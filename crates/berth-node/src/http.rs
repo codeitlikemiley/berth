@@ -47,6 +47,15 @@ struct Inner {
     tunnel_cf: AtomicBool,
     tunnel_named: AtomicBool,
     tunnel_alive: AtomicBool,
+    /// Tests pause after Guest::start so unpark can win the boot window.
+    #[cfg(test)]
+    create_hold: tokio::sync::Mutex<Option<CreateHold>>,
+}
+
+#[cfg(test)]
+struct CreateHold {
+    started: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Receiver<()>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,6 +140,8 @@ impl AppState {
                 tunnel_cf: AtomicBool::new(false),
                 tunnel_named: AtomicBool::new(false),
                 tunnel_alive: AtomicBool::new(false),
+                #[cfg(test)]
+                create_hold: tokio::sync::Mutex::new(None),
             }),
         })
     }
@@ -161,6 +172,15 @@ impl AppState {
 
     fn shutdown_rx(&self) -> watch::Receiver<bool> {
         self.inner.shutting_down.subscribe()
+    }
+
+    #[cfg(test)]
+    async fn after_guest_start_hold(&self) {
+        let Some(hold) = self.inner.create_hold.lock().await.take() else {
+            return;
+        };
+        let _ = hold.started.send(());
+        let _ = hold.resume.await;
     }
 
     async fn docker_manager(&self) -> Result<SessionManager> {
@@ -463,9 +483,15 @@ async fn create_lease(
     req.validate_mvp()?;
     let quote = Quote::from_request(&req)?;
     let mut guest = Guest::start(state.inner.mode, &state.inner.docker, &req).await?;
+    #[cfg(test)]
+    state.after_guest_start_hold().await;
     if state.is_shutting_down() {
         let _ = guest.stop().await;
         return Err(Error::ShuttingDown);
+    }
+    if !state.inner.db.parked()? {
+        let _ = guest.stop().await;
+        return Err(Error::Unparked);
     }
     let session_id = guest.session_id().to_string();
     let workspace_id = guest.workspace_id().to_string();
@@ -1524,6 +1550,43 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(state.inner.db.active_leases().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_aborts_if_unparked_after_guest_start() {
+        let (_dir, state) = test_state();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        *state.inner.create_hold.lock().await = Some(CreateHold {
+            started: started_tx,
+            resume: resume_rx,
+        });
+        let code = state.pairing_code().unwrap();
+        let app = router(state.clone());
+        let token = pair_token(&app, &code).await;
+
+        let app_create = app.clone();
+        let token_create = token.clone();
+        let create = tokio::spawn(async move {
+            authed_json(
+                &app_create,
+                "POST",
+                "/v1/leases",
+                &token_create,
+                Some(sample_lease()),
+            )
+            .await
+        });
+        started_rx.await.unwrap();
+        let (status, json) = authed_json(&app, "POST", "/v1/node/unpark", &token, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["parked"], false);
+        resume_tx.send(()).unwrap();
+        let (status, json) = create.await.unwrap();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(json["error"], "node is unparked");
+        assert!(state.inner.db.list_leases().unwrap().is_empty());
+        assert!(state.inner.live.lock().await.is_empty());
     }
 
     #[tokio::test]
