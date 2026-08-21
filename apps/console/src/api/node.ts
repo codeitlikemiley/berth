@@ -192,7 +192,8 @@ export function createApi(
     },
     async preview(sessionId: string) {
       // Bearer stays on Authorization so iframe/img src never carry the token.
-      const res = await request(previewPath(sessionId));
+      // 204 has no Cache-Control; a cached empty would hide a later last_frame.
+      const res = await request(previewPath(sessionId), { cache: "no-store" });
       if (res.status === 204) {
         return null;
       }

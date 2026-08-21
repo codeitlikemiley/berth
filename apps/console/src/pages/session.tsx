@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 
 import { api } from "@/api/node";
@@ -36,15 +36,20 @@ export function SessionPage() {
   const [nowUnix, setNowUnix] = useState(() => Date.now() / 1000);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const genRef = useRef(0);
+  const busyRef = useRef(false);
 
   const refresh = useCallback(async () => {
     if (!id) return;
+    const gen = ++genRef.current;
     try {
       const next = await api().getLease(id);
+      if (gen !== genRef.current) return;
       setLease(next);
       setNowUnix(Date.now() / 1000);
       setError(null);
     } catch (err) {
+      if (gen !== genRef.current) return;
       if (!getToken()) {
         navigate("/pair", { replace: true });
         return;
@@ -56,7 +61,7 @@ export function SessionPage() {
   useEffect(() => {
     let cancelled = false;
     const tick = async () => {
-      if (cancelled) return;
+      if (cancelled || busyRef.current) return;
       await refresh();
     };
     void tick();
@@ -67,41 +72,37 @@ export function SessionPage() {
     };
   }, [refresh]);
 
-  async function onEnd() {
+  async function runStop(
+    action: (leaseId: string) => Promise<LeaseView>,
+    fail: string,
+  ) {
     if (!id) return;
+    busyRef.current = true;
     setBusy(true);
+    // Guest stop can outlive a GET that still saw live; drop that result.
+    genRef.current += 1;
     try {
-      setLease(await api().endLease(id));
-      setNowUnix(Date.now() / 1000);
-      setError(null);
+      await action(id);
+      await refresh();
     } catch (err) {
       if (!getToken()) {
         navigate("/pair", { replace: true });
         return;
       }
-      setError(err instanceof Error ? err.message : "end failed");
+      setError(err instanceof Error ? err.message : fail);
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   }
 
+  async function onEnd() {
+    await runStop((leaseId) => api().endLease(leaseId), "end failed");
+  }
+
   async function onForce() {
-    if (!id) return;
     if (!window.confirm(FORCE_CONFIRM_COPY)) return;
-    setBusy(true);
-    try {
-      setLease(await api().forceEnd(id));
-      setNowUnix(Date.now() / 1000);
-      setError(null);
-    } catch (err) {
-      if (!getToken()) {
-        navigate("/pair", { replace: true });
-        return;
-      }
-      setError(err instanceof Error ? err.message : "force disconnect failed");
-    } finally {
-      setBusy(false);
-    }
+    await runStop((leaseId) => api().forceEnd(leaseId), "force disconnect failed");
   }
 
   const stopped = lease?.status === "stopped";

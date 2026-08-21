@@ -44,7 +44,7 @@ function LastFrame({ sessionId }: { sessionId: string }) {
   useEffect(() => {
     let cancelled = false;
     let objectUrl: string | null = null;
-    let seq = 0;
+    let timer: number | undefined;
 
     const forgetFrame = () => {
       if (objectUrl) {
@@ -55,10 +55,9 @@ function LastFrame({ sessionId }: { sessionId: string }) {
     };
 
     const tick = async () => {
-      const id = ++seq;
       try {
         const blob = await api().preview(sessionId);
-        if (cancelled || id !== seq) return;
+        if (cancelled) return;
         if (!getToken()) {
           navigate("/pair", { replace: true });
           return;
@@ -71,7 +70,7 @@ function LastFrame({ sessionId }: { sessionId: string }) {
           return;
         }
         const next = URL.createObjectURL(blob);
-        if (cancelled || id !== seq) {
+        if (cancelled) {
           URL.revokeObjectURL(next);
           return;
         }
@@ -82,7 +81,7 @@ function LastFrame({ sessionId }: { sessionId: string }) {
         setGone(false);
         setError(null);
       } catch (err) {
-        if (cancelled || id !== seq) return;
+        if (cancelled) return;
         if (!getToken()) {
           navigate("/pair", { replace: true });
           return;
@@ -98,14 +97,17 @@ function LastFrame({ sessionId }: { sessionId: string }) {
           setEmpty(false);
           setError(message);
         }
+      } finally {
+        if (!cancelled) {
+          timer = window.setTimeout(() => void tick(), 2000);
+        }
       }
     };
 
     void tick();
-    const timer = window.setInterval(() => void tick(), 2000);
     return () => {
       cancelled = true;
-      window.clearInterval(timer);
+      if (timer !== undefined) window.clearTimeout(timer);
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
   }, [sessionId, navigate]);
