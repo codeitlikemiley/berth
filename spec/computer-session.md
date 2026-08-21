@@ -117,6 +117,8 @@ Response:
 
 `DELETE /v1/leases/{lease_id}` reverts the snapshot and drops the tunnel.
 
+A private node MAY also expose operator HTTP (list leases, park/unpark, force disconnect) on the same listener. That is the node console, not this socket. Agents remain on `POST /v1/leases`, `DELETE /v1/leases/{lease_id}`, and the session WebSocket.
+
 ## Action channel
 
 WebSocket or QUIC. Client → server: actions. Server → client: frames,

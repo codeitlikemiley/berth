@@ -9,12 +9,16 @@ driven.**
 
 Windows, macOS guests, and `class=mesh` are not in v0.1.
 
+**Humans use the node console. Agents stay on CLI/MCP.** Occupancy USD is
+quoted, not billed. Force disconnect forfeits host credit (`forfeited`); it is
+not a cash fine. No wallets, earnings, or cash-out in v0.1.
+
 ```
-laptop (CLI / Claude Code / MCP)
+laptop (CLI / Claude Code / MCP)     browser (operator console)
         │  HTTPS (cloudflared) or loopback
         ▼
 parked box (macOS + Docker Desktop/OrbStack, or Linux + Docker)
-        │  berth-node on 127.0.0.1:7432
+        │  berth-node on 127.0.0.1:7432  — GET / is the console
         ▼
 Linux guest (Xvfb + openbox + Chromium)   ← not Finder, not your cursor
 ```
@@ -35,44 +39,70 @@ berth doctor
 cloudflared is a warning unless you want `--tunnel cloudflare`. Unpaired is a
 warning until `berth pair`.
 
-The dashboard is compiled into berth. **Node 22 at compile time** (`npm` on
-PATH, or a pre-built `apps/console/dist`). `cargo install --path crates/berth-cli`
-without Node embeds the placeholder, not the UI.
+### Node 22 at compile time
 
-### Two machines (headline)
+The dashboard is compiled into berth. **Node 22 is required at compile time**
+for the real UI (`npm` on PATH, or a pre-built `apps/console/dist`).
+`cargo install --path crates/berth-cli` without Node embeds the placeholder
+page, not the dashboard. Install Node 22 on this Mac before `cargo install` if
+you will open the console.
 
-The node still binds **loopback**. `cloudflared` is the public edge. Pairing is
-`POST /v1/pair` with `{code}` — the token is never placed on the tunnel URL.
+### Human path (console)
+
+Same Mac, no tunnel. The node starts **parked** (it already accepts leases).
 
 ```sh
-# parked Mac or Linux box
-berth node up --tunnel cloudflare
+berth node up
 # pairing code: ABCD-EFGH
-# quick tunnel; pair with https://….trycloudflare.com
-# named (TUNNEL_TOKEN set): named tunnel; pair with your hostname
-
-# laptop (or this Mac via the public URL — a phone hotspot is a valid test)
-berth pair --url https://<name>.trycloudflare.com --code ABCD-EFGH
-berth up --os linux
-# berth view is only useful on the parked node (127.0.0.1); the tunnel does not
-# publish noVNC. Agents use berth mcp / the tunneled session WS.
-claude mcp add --transport stdio berth -- berth mcp
-berth end
+# listening on 127.0.0.1:7432
+# console: http://127.0.0.1:7432/
 ```
 
-Install `cloudflared` first (`brew install cloudflared` on macOS; on Linux,
-`echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main' | sudo tee /etc/apt/sources.list.d/cloudflared.list && sudo apt-get update && sudo apt-get install cloudflared`).
+Open [http://127.0.0.1:7432/](http://127.0.0.1:7432/) on this machine.
+**Pair this browser.** On loopback the code is shown (`GET /v1/pairing` only).
+A tunneled browser types the stderr code — the code is never placed on the
+URL. Default pair does **not** revoke other bearers, so you can pair the CLI
+**and** this browser. `berth pair --revoke-others` or Doctor → **Revoke other
+clients** rotates everyone else (this browser stays in; CLI must re-pair).
 
-noVNC (`berth view`) is node-local on the mapped guest port; the tunnel does
-not publish it. Agents use the tunneled session WS / `berth mcp`.
+Then:
 
-### One machine (loopback)
+1. Home shows **Park / Unpark**. Parked = inventory on (new leases allowed).
+   Unpark while a live session exists is **409** (`cannot unpark while a lease
+   is live`) — End or Force disconnect first. Creating a lease while unparked
+   is **409** (`node is unparked`) **before** Docker starts a guest.
+2. **New lease** — wizard **What** (linux; windows/macos disabled) → **Where**
+   (this node, must be parked) → **Review** (quoted USD, **not charged**).
+   Confirm.
+3. **End** is graceful (`DELETE` / `berth end` / MCP `berth_end`) — occupancy
+   stays income-eligible. **Force disconnect** (`POST /v1/leases/{id}/force` or
+   `berth end --force`) forfeits host income for that row (`forfeited`; badge
+   “No income — forced disconnect”). Not a cash fine. MCP cannot force.
+   Quotes printed or shown are **not charged**.
 
-Same Mac, no tunnel. Enough to get Claude Code clicking.
+`berth view` is node-local noVNC on the mapped guest port. The tunnel does not
+publish it. The session pane iframes noVNC only when this browser is on the
+parked box; otherwise last screenshot or “use MCP / open viewer on the parked
+box.”
+
+Cloudflare origin parameter `httpHostHeader: 127.0.0.1` is **unsupported**.
+`Cf-Ray` is still present, so the pairing code stays 404 and the console does
+not treat the request as loopback.
+
+Operator HTTP (list, park, force, wizard) is [docs/CONSOLE.md](docs/CONSOLE.md).
+That is not the agent protocol.
+
+### Agent path (CLI / MCP)
+
+Agents do not use the console. Pair once (default does not log out the
+browser), then `berth up` / `berth mcp`. `berth_end` is graceful.
+
+#### One machine (loopback)
 
 ```sh
 berth node up
 # prints a pairing code; listens on 127.0.0.1:7432
+# console: http://127.0.0.1:7432/
 
 # another terminal, same machine
 berth pair --code ABCD-EFGH
@@ -86,12 +116,43 @@ berth end
 `~/.berth/config.toml` (mode 0600). `berth mcp` is stdio JSON-RPC (tools talk
 to the guest, not the host desktop).
 
+#### Two machines (headline)
+
+The node still binds **loopback**. `cloudflared` is the public edge. Pairing is
+`POST /v1/pair` with `{code}` — the token is never placed on the tunnel URL.
+
+```sh
+# parked Mac or Linux box
+berth node up --tunnel cloudflare
+# pairing code: ABCD-EFGH
+# console: http://127.0.0.1:7432/   (open this on the parked box)
+# quick tunnel; pair with https://….trycloudflare.com
+# named (TUNNEL_TOKEN set): named tunnel; pair with your hostname
+
+# laptop (or this Mac via the public URL — a phone hotspot is a valid test)
+berth pair --url https://<name>.trycloudflare.com --code ABCD-EFGH
+berth up --os linux
+# berth view is only useful on the parked node (127.0.0.1); the tunnel does not
+# publish noVNC. Agents use berth mcp / the tunneled session WS.
+claude mcp add --transport stdio berth -- berth mcp
+berth end
+```
+
+A tunneled browser can load the console and type the stderr pairing code. That
+pair still does not revoke the CLI unless you pass `--revoke-others` or use
+Doctor **Revoke other clients**.
+
+Install `cloudflared` first (`brew install cloudflared` on macOS; on Linux,
+`echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main' | sudo tee /etc/apt/sources.list.d/cloudflared.list && sudo apt-get update && sudo apt-get install cloudflared`).
+
 ## Security
 
 - **Host desktop is never driven.** Isolation is the product. No
   `--network=host`, no `/tmp/.X11-unix`, no host `DISPLAY`.
 - Node HTTP binds **127.0.0.1**. Remote access is Cloudflare Tunnel + pairing
   token, not a bind-all listener.
+- Pairing code on `GET /v1/pairing` is loopback-operator only. Ignore
+  `X-Forwarded-*`. `httpHostHeader: 127.0.0.1` is unsupported (see above).
 - Guest egress is **default-deny**. Default allowlist: `github.com`,
   `pypi.org`, `registry.npmjs.org`. **Empty allowlist = no outbound** (not
   "allow all"). Set in `~/.berth/config.toml`:
@@ -123,6 +184,7 @@ not another agent. It is not another sandbox SDK. It is the place an agent
 sits down.
 
 Read the argument: [docs/THESIS.md](docs/THESIS.md).
+Read the human console: [docs/CONSOLE.md](docs/CONSOLE.md).
 Read the market: [research/LANDSCAPE.md](research/LANDSCAPE.md).
 Read the legal constraints: [docs/LEGAL.md](docs/LEGAL.md).
 Read the meter: [docs/ECONOMICS.md](docs/ECONOMICS.md).
@@ -145,6 +207,11 @@ Read the MVP plan: [docs/MVP.md](docs/MVP.md).
 ## v0.1.0 tag checklist
 
 - [ ] `berth doctor` green on macOS + Docker Desktop (and Linux+Docker if present)
+- [ ] `berth node up` + open `http://127.0.0.1:7432/` + pair this browser
+- [ ] Wizard What → Where → Review shows quoted USD (not charged)
+- [ ] `berth pair` (CLI) still works after pairing the console (no `--revoke-others`)
+- [ ] Park / unpark; unpark while live is blocked (409)
+- [ ] Force disconnect = no income; `berth end` / `berth_end` graceful
 - [ ] `berth node up` + `berth up --os linux` on one machine
 - [ ] Same path across two machines via `--tunnel cloudflare`
 - [ ] Claude Code screenshot + click (e2e screenshot)

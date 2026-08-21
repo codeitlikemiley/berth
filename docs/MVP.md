@@ -16,6 +16,8 @@ claude mcp add --transport stdio berth -- berth mcp
 
 …then ask Claude: *open Chromium, go to example.com, screenshot*. They see the click happen in `berth view`. `/workspace` still has the files after `berth end` + a second `berth up`.
 
+The **human console is node-local** (`http://127.0.0.1:7432/` from the same process). A hosted control plane remains post-MVP item 6.
+
 No mesh. No token. No Windows. No public Mac. No hosted SaaS control plane.
 
 ## Where you develop: macOS is fine
@@ -74,6 +76,7 @@ reason to stay on Apple silicon, not a reason to switch to Linux now.
 | Cloudflare Tunnel **or** Tailscale (pick one, ship both later) | Custom relay network |
 | xdotool + ImageMagick inside the guest | Cua Driver (add when the loop works) |
 | Human viewer (noVNC or a PNG stream) | Session recording as a product |
+| Node-local console (`GET /`) | Hosted SaaS dashboard / accounts |
 
 Post-MVP (do not start until the Done-when above is true):
 
@@ -85,7 +88,7 @@ Post-MVP (do not start until the Done-when above is true):
    [microsoft/windows-365-for-agents](https://github.com/microsoft/windows-365-for-agents)
    MCP (acquire → Ready → tools → release). Not in v0.1: needs an Agent 365
    tenant. See [WINDOWS365.md](WINDOWS365.md).  
-6. Hosted control plane + credits  
+6. Hosted control plane + credits (the node-local console is v0.1; this is the hosted plane)  
 7. Linux mesh (wired mini PCs)  
 8. Mac §3 fleet  
 
@@ -99,8 +102,9 @@ No central cloud. The **node is the control plane** for private leases.
 Laptop (macOS)                 Tunnel                    Parked box (macOS or Linux + Docker)
 ┌─────────────────────┐        (cloudflared)        ┌──────────────────────────┐
 │ berth CLI           │  HTTPS/WSS ───────────────► │ berth-node (daemon)      │
-│ berth mcp (stdio)   │                             │  POST /v1/leases         │
-│ Claude Code / Codex │                             │  WS  /v1/sessions/:id    │
+│ berth mcp (stdio)   │                             │  GET  /  console         │
+│ Claude Code / Codex │                             │  POST /v1/leases         │
+│ operator browser    │                             │  WS  /v1/sessions/:id    │
 └─────────────────────┘                             │  docker run berthos      │
                                                     │    Xvfb + XFCE + Chromium│
                                                     │    xdotool + import      │
@@ -109,8 +113,8 @@ Laptop (macOS)                 Tunnel                    Parked box (macOS or Li
                                                     └──────────────────────────┘
 ```
 
-- **Protocol:** JSON over WebSocket as in `spec/computer-session.md` (actions + frames). HTTP for lease CRUD.
-- **Auth:** node issues a pairing token (`berth pair`). Token in `Authorization: Bearer`. Rotate by re-pair.
+- **Protocol:** JSON over WebSocket as in `spec/computer-session.md` (actions + frames). HTTP for lease CRUD. Operator list/park/force is the node console, not the agent socket.
+- **Auth:** node issues a pairing token (`berth pair`). Token in `Authorization: Bearer`. Default pair does not revoke other bearers.
 - **Isolation:** one Docker container per session. Not the host desktop. Ever.
 - **Driver v0:** `xdotool` + `import -window root png:-` on `DISPLAY=:99`. Coordinates = screenshot pixels. Swap to Cua Driver later without changing the protocol.
 
@@ -373,7 +377,7 @@ Ordered, still:
 3. `/mnt/s3` rclone  
 4. Lume private macOS  
 5. W365 provider (`isolated` + `pooled`, list $0.40/hr)  
-6. Hosted control plane + credits (MATH.md)  
+6. Hosted control plane + credits (MATH.md) — not the node-local console  
 7. Linux mesh  
 8. Mac §3  
 
@@ -382,7 +386,7 @@ Ordered, still:
 ## Key decisions
 
 1. **MVP = private Linux outpost + MCP.** Mesh/token/Windows are later products.
-2. **Node is the control plane.** No hosted API in v0.1.
+2. **Node is the control plane.** No hosted API in v0.1. The human console is node-local (`GET /`).
 3. **Rust workspace, one `berth` binary.**
 4. **xdotool in Xvfb for v0;** Cua Driver is a driver swap, not a rewrite.
 5. **Container per session, volume per workspace.** Never the host desktop.
