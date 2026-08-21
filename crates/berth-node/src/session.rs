@@ -22,6 +22,8 @@ use crate::error::{Error, Result};
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const READY_POLL: Duration = Duration::from_millis(200);
 const EXEC_WAIT: Duration = Duration::from_secs(10);
+const NETWORK_RM_TRIES: u32 = 10;
+const NETWORK_RM_DELAY: Duration = Duration::from_millis(50);
 
 /// Talks to the local Docker engine and starts isolated guest sessions.
 #[derive(Clone, Debug)]
@@ -61,10 +63,9 @@ impl SessionManager {
             .unwrap_or_else(|| new_id("ws"));
         let volume = volume_name(&workspace_id);
         let network = network_name(&session_id);
-        self.ensure_volume(&volume).await?;
-        self.create_session_network(&network, &session_id).await?;
-
         let name = container_name(&session_id);
+        // Build HostConfig before allocating a network so InvalidResources
+        // cannot leak a berth-net-*.
         let body = container_body(
             &self.image,
             &session_id,
@@ -78,6 +79,9 @@ impl SessionManager {
             assert_host_isolated(host);
         }
 
+        self.ensure_volume(&volume).await?;
+        self.create_session_network(&network, &session_id).await?;
+
         let created = match self
             .docker
             .create_container(
@@ -88,7 +92,7 @@ impl SessionManager {
         {
             Ok(created) => created,
             Err(err) => {
-                let _ = self.docker.remove_network(&network).await;
+                remove_session_network(&self.docker, &network).await;
                 return Err(err.into());
             }
         };
@@ -96,7 +100,7 @@ impl SessionManager {
 
         if let Err(err) = self.boot(&container_id).await {
             let _ = self.remove_container(&container_id).await;
-            let _ = self.docker.remove_network(&network).await;
+            remove_session_network(&self.docker, &network).await;
             return Err(err);
         }
 
@@ -353,8 +357,8 @@ impl Session {
                 ),
             )
             .await?;
-        let _ = self.docker.remove_network(&self.network).await;
         self.stopped = true;
+        remove_session_network(&self.docker, &self.network).await;
         Ok(())
     }
 }
@@ -381,8 +385,30 @@ impl Drop for Session {
                         ),
                     )
                     .await;
-                let _ = docker.remove_network(&network).await;
+                remove_session_network(&docker, &network).await;
             });
+        }
+    }
+}
+
+fn network_already_gone(err: &bollard::errors::Error) -> bool {
+    matches!(
+        err,
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            ..
+        }
+    )
+}
+
+/// Best-effort delete. 404 is success. "active endpoints" is retried.
+async fn remove_session_network(docker: &Docker, name: &str) {
+    for attempt in 0..NETWORK_RM_TRIES {
+        match docker.remove_network(name).await {
+            Ok(()) => return,
+            Err(err) if network_already_gone(&err) => return,
+            Err(_) if attempt + 1 == NETWORK_RM_TRIES => return,
+            Err(_) => sleep(NETWORK_RM_DELAY).await,
         }
     }
 }
@@ -588,6 +614,22 @@ mod tests {
         assert!(matches!(
             frame_from_png("s_1", data),
             Err(Error::InvalidPng)
+        ));
+    }
+
+    #[test]
+    fn missing_network_is_gone() {
+        assert!(network_already_gone(
+            &bollard::errors::Error::DockerResponseServerError {
+                status_code: 404,
+                message: "network not found".into(),
+            }
+        ));
+        assert!(!network_already_gone(
+            &bollard::errors::Error::DockerResponseServerError {
+                status_code: 403,
+                message: "active endpoints".into(),
+            }
         ));
     }
 }
