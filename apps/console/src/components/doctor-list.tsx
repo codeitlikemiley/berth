@@ -54,6 +54,9 @@ export function DoctorList({
       <Row label="guest image">
         <span className={node.guest_image.ok ? undefined : "text-destructive"}>
           {okText(node.guest_image.ok)} {node.guest_image.name}
+          {node.guest_image.detail ? (
+            <span className="block text-xs">{node.guest_image.detail}</span>
+          ) : null}
         </span>
       </Row>
       <Row label="home writable">

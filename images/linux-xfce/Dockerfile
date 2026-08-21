@@ -91,6 +91,11 @@ RUN chmod 755 /usr/local/bin/entrypoint.sh /usr/local/bin/action.sh \
     && cp /etc/xdg/openbox/menu.xml /home/berth/.config/openbox/menu.xml \
     && chown berth:berth /home/berth/.config/openbox/menu.xml
 
+# Proof the image carries the egress-filtering entrypoint. The node refuses to
+# call an image healthy without it, so a guest built before the filter existed
+# cannot quietly report green. Bump when the egress contract changes.
+LABEL berth.egress.version="1"
+
 # Viewer is noVNC on 6080; raw VNC is localhost-only inside the guest.
 # Entrypoint starts as root to apply the egress filter, then drops to berth.
 EXPOSE 6080

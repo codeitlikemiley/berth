@@ -39,6 +39,13 @@ berth doctor
 It does **not** probe the embedded SPA. cloudflared is a warning unless you
 want `--tunnel cloudflare`. Unpaired is a warning until `berth pair`.
 
+The guest image check is not "does this image exist" — an image built before
+the egress filter existed inspects fine and filters nothing. berth requires the
+`berth.egress.version` label the Dockerfile stamps, so
+`image ... predates the egress filter` means exactly one thing: rebuild it with
+the `docker build` line above. `images/linux-xfce/test-egress.sh` asserts what
+the image does to traffic and runs in CI.
+
 ### Node 22 at compile time
 
 The dashboard is compiled into berth. **Node 22 is required at compile time**

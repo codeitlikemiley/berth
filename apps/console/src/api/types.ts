@@ -52,6 +52,8 @@ export type DockerProbe = {
 export type GuestImageProbe = {
   ok: boolean;
   name: string;
+  /** Why the image is or is not usable — an image that merely exists may have no egress filter. */
+  detail: string;
 };
 
 export type TunnelStatus =

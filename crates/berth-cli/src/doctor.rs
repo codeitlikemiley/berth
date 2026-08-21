@@ -156,14 +156,36 @@ fn probe_docker() -> std::result::Result<String, String> {
     }
 }
 
+/// Existence is not the property that matters: an image built before the egress
+/// filter landed inspects fine and applies no filter. Require the build label.
 fn probe_image(name: &str) -> std::result::Result<String, String> {
-    match Command::new("docker")
-        .args(["image", "inspect", name])
+    let rebuild = format!("docker build -t {name} images/linux-xfce");
+    let out = match Command::new("docker")
+        .args([
+            "image",
+            "inspect",
+            "-f",
+            &format!(
+                "{{{{index .Config.Labels \"{}\"}}}}",
+                berth_node::EGRESS_LABEL
+            ),
+            name,
+        ])
         .output()
     {
-        Ok(out) if out.status.success() => Ok(format!("image {name}")),
-        _ => Err(format!(
-            "image {name} not found; docker build -t {name} images/linux-xfce"
+        Ok(out) if out.status.success() => out,
+        _ => return Err(format!("image {name} not found; {rebuild}")),
+    };
+    // `docker inspect -f` prints "<no value>" for a missing label, not an error.
+    match String::from_utf8_lossy(&out.stdout).trim() {
+        v if v == berth_node::EGRESS_VERSION => Ok(format!("image {name} (egress v{v})")),
+        "" | "<no value>" => Err(format!(
+            "image {name} predates the egress filter (no {} label); {rebuild}",
+            berth_node::EGRESS_LABEL
+        )),
+        v => Err(format!(
+            "image {name} is egress v{v}, this berth expects v{}; {rebuild}",
+            berth_node::EGRESS_VERSION
         )),
     }
 }

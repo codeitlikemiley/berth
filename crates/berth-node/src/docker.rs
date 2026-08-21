@@ -27,6 +27,15 @@ pub fn resolve_image(env_val: Option<&str>) -> String {
         .to_string()
 }
 
+/// Label stamped by `images/linux-xfce/Dockerfile` proving the image applies an
+/// egress filter. Existence of an image says nothing about what is inside it, so
+/// the health probe requires this instead.
+pub const EGRESS_LABEL: &str = "berth.egress.version";
+
+/// Egress contract the node understands. Bump alongside the Dockerfile when the
+/// filter's guarantees change so stale images stop reporting healthy.
+pub const EGRESS_VERSION: &str = "1";
+
 pub fn image_from_env() -> String {
     resolve_image(env::var("BERTH_IMAGE").ok().as_deref())
 }

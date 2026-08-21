@@ -731,6 +731,9 @@ struct DockerProbe {
 struct GuestImageProbe {
     ok: bool,
     name: String,
+    /// Why the image is or is not usable. An image that merely exists proves
+    /// nothing about whether it filters egress, so say which it is.
+    detail: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -971,6 +974,42 @@ fn tunnel_view(state: &AppState) -> TunnelView {
     }
 }
 
+/// An image that exists is not necessarily an image that filters egress: the
+/// guest built before the filter landed still inspects fine. Require the build
+/// label instead, and hand back a line the operator can act on.
+async fn inspect_guest_image(docker: &bollard::Docker, name: &str) -> (bool, String) {
+    let rebuild = format!("rebuild: docker build -t {name} images/linux-xfce");
+    let image = match docker.inspect_image(name).await {
+        Ok(image) => image,
+        Err(_) => return (false, format!("not found; {rebuild}")),
+    };
+    let label = image
+        .config
+        .as_ref()
+        .and_then(|config| config.labels.as_ref())
+        .and_then(|labels| labels.get(crate::docker::EGRESS_LABEL))
+        .map(String::as_str);
+    match label {
+        Some(version) if version == crate::docker::EGRESS_VERSION => {
+            (true, format!("egress filter v{version}"))
+        }
+        Some(version) => (
+            false,
+            format!(
+                "egress contract v{version}, node expects v{}; {rebuild}",
+                crate::docker::EGRESS_VERSION
+            ),
+        ),
+        None => (
+            false,
+            format!(
+                "no {} label; image predates the egress filter; {rebuild}",
+                crate::docker::EGRESS_LABEL
+            ),
+        ),
+    }
+}
+
 async fn probe_docker_and_image(mode: GuestMode) -> (DockerProbe, GuestImageProbe) {
     let name = image_from_env();
     match mode {
@@ -980,7 +1019,11 @@ async fn probe_docker_and_image(mode: GuestMode) -> (DockerProbe, GuestImageProb
                 ok: true,
                 detail: "bollard ping ok".into(),
             },
-            GuestImageProbe { ok: true, name },
+            GuestImageProbe {
+                ok: true,
+                name,
+                detail: "stub".into(),
+            },
         ),
         GuestMode::Docker => match bollard::Docker::connect_with_local_defaults() {
             Ok(docker) => {
@@ -988,10 +1031,14 @@ async fn probe_docker_and_image(mode: GuestMode) -> (DockerProbe, GuestImageProb
                     Ok(_) => (true, "bollard ping ok".into()),
                     Err(err) => (false, format!("bollard ping failed: {err}")),
                 };
-                let image_ok = docker.inspect_image(&name).await.is_ok();
+                let (image_ok, image_detail) = inspect_guest_image(&docker, &name).await;
                 (
                     DockerProbe { ok, detail },
-                    GuestImageProbe { ok: image_ok, name },
+                    GuestImageProbe {
+                        ok: image_ok,
+                        name,
+                        detail: image_detail,
+                    },
                 )
             }
             Err(err) => (
@@ -999,7 +1046,11 @@ async fn probe_docker_and_image(mode: GuestMode) -> (DockerProbe, GuestImageProb
                     ok: false,
                     detail: format!("docker not reachable: {err}"),
                 },
-                GuestImageProbe { ok: false, name },
+                GuestImageProbe {
+                    ok: false,
+                    name,
+                    detail: "docker not reachable".into(),
+                },
             ),
         },
     }

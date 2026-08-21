@@ -37,3 +37,17 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace
+
+  # The egress guarantee lives in the guest image's entrypoint, not in Rust, so
+  # the Rust job above cannot see it regress. Build the real image and assert
+  # what it actually does to traffic.
+  guest-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build guest image
+        run: docker build -t berthos-linux-xfce:ci images/linux-xfce
+
+      - name: Egress filter holds
+        run: ./images/linux-xfce/test-egress.sh berthos-linux-xfce:ci
