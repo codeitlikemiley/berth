@@ -10,7 +10,7 @@ import {
 import type { LeaseView } from "@/api/types";
 import { QuoteLabel } from "@/components/quote-label";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { incomeUsd, occupancyBadge, quotedUsd } from "@/lib/ledger";
+import { incomeUsd, occupancyBadge, quotedUsd, usdPerHour } from "@/lib/ledger";
 
 export function MeterChart({
   leases,
@@ -28,6 +28,12 @@ export function MeterChart({
   const quotedSum = data.reduce((sum, row) => sum + row.quotedUsd, 0);
   const incomeSum = leases.reduce(
     (sum, lease) => sum + incomeUsd(lease, nowUnix),
+    0,
+  );
+  // Combined occupancy velocity across the displayed leases; the accrued
+  // totals above already account for forfeiture, this is just the rate.
+  const rateSum = leases.reduce(
+    (sum, lease) => sum + usdPerHour(lease.quote),
     0,
   );
   const anyForfeited = leases.some(
@@ -63,11 +69,12 @@ export function MeterChart({
         </div>
         <div className="flex flex-wrap gap-x-8 gap-y-2 text-sm">
           <p>
-            Quoted occupancy (not charged). <QuoteLabel usd={quotedSum} />
+            Quoted occupancy (not charged).{" "}
+            <QuoteLabel usd={quotedSum} ratePerHour={rateSum} />
           </p>
           <p>
             {anyForfeited ? "Income (forced disconnects earn $0)" : "Income"}{" "}
-            <QuoteLabel usd={incomeSum} />
+            <QuoteLabel usd={incomeSum} ratePerHour={rateSum} />
           </p>
         </div>
         {truncated ? (

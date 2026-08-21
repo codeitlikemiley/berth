@@ -12,6 +12,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { ConfirmDialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { getToken, refreshRememberedToken, url_is_loopback } from "@/lib/auth";
 
@@ -30,6 +31,7 @@ export function DoctorPage() {
   const [pending, setPending] = useState(true);
   const [unauthed, setUnauthed] = useState(false);
   const [checkedAt, setCheckedAt] = useState<number | null>(null);
+  const [revokeConfirmOpen, setRevokeConfirmOpen] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -106,13 +108,6 @@ export function DoctorPage() {
   }
 
   async function onRevoke() {
-    if (
-      !window.confirm(
-        "Revoke other clients? CLI and other browsers must pair again.",
-      )
-    ) {
-      return;
-    }
     const gen = ++genRef.current;
     setError(null);
     setNotice(null);
@@ -246,13 +241,26 @@ export function DoctorPage() {
               type="button"
               variant="destructive"
               disabled={pending}
-              onClick={() => void onRevoke()}
+              onClick={() => setRevokeConfirmOpen(true)}
             >
               Revoke other clients
             </Button>
           </div>
         </CardContent>
       </Card>
+
+      <ConfirmDialog
+        open={revokeConfirmOpen}
+        title="Revoke other clients?"
+        description="CLI and other browsers must pair again."
+        confirmLabel="Revoke"
+        confirmVariant="destructive"
+        onCancel={() => setRevokeConfirmOpen(false)}
+        onConfirm={() => {
+          setRevokeConfirmOpen(false);
+          void onRevoke();
+        }}
+      />
     </main>
   );
 }

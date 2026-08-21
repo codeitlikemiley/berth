@@ -13,6 +13,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { ConfirmDialog } from "@/components/ui/dialog";
 import { getToken } from "@/lib/auth";
 import {
   FORCE_CONFIRM_COPY,
@@ -20,6 +21,7 @@ import {
   occupancyBadge,
   occupancyBadgeCopy,
   quotedUsd,
+  usdPerHour,
 } from "@/lib/ledger";
 
 function badgeClass(lease: LeaseView): string {
@@ -36,6 +38,7 @@ export function SessionPage() {
   const [nowUnix, setNowUnix] = useState(() => Date.now() / 1000);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [confirmOpen, setConfirmOpen] = useState(false);
   const genRef = useRef(0);
   const busyRef = useRef(false);
 
@@ -101,7 +104,6 @@ export function SessionPage() {
   }
 
   async function onForce() {
-    if (!window.confirm(FORCE_CONFIRM_COPY)) return;
     await runStop((leaseId) => api().forceEnd(leaseId), "force disconnect failed");
   }
 
@@ -134,7 +136,7 @@ export function SessionPage() {
             size="sm"
             variant="destructive"
             disabled={!lease || stopped || busy}
-            onClick={() => void onForce()}
+            onClick={() => setConfirmOpen(true)}
           >
             Force disconnect
           </Button>
@@ -158,10 +160,18 @@ export function SessionPage() {
                 <p className="text-destructive">{occupancyBadgeCopy(lease)}</p>
               ) : null}
               <p>
-                Quoted <QuoteLabel usd={quotedUsd(lease, nowUnix)} />
+                Quoted{" "}
+                <QuoteLabel
+                  usd={quotedUsd(lease, nowUnix)}
+                  ratePerHour={usdPerHour(lease.quote)}
+                />
               </p>
               <p>
-                Income <QuoteLabel usd={incomeUsd(lease, nowUnix)} />
+                Income{" "}
+                <QuoteLabel
+                  usd={incomeUsd(lease, nowUnix)}
+                  ratePerHour={usdPerHour(lease.quote)}
+                />
               </p>
             </CardContent>
           </Card>
@@ -179,6 +189,19 @@ export function SessionPage() {
           </Card>
         </>
       ) : null}
+
+      <ConfirmDialog
+        open={confirmOpen}
+        title="Force disconnect"
+        description={FORCE_CONFIRM_COPY}
+        confirmLabel="Force disconnect"
+        confirmVariant="destructive"
+        onCancel={() => setConfirmOpen(false)}
+        onConfirm={() => {
+          setConfirmOpen(false);
+          void onForce();
+        }}
+      />
     </main>
   );
 }

@@ -5,6 +5,11 @@ export function usdPerSecond(q: Quote): number {
   return Number(q.gas_per_second) * Number(q.usd_per_gas);
 }
 
+/** Occupancy rate as $/hr — the number a human can actually reason about. */
+export function usdPerHour(q: Quote): number {
+  return usdPerSecond(q) * 3600;
+}
+
 /** Quote has no elapsed clock yet; review uses rate × min_seconds. */
 export function occupancyUsd(quote: Quote): number {
   return usdPerSecond(quote) * quote.min_seconds;
@@ -37,6 +42,7 @@ export function incomeUsd(lease: LeaseView, nowUnix = Date.now() / 1000): number
 
 export const FORCE_BADGE_COPY = "No income — forced disconnect.";
 
+/** Shown in the confirm dialog, not a native confirm() — see ui/dialog.tsx. */
 export const FORCE_CONFIRM_COPY =
   "This stops the guest. Occupancy time is recorded. Host income for this lease is $0. Nothing is charged.";
 
@@ -48,4 +54,10 @@ export function occupancyBadgeCopy(lease: LeaseView): string {
 export function formatUsd(n: number): string {
   if (n === 0) return "$0";
   return `$${n.toFixed(6).replace(/0+$/, "").replace(/\.$/, "")}`;
+}
+
+/** Rate as the primary number: $/hr at 3 decimals, not the 6 used for exact accrued totals. */
+export function formatUsdRate(perHour: number): string {
+  if (perHour === 0) return "$0/hr";
+  return `$${perHour.toFixed(3).replace(/0+$/, "").replace(/\.$/, "")}/hr`;
 }

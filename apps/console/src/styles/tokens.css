@@ -25,6 +25,7 @@
   --accent-foreground: oklch(0.99 0.001 90);
   --destructive: var(--danger);
   --input: var(--border);
+  --overlay: oklch(0 0 0 / 40%);
 }
 html.dark {
   --bg: oklch(0.18 0.015 260);
@@ -53,4 +54,5 @@ html.dark {
   --accent-foreground: oklch(0.18 0.015 260);
   --destructive: var(--danger);
   --input: var(--border);
+  --overlay: oklch(0 0 0 / 60%);
 }

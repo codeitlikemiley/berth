@@ -4,11 +4,13 @@ import type { LeaseView, Quote } from "@/api/types";
 import {
   FORCE_BADGE_COPY,
   formatUsd,
+  formatUsdRate,
   incomeUsd,
   occupancyBadge,
   occupancyBadgeCopy,
   occupancyUsd,
   quotedUsd,
+  usdPerHour,
   usdPerSecond,
 } from "./ledger";
 
@@ -55,6 +57,18 @@ describe("ledger 2/4/40 isolated", () => {
   it("review occupancy at 60s min is $0.000804", () => {
     expect(occupancyUsd(isolated240)).toBe(0.000804);
     expect(formatUsd(occupancyUsd(isolated240))).toBe("$0.000804");
+  });
+
+  it("usdPerHour is usdPerSecond × 3600", () => {
+    expect(usdPerHour(isolated240)).toBeCloseTo(0.04824, 10);
+    expect(usdPerHour(isolated240)).toBeCloseTo(usdPerSecond(isolated240) * 3600, 12);
+  });
+
+  it("formatUsdRate reads as a rate, not a fraction of a cent", () => {
+    expect(formatUsdRate(usdPerHour(isolated240))).toBe("$0.048/hr");
+    expect(formatUsdRate(0)).toBe("$0/hr");
+    expect(formatUsdRate(2.1)).toBe("$2.1/hr");
+    expect(formatUsdRate(5)).toBe("$5/hr");
   });
 
   it("stopped graceful billable_seconds=60 → occupancy $0.000804 and income $0.000804", () => {

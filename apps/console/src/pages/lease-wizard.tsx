@@ -14,7 +14,7 @@ import {
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { getToken } from "@/lib/auth";
-import { occupancyUsd } from "@/lib/ledger";
+import { occupancyUsd, usdPerHour } from "@/lib/ledger";
 import {
   UNPARKED_LEASE_COPY,
   quoteMatchesDraft,
@@ -384,7 +384,11 @@ export function LeaseWizardPage() {
             {liveQuote ? (
               <>
                 <p>
-                  Occupancy <QuoteLabel usd={occupancyUsd(liveQuote)} />
+                  Occupancy{" "}
+                  <QuoteLabel
+                    usd={occupancyUsd(liveQuote)}
+                    ratePerHour={usdPerHour(liveQuote)}
+                  />
                 </p>
                 <p className="text-muted-foreground">
                   {liveQuote.min_seconds}s min

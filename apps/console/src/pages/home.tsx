@@ -14,6 +14,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { ConfirmDialog } from "@/components/ui/dialog";
 import { getToken } from "@/lib/auth";
 import {
   FORCE_CONFIRM_COPY,
@@ -21,6 +22,7 @@ import {
   occupancyBadge,
   occupancyBadgeCopy,
   quotedUsd,
+  usdPerHour,
 } from "@/lib/ledger";
 
 function badgeClass(lease: LeaseView): string {
@@ -54,6 +56,7 @@ export function HomePage() {
   const [error, setError] = useState<string | null>(null);
   const [parkPending, setParkPending] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [confirmId, setConfirmId] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -146,7 +149,6 @@ export function HomePage() {
   }
 
   async function onForce(id: string) {
-    if (!window.confirm(FORCE_CONFIRM_COPY)) return;
     setBusyId(id);
     try {
       await api().forceEnd(id);
@@ -256,10 +258,16 @@ export function HomePage() {
                           {durationLabel(lease, nowUnix)}
                         </td>
                         <td className="py-3 pr-3 align-top">
-                          <QuoteLabel usd={quotedUsd(lease, nowUnix)} />
+                          <QuoteLabel
+                            usd={quotedUsd(lease, nowUnix)}
+                            ratePerHour={usdPerHour(lease.quote)}
+                          />
                         </td>
                         <td className="py-3 pr-3 align-top">
-                          <QuoteLabel usd={incomeUsd(lease, nowUnix)} />
+                          <QuoteLabel
+                            usd={incomeUsd(lease, nowUnix)}
+                            ratePerHour={usdPerHour(lease.quote)}
+                          />
                         </td>
                         <td className="py-3 align-top">
                           <div className="flex flex-wrap gap-2">
@@ -277,7 +285,7 @@ export function HomePage() {
                               size="sm"
                               variant="destructive"
                               disabled={stopped || busy}
-                              onClick={() => void onForce(lease.lease_id)}
+                              onClick={() => setConfirmId(lease.lease_id)}
                             >
                               Force disconnect
                             </Button>
@@ -292,6 +300,20 @@ export function HomePage() {
           </Card>
         </>
       ) : null}
+
+      <ConfirmDialog
+        open={confirmId !== null}
+        title="Force disconnect"
+        description={FORCE_CONFIRM_COPY}
+        confirmLabel="Force disconnect"
+        confirmVariant="destructive"
+        onCancel={() => setConfirmId(null)}
+        onConfirm={() => {
+          const id = confirmId;
+          setConfirmId(null);
+          if (id) void onForce(id);
+        }}
+      />
     </main>
   );
 }
