@@ -1,0 +1,10 @@
+.DS_Store
+target/
+dist/
+node_modules/
+*.iso
+*.qcow2
+*.ipsw
+.env
+.env.*
+!.env.example
