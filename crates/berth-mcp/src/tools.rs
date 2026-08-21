@@ -32,15 +32,12 @@ impl Mcp {
     }
 
     async fn lease(&self, args: &serde_json::Value) -> Result<ToolResult> {
-        if let Some(cur) = existing_session(&self.home)? {
-            return Ok(ToolResult::text(format_lease(
-                "current lease",
-                &cur.lease_id,
-                &cur.session_id,
-                cur.viewer_url.as_deref(),
-            )));
-        }
-
+        // Validate before consulting the current session. Returning the session
+        // first meant an agent asking for windows was handed the linux guest it
+        // already had, with no error -- and `os` was never even parsed, so a
+        // typo passed too. v0.1 accepts only linux, so anything that validates
+        // necessarily matches a live session's OS; once other guests exist this
+        // needs an explicit same-OS check before the early return below.
         let os = parse_os(
             args.get("os")
                 .and_then(|v| v.as_str())
@@ -58,6 +55,24 @@ impl Mcp {
 
         let node = cfg.node(DEFAULT_NODE)?;
         let client = NodeClient::new(&node.url, Some(&node.token))?;
+
+        // The session file outlives the guest it names. Handing back a dead one
+        // sends the agent into 404s on its next screenshot with nothing telling
+        // it to lease again, so ask the node before trusting it.
+        if let Some(cur) = existing_session(&self.home)? {
+            // BERTH_SESSION can name a session that is not backed by a lease of
+            // ours (empty lease_id); there is nothing to look up, so trust it.
+            if cur.lease_id.is_empty() || session_is_live(&client, &cur.lease_id).await? {
+                return Ok(ToolResult::text(format_lease(
+                    "current lease",
+                    &cur.lease_id,
+                    &cur.session_id,
+                    cur.viewer_url.as_deref(),
+                )));
+            }
+            clear_session(&self.home)?;
+        }
+
         let lease = client.create_lease(&req).await?;
         let ws_url = resolve_ws_url(Some(&lease.ws_url), &node.url, &lease.session_id);
         save_session(
@@ -211,6 +226,20 @@ fn mvp_lease_request(os: Os, allowlist: Option<&str>) -> Result<LeaseRequest> {
     let req: LeaseRequest = serde_json::from_value(value)?;
     req.validate_mvp()?;
     Ok(req)
+}
+
+/// Is the stored lease still backed by a running guest?
+///
+/// A 404 means the node has no such lease, so the stored session is stale and
+/// the caller should replace it. Any other failure -- node down, auth, network
+/// -- must propagate: treating "cannot tell" as "dead" would start a second
+/// guest while the first is still running and billing.
+async fn session_is_live(client: &NodeClient, lease_id: &str) -> Result<bool> {
+    match client.get_lease(lease_id).await {
+        Ok(view) => Ok(view.live),
+        Err(Error::Api { status: 404, .. }) => Ok(false),
+        Err(err) => Err(err),
+    }
 }
 
 fn parse_os(s: &str) -> Result<Os> {

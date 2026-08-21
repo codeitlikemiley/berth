@@ -36,6 +36,9 @@ pub struct LeaseView {
     #[serde(default)]
     #[allow(dead_code)]
     pub elapsed_seconds: Option<u64>,
+    /// Whether the guest is actually running. A stored session outlives it.
+    #[serde(default)]
+    pub live: bool,
 }
 
 impl NodeClient {
@@ -58,6 +61,12 @@ impl NodeClient {
             .json(req)
             .send()
             .await?;
+        decode(res).await
+    }
+
+    pub async fn get_lease(&self, lease_id: &str) -> Result<LeaseView> {
+        let url = format!("{}/v1/leases/{lease_id}", self.base);
+        let res = self.authed(self.http.get(url)).send().await?;
         decode(res).await
     }
 

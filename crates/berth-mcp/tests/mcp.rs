@@ -80,7 +80,8 @@ fn sample_lease() -> Value {
         "ws_url": "ws://127.0.0.1:7432/v1/sessions/s_1",
         "viewer_url": "http://127.0.0.1:6080/vnc.html",
         "quote": sample_quote(),
-        "status": "active"
+        "status": "active",
+        "live": true
     })
 }
 
@@ -394,11 +395,86 @@ async fn existing_session_does_not_create_second_lease() {
     let url = format!("http://{}", server.addr());
     seed_pair(dir.path(), &url, TOKEN);
     seed_session(dir.path(), "ws://127.0.0.1:9/v1/sessions/s_1");
+    // The session is only reused once the node confirms the guest is alive.
+    server.expect(
+        Expectation::matching(request::method_path("GET", "/v1/leases/l_1"))
+            .times(1)
+            .respond_with(json_encoded(sample_lease())),
+    );
     let mcp = Mcp::new(dir.path());
     let result = mcp.call_tool("berth_lease", json!({ "os": "linux" })).await;
     assert!(!result.is_error, "{}", text_of(&result));
     assert!(text_of(&result).contains("current lease"));
     assert!(text_of(&result).contains("l_1"));
+}
+
+/// An agent holding a linux session that asks for windows used to be handed the
+/// linux guest with no error, because `os` was parsed after the early return.
+#[tokio::test]
+async fn unsupported_os_rejected_even_with_a_live_session() {
+    let (dir, _env) = home();
+    let server = Server::run();
+    let url = format!("http://{}", server.addr());
+    seed_pair(dir.path(), &url, TOKEN);
+    seed_session(dir.path(), "ws://127.0.0.1:9/v1/sessions/s_1");
+    let mcp = Mcp::new(dir.path());
+    let win = mcp
+        .call_tool("berth_lease", json!({ "os": "windows" }))
+        .await;
+    assert!(win.is_error, "{}", text_of(&win));
+    assert!(text_of(&win).contains("Windows"));
+    assert!(!text_of(&win).contains("current lease"));
+    let bogus = mcp.call_tool("berth_lease", json!({ "os": "nope" })).await;
+    assert!(bogus.is_error);
+    assert!(text_of(&bogus).contains("unknown os"));
+}
+
+/// The session file outlives the guest. A 404 means it is stale, so replace it
+/// rather than handing back a lease whose next screenshot 404s.
+#[tokio::test]
+async fn stale_session_is_replaced() {
+    let (dir, _env) = home();
+    let server = Server::run();
+    let url = format!("http://{}", server.addr());
+    seed_pair(dir.path(), &url, TOKEN);
+    seed_session(dir.path(), "ws://127.0.0.1:9/v1/sessions/s_1");
+    server.expect(
+        Expectation::matching(request::method_path("GET", "/v1/leases/l_1"))
+            .times(1)
+            .respond_with(status_code(404)),
+    );
+    server.expect(
+        Expectation::matching(request::method_path("POST", "/v1/leases"))
+            .times(1)
+            .respond_with(json_encoded(sample_lease())),
+    );
+    let mcp = Mcp::new(dir.path());
+    let result = mcp.call_tool("berth_lease", json!({ "os": "linux" })).await;
+    assert!(!result.is_error, "{}", text_of(&result));
+    assert!(text_of(&result).contains("leased"));
+}
+
+/// "Cannot tell" is not "dead": a node that fails to answer must not cause a
+/// second guest to be started while the first may still be running.
+#[tokio::test]
+async fn unverifiable_session_is_not_replaced() {
+    let (dir, _env) = home();
+    let server = Server::run();
+    let url = format!("http://{}", server.addr());
+    seed_pair(dir.path(), &url, TOKEN);
+    seed_session(dir.path(), "ws://127.0.0.1:9/v1/sessions/s_1");
+    server.expect(
+        Expectation::matching(request::method_path("GET", "/v1/leases/l_1"))
+            .times(1)
+            .respond_with(status_code(500)),
+    );
+    let mcp = Mcp::new(dir.path());
+    let result = mcp.call_tool("berth_lease", json!({ "os": "linux" })).await;
+    assert!(result.is_error, "{}", text_of(&result));
+    assert!(
+        dir.path().join("session.toml").exists(),
+        "session must survive an unverifiable probe"
+    );
 }
 
 #[tokio::test]
