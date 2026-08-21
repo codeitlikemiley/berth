@@ -70,6 +70,14 @@ impl Guest {
         }
     }
 
+    pub(crate) fn container_id(&self) -> Option<&str> {
+        match self {
+            Self::Docker(s) => Some(s.container_id()),
+            #[cfg(test)]
+            Self::Stub(_) => None,
+        }
+    }
+
     pub(crate) async fn exec(&mut self, batch: ActionBatch) -> Result<ExecOutput> {
         match self {
             Self::Docker(s) => s.exec(batch).await,

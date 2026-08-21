@@ -13,6 +13,7 @@ use axum::routing::{get, post};
 use axum::{Router, middleware};
 use berth_protocol::{ActionBatch, LeaseRequest, Quote};
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 
 use crate::db::{Db, LeaseRow, NewLease};
 use crate::error::{Error, Result};
@@ -34,6 +35,7 @@ struct Inner {
     live: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<Guest>>>>,
     docker: tokio::sync::Mutex<Option<SessionManager>>,
     mode: GuestMode,
+    shutting_down: watch::Sender<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +81,7 @@ impl AppState {
     fn open_mode(db_path: &Path, bind: SocketAddr, mode: GuestMode) -> Result<Self> {
         let db = Db::open(db_path)?;
         db.ensure_pairing_code()?;
+        let (shutting_down, _) = watch::channel(false);
         Ok(Self {
             inner: Arc::new(Inner {
                 db,
@@ -86,6 +89,7 @@ impl AppState {
                 live: tokio::sync::Mutex::new(HashMap::new()),
                 docker: tokio::sync::Mutex::new(None),
                 mode,
+                shutting_down,
             }),
         })
     }
@@ -96,6 +100,56 @@ impl AppState {
 
     fn pairing_code(&self) -> Result<String> {
         self.inner.db.pairing_code()
+    }
+
+    fn begin_shutdown(&self) {
+        self.inner.shutting_down.send_replace(true);
+    }
+
+    fn shutdown_rx(&self) -> watch::Receiver<bool> {
+        self.inner.shutting_down.subscribe()
+    }
+
+    async fn docker_manager(&self) -> Result<SessionManager> {
+        let mut slot = self.inner.docker.lock().await;
+        if slot.is_none() {
+            *slot = Some(SessionManager::connect()?);
+        }
+        Ok(slot.as_ref().expect("docker slot").clone())
+    }
+
+    async fn reap_session(&self, session_id: &str, container_id: Option<&str>) -> Result<()> {
+        match self.inner.mode {
+            GuestMode::Docker => {
+                self.docker_manager()
+                    .await?
+                    .reap(session_id, container_id)
+                    .await
+            }
+            #[cfg(test)]
+            GuestMode::Stub => Ok(()),
+        }
+    }
+
+    /// Stop live guests, reap Docker leftovers, write billable_seconds.
+    async fn drain(&self) {
+        let guests: Vec<_> = {
+            let mut live = self.inner.live.lock().await;
+            live.drain().map(|(_, g)| g).collect()
+        };
+        for guest in guests {
+            let mut guest = guest.lock().await;
+            let _ = guest.stop().await;
+        }
+        let Ok(active) = self.inner.db.active_leases() else {
+            return;
+        };
+        for row in active {
+            let _ = self
+                .reap_session(&row.session_id, row.container_id.as_deref())
+                .await;
+            let _ = self.inner.db.stop_lease(&row.id);
+        }
     }
 }
 
@@ -109,7 +163,6 @@ pub fn default_db_path() -> Result<PathBuf> {
             PathBuf::from(home).join(".berth")
         }
     };
-    std::fs::create_dir_all(&dir)?;
     Ok(dir.join("node.db"))
 }
 
@@ -139,12 +192,38 @@ pub async fn serve(bind: SocketAddr) -> Result<()> {
     let actual = listener.local_addr()?;
     state.set_bind(actual);
     eprintln!("listening on {actual}");
+    let shutdown_state = state.clone();
     axum::serve(listener, router(state))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
+        .with_graceful_shutdown(async move {
+            wait_shutdown_signal().await;
+            shutdown_state.begin_shutdown();
+            shutdown_state.drain().await;
         })
         .await?;
     Ok(())
+}
+
+async fn wait_shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        let mut term =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(_) => {
+                    let _ = ctrl_c.await;
+                    return;
+                }
+            };
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = ctrl_c.await;
+    }
 }
 
 pub fn serve_blocking(bind: SocketAddr) -> Result<()> {
@@ -228,6 +307,7 @@ async fn create_lease(
     let session_id = guest.session_id().to_string();
     let workspace_id = guest.workspace_id().to_string();
     let viewer_port = guest.viewer_port();
+    let container_id = guest.container_id().map(str::to_string);
     let lease_id = new_id("l");
     let bind = *state.inner.bind.lock().expect("bind lock");
     let ws_url = format!("ws://{}/v1/sessions/{session_id}", advertise(bind));
@@ -242,6 +322,7 @@ async fn create_lease(
         viewer_url: viewer_url.clone(),
         min_seconds: quote.min_seconds,
         viewer_port,
+        container_id,
     };
     if let Err(err) = state.inner.db.insert_lease(&persist) {
         let _ = guest.stop().await;
@@ -289,6 +370,10 @@ async fn delete_lease(
         };
         if let Some(handle) = handle {
             handle.lock().await.stop().await?;
+        } else {
+            state
+                .reap_session(&row.session_id, row.container_id.as_deref())
+                .await?;
         }
         state.inner.live.lock().await.remove(&row.session_id);
     }
@@ -311,34 +396,52 @@ async fn session_ws(
 }
 
 async fn ws_loop(mut socket: WebSocket, session_id: String, state: AppState) {
-    while let Some(msg) = socket.recv().await {
-        let Ok(msg) = msg else {
-            break;
-        };
-        match msg {
-            Message::Text(text) => {
-                if let Err(err) = handle_text(&mut socket, &session_id, &state, text.as_str()).await
-                {
-                    let payload =
-                        serde_json::json!({"type": "error", "error": err.to_string()}).to_string();
-                    if socket.send(Message::Text(payload.into())).await.is_err() {
-                        break;
-                    }
-                    if matches!(err, Error::NotFound | Error::Stopped) {
-                        break;
-                    }
-                }
-            }
-            Message::Binary(_) => {
-                let payload =
-                    serde_json::json!({"type": "error", "error": "expected text ActionBatch"})
-                        .to_string();
-                if socket.send(Message::Text(payload.into())).await.is_err() {
+    let mut shutdown = state.shutdown_rx();
+    if *shutdown.borrow() {
+        return;
+    }
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
                     break;
                 }
             }
-            Message::Close(_) => break,
-            Message::Ping(_) | Message::Pong(_) => {}
+            msg = socket.recv() => {
+                let Some(msg) = msg else { break; };
+                let Ok(msg) = msg else { break; };
+                match msg {
+                    Message::Text(text) => {
+                        if let Err(err) =
+                            handle_text(&mut socket, &session_id, &state, text.as_str()).await
+                        {
+                            let payload = serde_json::json!({
+                                "type": "error",
+                                "error": err.to_string()
+                            })
+                            .to_string();
+                            if socket.send(Message::Text(payload.into())).await.is_err() {
+                                break;
+                            }
+                            if matches!(err, Error::NotFound | Error::Stopped) {
+                                break;
+                            }
+                        }
+                    }
+                    Message::Binary(_) => {
+                        let payload = serde_json::json!({
+                            "type": "error",
+                            "error": "expected text ActionBatch"
+                        })
+                        .to_string();
+                        if socket.send(Message::Text(payload.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Message::Close(_) => break,
+                    Message::Ping(_) | Message::Pong(_) => {}
+                }
+            }
         }
     }
 }
@@ -753,5 +856,86 @@ mod tests {
         assert_eq!(frame_json["type"], "frame");
         assert_eq!(frame_json["session_id"], session_id);
         assert_eq!(frame_json["mime"], "image/png");
+    }
+
+    #[tokio::test]
+    async fn drain_settles_active_leases() {
+        let (_dir, state) = test_state();
+        let code = state.pairing_code().unwrap();
+        let app = router(state.clone());
+        let token = pair_token(&app, &code).await;
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/leases")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(sample_lease().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let lease = body_json(created).await;
+        let lease_id = lease["lease_id"].as_str().unwrap().to_string();
+
+        state.begin_shutdown();
+        state.drain().await;
+
+        let got = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/leases/{lease_id}"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(got.status(), StatusCode::OK);
+        let json = body_json(got).await;
+        assert_eq!(json["status"], "stopped");
+        assert_eq!(json["billable_seconds"], 60);
+    }
+
+    #[tokio::test]
+    async fn delete_settles_without_live_handle() {
+        let (_dir, state) = test_state();
+        let code = state.pairing_code().unwrap();
+        let app = router(state.clone());
+        let token = pair_token(&app, &code).await;
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/leases")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(sample_lease().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let lease = body_json(created).await;
+        let lease_id = lease["lease_id"].as_str().unwrap().to_string();
+        state.inner.live.lock().await.clear();
+
+        let deleted = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/v1/leases/{lease_id}"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::OK);
+        let json = body_json(deleted).await;
+        assert_eq!(json["status"], "stopped");
+        assert_eq!(json["billable_seconds"], 60);
     }
 }

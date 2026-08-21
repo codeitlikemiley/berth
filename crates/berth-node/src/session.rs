@@ -76,30 +76,23 @@ impl SessionManager {
 
         self.ensure_volume(&volume).await?;
         self.create_session_network(&network, &session_id).await?;
+        // Drop (cancel or error) removes the in-flight network/container.
+        let mut guard = StartGuard::new(self.docker.clone(), network.clone());
 
-        let created = match self
+        let created = self
             .docker
             .create_container(
                 Some(CreateContainerOptionsBuilder::default().name(&name).build()),
                 body,
             )
-            .await
-        {
-            Ok(created) => created,
-            Err(err) => {
-                remove_session_network(&self.docker, &network).await;
-                return Err(err.into());
-            }
-        };
+            .await?;
         let container_id = created.id;
+        guard.arm_container(container_id.clone());
 
-        if let Err(err) = self.boot(&container_id).await {
-            let _ = self.remove_container(&container_id).await;
-            remove_session_network(&self.docker, &network).await;
-            return Err(err);
-        }
+        self.boot(&container_id).await?;
 
         let viewer_port = self.viewer_port(&container_id).await;
+        guard.disarm();
         Ok(Session {
             docker: self.docker.clone(),
             container_id,
@@ -112,6 +105,19 @@ impl SessionManager {
             last_frame: None,
             stopped: false,
         })
+    }
+
+    /// Force-remove container + session network. Docker 404 is success (already gone).
+    pub async fn reap(&self, session_id: &str, container_id: Option<&str>) -> Result<()> {
+        if let Some(id) = container_id.filter(|id| !id.is_empty()) {
+            force_remove_container(&self.docker, id).await?;
+        }
+        let name = container_name(session_id);
+        if container_id.is_none_or(|id| id != name) {
+            force_remove_container(&self.docker, &name).await?;
+        }
+        remove_session_network(&self.docker, &network_name(session_id)).await;
+        Ok(())
     }
 
     async fn ensure_volume(&self, name: &str) -> Result<()> {
@@ -174,21 +180,6 @@ impl SessionManager {
         bindings
             .iter()
             .find_map(|b| b.host_port.as_deref().and_then(|p| p.parse().ok()))
-    }
-
-    async fn remove_container(&self, container_id: &str) -> Result<()> {
-        self.docker
-            .remove_container(
-                container_id,
-                Some(
-                    RemoveContainerOptionsBuilder::default()
-                        .force(true)
-                        .v(false)
-                        .build(),
-                ),
-            )
-            .await?;
-        Ok(())
     }
 }
 
@@ -336,22 +327,13 @@ impl Session {
 
     /// Remove the container (and its private network). The workspace volume is kept.
     ///
-    /// On failure the session stays usable so `stop` can be retried.
+    /// Docker 404 is success so a restarted node can still close the ledger.
+    /// On other failures the session stays usable so `stop` can be retried.
     pub async fn stop(&mut self) -> Result<()> {
         if self.stopped {
             return Ok(());
         }
-        self.docker
-            .remove_container(
-                &self.container_id,
-                Some(
-                    RemoveContainerOptionsBuilder::default()
-                        .force(true)
-                        .v(false)
-                        .build(),
-                ),
-            )
-            .await?;
+        force_remove_container(&self.docker, &self.container_id).await?;
         self.stopped = true;
         remove_session_network(&self.docker, &self.network).await;
         Ok(())
@@ -369,24 +351,60 @@ impl Drop for Session {
         let network = self.network.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                let _ = docker
-                    .remove_container(
-                        &container_id,
-                        Some(
-                            RemoveContainerOptionsBuilder::default()
-                                .force(true)
-                                .v(false)
-                                .build(),
-                        ),
-                    )
-                    .await;
+                let _ = force_remove_container(&docker, &container_id).await;
                 remove_session_network(&docker, &network).await;
             });
         }
     }
 }
 
-fn network_already_gone(err: &bollard::errors::Error) -> bool {
+/// Owns an in-flight create/boot so request cancellation cannot leak a container.
+struct StartGuard {
+    docker: Docker,
+    container_id: Option<String>,
+    network: String,
+    disarmed: bool,
+}
+
+impl StartGuard {
+    fn new(docker: Docker, network: String) -> Self {
+        Self {
+            docker,
+            container_id: None,
+            network,
+            disarmed: false,
+        }
+    }
+
+    fn arm_container(&mut self, id: String) {
+        self.container_id = Some(id);
+    }
+
+    fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for StartGuard {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        let docker = self.docker.clone();
+        let container_id = self.container_id.take();
+        let network = self.network.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Some(id) = container_id {
+                    let _ = force_remove_container(&docker, &id).await;
+                }
+                remove_session_network(&docker, &network).await;
+            });
+        }
+    }
+}
+
+fn docker_not_found(err: &bollard::errors::Error) -> bool {
     matches!(
         err,
         bollard::errors::Error::DockerResponseServerError {
@@ -396,12 +414,31 @@ fn network_already_gone(err: &bollard::errors::Error) -> bool {
     )
 }
 
+async fn force_remove_container(docker: &Docker, id: &str) -> Result<()> {
+    match docker
+        .remove_container(
+            id,
+            Some(
+                RemoveContainerOptionsBuilder::default()
+                    .force(true)
+                    .v(false)
+                    .build(),
+            ),
+        )
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(err) if docker_not_found(&err) => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
 /// Best-effort delete. 404 is success. "active endpoints" is retried.
 async fn remove_session_network(docker: &Docker, name: &str) {
     for attempt in 0..NETWORK_RM_TRIES {
         match docker.remove_network(name).await {
             Ok(()) => return,
-            Err(err) if network_already_gone(&err) => return,
+            Err(err) if docker_not_found(&err) => return,
             Err(_) if attempt + 1 == NETWORK_RM_TRIES => return,
             Err(_) => sleep(NETWORK_RM_DELAY).await,
         }
@@ -614,14 +651,20 @@ mod tests {
     }
 
     #[test]
-    fn missing_network_is_gone() {
-        assert!(network_already_gone(
+    fn missing_docker_object_is_gone() {
+        assert!(docker_not_found(
             &bollard::errors::Error::DockerResponseServerError {
                 status_code: 404,
                 message: "network not found".into(),
             }
         ));
-        assert!(!network_already_gone(
+        assert!(docker_not_found(
+            &bollard::errors::Error::DockerResponseServerError {
+                status_code: 404,
+                message: "No such container".into(),
+            }
+        ));
+        assert!(!docker_not_found(
             &bollard::errors::Error::DockerResponseServerError {
                 status_code: 403,
                 message: "active endpoints".into(),

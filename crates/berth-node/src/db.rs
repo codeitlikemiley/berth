@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -48,10 +49,17 @@ CREATE TABLE IF NOT EXISTS sessions (
     workspace_id TEXT NOT NULL,
     status TEXT NOT NULL,
     viewer_port INTEGER,
+    container_id TEXT,
     created_at INTEGER NOT NULL,
     stopped_at INTEGER
 );
 "#;
+
+const LEASE_SELECT: &str = "SELECT leases.id, leases.session_id, leases.status, leases.quote_json,
+        leases.ws_url, leases.viewer_url, leases.started_at, leases.min_seconds,
+        leases.elapsed_seconds, leases.billable_seconds, sessions.container_id
+ FROM leases
+ LEFT JOIN sessions ON sessions.id = leases.session_id";
 
 pub(crate) fn billable_seconds(min_seconds: u64, elapsed: u64) -> u64 {
     elapsed.max(min_seconds)
@@ -59,6 +67,7 @@ pub(crate) fn billable_seconds(min_seconds: u64, elapsed: u64) -> u64 {
 
 pub(crate) struct Db {
     conn: Mutex<Connection>,
+    pair_file: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +82,7 @@ pub(crate) struct LeaseRow {
     pub min_seconds: i64,
     pub elapsed_seconds: Option<i64>,
     pub billable_seconds: Option<i64>,
+    pub container_id: Option<String>,
 }
 
 pub(crate) struct NewLease {
@@ -85,20 +95,31 @@ pub(crate) struct NewLease {
     pub viewer_url: Option<String>,
     pub min_seconds: u64,
     pub viewer_port: Option<u16>,
+    pub container_id: Option<String>,
 }
 
 impl Db {
     pub(crate) fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            secure_mkdir(parent)?;
         }
+        let pair_file = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .join("pair.code");
         let conn = Connection::open(path)?;
+        secure_file(path)?;
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN container_id TEXT", []);
+        secure_file(&sidecar(path, "-wal"))?;
+        secure_file(&sidecar(path, "-shm"))?;
         Ok(Self {
             conn: Mutex::new(conn),
+            pair_file,
         })
     }
 
@@ -107,28 +128,80 @@ impl Db {
     }
 
     pub(crate) fn ensure_pairing_code(&self) -> Result<String> {
+        if let Ok(raw) = std::fs::read_to_string(&self.pair_file) {
+            let code = raw.trim();
+            if !code.is_empty() {
+                self.store_pairing_hash(code)?;
+                return Ok(code.to_string());
+            }
+        }
+        if let Some(legacy) = self.take_legacy_pairing_secret()? {
+            write_secret_file(&self.pair_file, &legacy)?;
+            self.store_pairing_hash(&legacy)?;
+            return Ok(legacy);
+        }
+        let code = random_pairing_code()?;
+        write_secret_file(&self.pair_file, &code)?;
+        self.store_pairing_hash(&code)?;
+        Ok(code)
+    }
+
+    fn take_legacy_pairing_secret(&self) -> Result<Option<String>> {
         let conn = self.lock();
-        let existing: Option<String> = conn
+        let secret: Option<String> = conn
             .query_row(
                 "SELECT secret FROM pair_tokens
+                 WHERE kind = 'pairing_code' AND secret != '' AND revoked_at IS NULL
+                 LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if secret.is_some() {
+            conn.execute(
+                "UPDATE pair_tokens SET secret = '' WHERE kind = 'pairing_code'",
+                [],
+            )?;
+        }
+        Ok(secret
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()))
+    }
+
+    fn store_pairing_hash(&self, code: &str) -> Result<()> {
+        let hash = sha256_hex(&normalize_code(code));
+        let now = unix_now();
+        let mut conn = self.lock();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT secret_hash FROM pair_tokens
                  WHERE kind = 'pairing_code' AND revoked_at IS NULL
                  LIMIT 1",
                 [],
                 |row| row.get(0),
             )
             .optional()?;
-        if let Some(code) = existing {
-            return Ok(code);
+        if existing.as_deref() == Some(hash.as_str()) {
+            conn.execute(
+                "UPDATE pair_tokens SET secret = ''
+                 WHERE kind = 'pairing_code' AND secret != ''",
+                [],
+            )?;
+            return Ok(());
         }
-        let code = random_pairing_code()?;
-        let hash = sha256_hex(&normalize_code(&code));
-        let now = unix_now();
-        conn.execute(
-            "INSERT INTO pair_tokens (kind, secret, secret_hash, created_at)
-             VALUES ('pairing_code', ?1, ?2, ?3)",
-            params![code, hash, now],
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE pair_tokens SET revoked_at = ?1
+             WHERE kind = 'pairing_code' AND revoked_at IS NULL",
+            params![now],
         )?;
-        Ok(code)
+        tx.execute(
+            "INSERT INTO pair_tokens (kind, secret, secret_hash, created_at)
+             VALUES ('pairing_code', '', ?1, ?2)",
+            params![hash, now],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub(crate) fn pairing_code(&self) -> Result<String> {
@@ -222,13 +295,14 @@ impl Db {
         )?;
         tx.execute(
             "INSERT INTO sessions (
-                id, lease_id, workspace_id, status, viewer_port, created_at
-             ) VALUES (?1, ?2, ?3, 'active', ?4, ?5)",
+                id, lease_id, workspace_id, status, viewer_port, container_id, created_at
+             ) VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?6)",
             params![
                 lease.session_id,
                 lease.lease_id,
                 lease.workspace_id,
                 viewer_port,
+                lease.container_id,
                 now,
             ],
         )?;
@@ -238,6 +312,17 @@ impl Db {
 
     pub(crate) fn get_lease(&self, lease_id: &str) -> Result<LeaseRow> {
         get_lease_conn(&self.lock(), lease_id)
+    }
+
+    pub(crate) fn active_leases(&self) -> Result<Vec<LeaseRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!("{LEASE_SELECT} WHERE leases.status = 'active'"))?;
+        let rows = stmt.query_map([], lease_from_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     pub(crate) fn stop_lease(&self, lease_id: &str) -> Result<LeaseRow> {
@@ -268,9 +353,7 @@ impl Db {
 
 fn get_lease_conn(conn: &Connection, lease_id: &str) -> Result<LeaseRow> {
     conn.query_row(
-        "SELECT id, session_id, status, quote_json, ws_url, viewer_url,
-                started_at, min_seconds, elapsed_seconds, billable_seconds
-         FROM leases WHERE id = ?1",
+        &format!("{LEASE_SELECT} WHERE leases.id = ?1"),
         params![lease_id],
         lease_from_row,
     )
@@ -292,7 +375,56 @@ fn lease_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LeaseRow> {
         min_seconds: row.get(7)?,
         elapsed_seconds: row.get(8)?,
         billable_seconds: row.get(9)?,
+        container_id: row.get(10)?,
     })
+}
+
+fn sidecar(db: &Path, suffix: &str) -> PathBuf {
+    let mut s = db.as_os_str().to_owned();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+fn secure_mkdir(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(path)?;
+    set_mode(path, 0o700)
+}
+
+fn secure_file(path: &Path) -> Result<()> {
+    if path.exists() {
+        set_mode(path, 0o600)?;
+    }
+    Ok(())
+}
+
+fn write_secret_file(path: &Path, contents: &str) -> Result<()> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
+    file.write_all(contents.as_bytes())?;
+    file.write_all(b"\n")?;
+    file.flush()?;
+    secure_file(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path)?.permissions();
+    perms.set_mode(mode);
+    std::fs::set_permissions(path, perms)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -308,10 +440,22 @@ mod tests {
 
     #[test]
     fn pairing_code_stable_and_bearer_rotates() {
-        let (_dir, db) = tmp_db();
+        let (dir, db) = tmp_db();
         let a = db.ensure_pairing_code().unwrap();
         let b = db.ensure_pairing_code().unwrap();
         assert_eq!(a, b);
+        let stored = std::fs::read_to_string(dir.path().join("pair.code")).unwrap();
+        assert_eq!(stored.trim(), a);
+        let conn = Connection::open(dir.path().join("node.db")).unwrap();
+        let secret: String = conn
+            .query_row(
+                "SELECT secret FROM pair_tokens
+                 WHERE kind = 'pairing_code' AND revoked_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(secret, "");
         assert!(db.check_pair_code(&a).unwrap());
         assert!(db.check_pair_code(&a.to_lowercase()).unwrap());
         assert!(!db.check_pair_code("nope-nope").unwrap());
@@ -323,6 +467,30 @@ mod tests {
         assert!(!db.bearer_valid(&t1).unwrap());
         assert!(db.bearer_valid(&t2).unwrap());
         assert!(!db.bearer_valid(&a).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn data_dir_and_secrets_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let nest = dir.path().join("berth");
+        let db = Db::open(&nest.join("node.db")).unwrap();
+        db.ensure_pairing_code().unwrap();
+        let dir_mode = std::fs::metadata(&nest).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        let db_mode = std::fs::metadata(nest.join("node.db"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(db_mode, 0o600);
+        let code_mode = std::fs::metadata(nest.join("pair.code"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(code_mode, 0o600);
     }
 
     #[test]
@@ -345,10 +513,12 @@ mod tests {
             viewer_url: Some("http://127.0.0.1:6080/vnc.html".into()),
             min_seconds: 60,
             viewer_port: Some(6080),
+            container_id: Some("abc123".into()),
         })
         .unwrap();
         let row = db.get_lease("l_1").unwrap();
         assert_eq!(row.status, "active");
+        assert_eq!(row.container_id.as_deref(), Some("abc123"));
         assert!(row.billable_seconds.is_none());
         let stopped = db.stop_lease("l_1").unwrap();
         assert_eq!(stopped.status, "stopped");
