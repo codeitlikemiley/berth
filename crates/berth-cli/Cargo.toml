@@ -10,4 +10,5 @@ name = "berth"
 path = "src/main.rs"
 
 [dependencies]
+berth-node = { version = "0.1.0", path = "../berth-node" }
 clap.workspace = true

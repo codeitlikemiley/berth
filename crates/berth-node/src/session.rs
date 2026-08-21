@@ -18,6 +18,7 @@ use crate::docker::{
     session_network_create, volume_create, volume_name,
 };
 use crate::error::{Error, Result};
+use crate::id::new_id;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const READY_POLL: Duration = Duration::from_millis(200);
@@ -54,13 +55,7 @@ impl SessionManager {
     pub async fn start(&self, req: &LeaseRequest) -> Result<Session> {
         req.validate_mvp()?;
         let session_id = new_id("s");
-        let workspace_id = req
-            .workspace
-            .as_ref()
-            .map(|w| w.id.as_str())
-            .filter(|id| !id.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| new_id("ws"));
+        let workspace_id = workspace_id_from_req(req);
         let volume = volume_name(&workspace_id);
         let network = network_name(&session_id);
         let name = container_name(&session_id);
@@ -542,12 +537,13 @@ fn now_ts() -> u64 {
         .unwrap_or(0)
 }
 
-fn new_id(prefix: &str) -> String {
-    let ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("{prefix}_{ns:x}")
+pub(crate) fn workspace_id_from_req(req: &LeaseRequest) -> String {
+    req.workspace
+        .as_ref()
+        .map(|w| w.id.as_str())
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| new_id("ws"))
 }
 
 #[cfg(test)]

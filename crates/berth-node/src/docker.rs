@@ -9,6 +9,7 @@ use bollard::models::{
 use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
+use crate::id::hex_lower;
 
 pub const DEFAULT_IMAGE: &str = "berthos-linux-xfce:dev";
 pub const WORKSPACE_MOUNT: &str = "/workspace";
@@ -87,16 +88,6 @@ fn is_docker_name_suffix(s: &str) -> bool {
 fn sha8(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     hex_lower(&digest[..4])
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    out
 }
 
 pub fn host_config(resources: &Resources, volume: &str, network: &str) -> Result<HostConfig> {

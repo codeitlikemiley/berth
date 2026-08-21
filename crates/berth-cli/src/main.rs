@@ -1,5 +1,7 @@
-use clap::{Parser, Subcommand};
+use std::net::SocketAddr;
 use std::process::ExitCode;
+
+use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -17,7 +19,8 @@ enum Command {
     /// Start a computer session
     Up,
     /// Run a berth node
-    Node,
+    #[command(subcommand)]
+    Node(NodeCmd),
     /// MCP stdio server
     Mcp,
     /// Pair with a node
@@ -32,8 +35,29 @@ enum Command {
     Doctor,
 }
 
+#[derive(Debug, Subcommand)]
+enum NodeCmd {
+    /// Start the HTTP/WS control plane
+    Up {
+        /// Listen address (loopback default; never host-network)
+        #[arg(long, default_value = "127.0.0.1:7432")]
+        bind: SocketAddr,
+    },
+}
+
 fn main() -> ExitCode {
-    let _cli = Cli::parse();
-    eprintln!("not implemented");
-    ExitCode::from(2)
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Node(NodeCmd::Up { bind }) => match berth_node::serve_blocking(bind) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("{err}");
+                ExitCode::from(1)
+            }
+        },
+        _ => {
+            eprintln!("not implemented");
+            ExitCode::from(2)
+        }
+    }
 }
