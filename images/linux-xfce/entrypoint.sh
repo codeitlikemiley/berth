@@ -51,6 +51,26 @@ apply_egress() {
     || iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
 
   if [ -z "${BERTH_ALLOWLIST}" ]; then
+    # Docker DNATs 127.0.0.11:53 to an ephemeral port in nat OUTPUT, and nat
+    # OUTPUT runs before filter OUTPUT. A --dport 53 match therefore never sees
+    # the embedded resolver, and the loopback ACCEPT below would let every
+    # lookup through -- deny-all would still resolve names. Drop the resolver
+    # by address, ahead of that ACCEPT.
+    local dns_ns
+    while read -r dns_ns; do
+      [ -n "$dns_ns" ] || continue
+      case "$dns_ns" in
+        *[!0-9.]*) continue ;;
+      esac
+      iptables -A OUTPUT -d "$dns_ns" -j DROP
+    done <<EOF
+$(awk '/^nameserver[ \t]+/ { print $2 }' /etc/resolv.conf 2>/dev/null || true)
+EOF
+    # Fixed address of Docker's embedded resolver, even if resolv.conf was
+    # edited. -C first so the usual case (it is already the nameserver above)
+    # does not add a duplicate rule.
+    iptables -C OUTPUT -d 127.0.0.11 -j DROP 2>/dev/null \
+      || iptables -A OUTPUT -d 127.0.0.11 -j DROP
     iptables -A OUTPUT -p udp --dport 53 -j DROP
     iptables -A OUTPUT -p tcp --dport 53 -j DROP
   fi
