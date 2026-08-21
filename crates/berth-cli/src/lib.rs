@@ -12,7 +12,8 @@ use clap::{Parser, Subcommand};
 use crate::client::{LeaseView, NodeClient};
 use crate::config::{
     Config, DEFAULT_NODE, DEFAULT_URL, NodeConfig, Session, berth_home, clear_session,
-    load_session, normalize_url, require_session, resolve_ws_url, save_session, validate_node_name,
+    load_session, normalize_url, require_session, resolve_ws_url, save_session, url_is_loopback,
+    validate_node_name,
 };
 pub use crate::error::{Error, Result};
 
@@ -108,6 +109,11 @@ pub fn exit(cli: Cli) -> ExitCode {
 pub fn execute(cli: Cli, home: &Path) -> Result<String> {
     match cli.command {
         Command::Node(NodeCmd::Up { bind, tunnel }) => {
+            if tunnel.is_some() && !bind.ip().is_loopback() {
+                return Err(Error::Usage(
+                    "--tunnel requires a loopback --bind (cloudflared is the public edge)".into(),
+                ));
+            }
             let tunnel = tunnel.map(|t| match t {
                 TunnelArg::Cloudflare => berth_node::TunnelKind::Cloudflare,
             });
@@ -169,7 +175,7 @@ fn cmd_up(home: &Path, os: &str, node: &str) -> Result<String> {
             ws_url: Some(ws_url),
         },
     )?;
-    Ok(format_up(&lease))
+    Ok(format_up(&lease, &node_cfg.url))
 }
 
 fn cmd_view(home: &Path) -> Result<String> {
@@ -229,12 +235,14 @@ fn mvp_lease_request(os: Os) -> Result<LeaseRequest> {
     Ok(req)
 }
 
-fn format_up(lease: &LeaseView) -> String {
+fn format_up(lease: &LeaseView, node_url: &str) -> String {
     let mut lines = vec![format!(
         "lease {} session {}",
         lease.lease_id, lease.session_id
     )];
-    if let Some(viewer) = &lease.viewer_url {
+    if url_is_loopback(node_url)
+        && let Some(viewer) = &lease.viewer_url
+    {
         lines.push(format!("viewer {viewer}"));
     }
     lines.push(format_quote(&lease.lease_id, &lease.quote));
@@ -248,7 +256,9 @@ fn format_status(node: &str, url: &str, lease: &LeaseView) -> String {
         format!("session: {}", lease.session_id),
         format!("node: {node} ({url})"),
     ];
-    if let Some(viewer) = &lease.viewer_url {
+    if url_is_loopback(url)
+        && let Some(viewer) = &lease.viewer_url
+    {
         lines.push(format!("viewer: {viewer}"));
     }
     if let Some(secs) = lease.billable_seconds {
@@ -525,6 +535,55 @@ mod tests {
             plain.command,
             Command::Node(NodeCmd::Up { tunnel: None, .. })
         ));
+    }
+
+    #[test]
+    fn node_up_tunnel_rejects_non_loopback_bind() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = run(
+            dir.path(),
+            &[
+                "node",
+                "up",
+                "--tunnel",
+                "cloudflare",
+                "--bind",
+                "0.0.0.0:7432",
+            ],
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("loopback"), "{msg}");
+        assert!(msg.contains("--tunnel"), "{msg}");
+    }
+
+    #[test]
+    fn pair_url_rejects_query_without_echoing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = run(
+            dir.path(),
+            &[
+                "pair",
+                "--url",
+                "https://host.example/?token=brt_secret",
+                "--code",
+                "ABCD-EFGH",
+            ],
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("query string"), "{msg}");
+        assert!(!msg.contains("brt_secret"), "{msg}");
+        assert!(!msg.contains("host.example"), "{msg}");
+    }
+
+    #[test]
+    fn format_up_omits_loopback_viewer_when_node_is_remote() {
+        let lease: LeaseView = serde_json::from_value(sample_lease("active", None)).unwrap();
+        assert!(format_up(&lease, "http://127.0.0.1:7432").contains("6080"));
+        let remote = format_up(&lease, "https://unit-test.trycloudflare.com");
+        assert!(!remote.contains("127.0.0.1"));
+        assert!(!remote.contains("viewer"));
     }
 
     #[test]

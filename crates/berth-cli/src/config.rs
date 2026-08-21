@@ -88,6 +88,9 @@ pub fn normalize_url(raw: &str) -> Result<String> {
     if raw.is_empty() {
         return Err(Error::Usage("url is empty".into()));
     }
+    if raw.contains('?') || raw.contains('#') {
+        return Err(Error::Usage("url must not include a query string".into()));
+    }
     if !(raw.starts_with("http://") || raw.starts_with("https://")) {
         return Err(Error::Usage(
             "url must start with http:// or https://".into(),
@@ -124,7 +127,7 @@ pub fn resolve_ws_url(ws_url: Option<&str>, node_url: &str, session_id: &str) ->
     url.to_string()
 }
 
-fn url_is_loopback(url: &str) -> bool {
+pub(crate) fn url_is_loopback(url: &str) -> bool {
     url_host(url).is_some_and(host_is_loopback)
 }
 
@@ -331,6 +334,17 @@ token = "brt_test"
             "http://127.0.0.1:7432"
         );
         assert!(normalize_url("ftp://x").is_err());
+    }
+
+    #[test]
+    fn normalize_url_rejects_query_and_fragment() {
+        let err = normalize_url("https://host.example/?token=brt_secret").unwrap_err();
+        assert!(err.to_string().contains("query string"));
+        assert!(!err.to_string().contains("brt_secret"));
+        assert!(!err.to_string().contains("host.example"));
+        let hash = normalize_url("https://host.example/#token").unwrap_err();
+        assert!(hash.to_string().contains("query string"));
+        assert!(!hash.to_string().contains("token"));
     }
 
     #[test]

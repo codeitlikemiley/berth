@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 
 const URL_TIMEOUT: Duration = Duration::from_secs(30);
 const TERM_WAIT: Duration = Duration::from_secs(2);
-const EARLY_EXIT_WAIT: Duration = Duration::from_millis(150);
+const EARLY_EXIT_WAIT: Duration = Duration::from_millis(500);
 
 const MISSING_CLOUDFLARED: &str = "\
 cloudflared is not installed; required for --tunnel cloudflare
@@ -42,28 +42,49 @@ impl TunnelChild {
         })
     }
 
+    fn mark_reaped(&mut self) {
+        self.pid = 0;
+    }
+
+    pub(crate) async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let child = self
+            .child
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("cloudflared child is gone"))?;
+        let status = child.wait().await?;
+        self.mark_reaped();
+        Ok(status)
+    }
+
     pub async fn shutdown(mut self) {
-        terminate_group(self.pid);
-        let Some(mut child) = self.child.take() else {
-            return;
-        };
-        match tokio::time::timeout(TERM_WAIT, child.wait()).await {
-            Ok(_) => {}
-            Err(_) => {
-                kill_group(self.pid);
-                let _ = tokio::time::timeout(TERM_WAIT, child.wait()).await;
+        if self.pid > 1 {
+            terminate_group(self.pid);
+        }
+        if let Some(mut child) = self.child.take() {
+            match tokio::time::timeout(TERM_WAIT, child.wait()).await {
+                Ok(_) => {}
+                Err(_) => {
+                    if self.pid > 1 {
+                        kill_group(self.pid);
+                    }
+                    let _ = tokio::time::timeout(TERM_WAIT, child.wait()).await;
+                }
             }
         }
+        self.mark_reaped();
     }
 }
 
 impl Drop for TunnelChild {
     fn drop(&mut self) {
-        terminate_group(self.pid);
-        kill_group(self.pid);
+        if self.pid > 1 {
+            terminate_group(self.pid);
+            kill_group(self.pid);
+        }
         if let Some(mut child) = self.child.take() {
             let _ = child.start_kill();
         }
+        self.pid = 0;
     }
 }
 
@@ -137,20 +158,18 @@ pub(crate) fn normalize_public_origin(raw: &str) -> Result<String> {
             "public origin must not include a query string".into(),
         ));
     }
-    let (scheme, rest) = if let Some(rest) = raw.strip_prefix("https://") {
-        ("https", rest)
-    } else if let Some(rest) = raw.strip_prefix("http://") {
-        ("http", rest)
-    } else if raw.contains("://") {
-        return Err(Error::Tunnel("public origin must be http(s)".into()));
+    let rest = if let Some(rest) = raw.strip_prefix("https://") {
+        rest
+    } else if raw.to_ascii_lowercase().starts_with("http://") || raw.contains("://") {
+        return Err(Error::Tunnel("public origin must be https".into()));
     } else {
-        ("https", raw)
+        raw
     };
     let hostport = rest.split('/').next().unwrap_or("").trim();
     if hostport.is_empty() {
         return Err(Error::Tunnel("public origin is missing a host".into()));
     }
-    Ok(format!("{scheme}://{hostport}"))
+    Ok(format!("https://{hostport}"))
 }
 
 /// Quick-tunnel hostname from cloudflared logs. Never keeps a query string.
@@ -272,11 +291,14 @@ async fn run_cloudflared_unix(
     let mut child = TunnelChild::new(child)?;
 
     let origin = if named {
-        tokio::time::sleep(EARLY_EXIT_WAIT).await;
-        if let Some(inner) = child.child.as_mut()
-            && let Some(status) = inner.try_wait()?
-        {
-            return Err(Error::Tunnel(format!("cloudflared exited: {status}")));
+        let early_exit = tokio::select! {
+            status = child.wait() => Some(status),
+            _ = tokio::time::sleep(EARLY_EXIT_WAIT) => None,
+        };
+        if let Some(status) = early_exit {
+            let status = status?;
+            let logs = drain_rx(&mut lines).await;
+            return Err(Error::Tunnel(exit_message(status, &logs)));
         }
         spawn_log_pump(lines);
         match advertised {
@@ -346,36 +368,78 @@ async fn wait_for_url(
 ) -> Result<String> {
     let deadline = tokio::time::sleep(URL_TIMEOUT);
     tokio::pin!(deadline);
-    let inner = child
-        .child
-        .as_mut()
-        .ok_or_else(|| Error::Tunnel("cloudflared child is gone".into()))?;
     let mut pipes_open = true;
+    enum Event {
+        Timeout,
+        Exit(std::io::Result<std::process::ExitStatus>),
+        Line(Option<String>),
+    }
     loop {
-        tokio::select! {
-            _ = &mut deadline => {
+        let event = {
+            let inner = child
+                .child
+                .as_mut()
+                .ok_or_else(|| Error::Tunnel("cloudflared child is gone".into()))?;
+            tokio::select! {
+                _ = &mut deadline => Event::Timeout,
+                status = inner.wait() => Event::Exit(status),
+                line = rx.recv(), if pipes_open => Event::Line(line),
+            }
+        };
+        match event {
+            Event::Timeout => {
                 return Err(Error::Tunnel(
                     "cloudflared did not print a trycloudflare URL".into(),
                 ));
             }
-            status = inner.wait() => {
+            Event::Exit(status) => {
+                child.mark_reaped();
                 let status = status?;
-                return Err(Error::Tunnel(format!(
-                    "cloudflared exited before the tunnel URL was ready: {status}"
-                )));
+                let logs = drain_rx(rx).await;
+                return Err(Error::Tunnel(if logs.trim().is_empty() {
+                    format!("cloudflared exited before the tunnel URL was ready: {status}")
+                } else {
+                    format!("cloudflared exited before the tunnel URL was ready: {status}\n{logs}")
+                }));
             }
-            line = rx.recv(), if pipes_open => {
-                match line {
-                    None => pipes_open = false,
-                    Some(line) => {
-                        eprintln!("{line}");
-                        if let Some(url) = parse_trycloudflare_url(&line) {
-                            return Ok(url);
-                        }
-                    }
+            Event::Line(None) => pipes_open = false,
+            Event::Line(Some(line)) => {
+                eprintln!("{line}");
+                if let Some(url) = parse_trycloudflare_url(&line) {
+                    return Ok(url);
                 }
             }
         }
+    }
+}
+
+async fn drain_rx(rx: &mut mpsc::UnboundedReceiver<String>) -> String {
+    let mut lines = Vec::new();
+    let deadline = tokio::time::sleep(Duration::from_millis(250));
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => break,
+            next = rx.recv() => {
+                match next {
+                    Some(line) => {
+                        eprintln!("{line}");
+                        lines.push(line);
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+fn exit_message(status: impl std::fmt::Display, logs: &str) -> String {
+    let logs = logs.trim();
+    if logs.is_empty() {
+        format!("cloudflared exited: {status}")
+    } else {
+        format!("cloudflared exited: {status}\n{logs}")
     }
 }
 
@@ -398,7 +462,7 @@ fn kill_group(pid: u32) {
 }
 
 fn signal_group(pid: u32, sig: i32) {
-    if pid == 0 {
+    if pid <= 1 {
         return;
     }
     // SAFETY: pid is a cloudflared child we spawned; negative pid is POSIX killpg.
@@ -521,6 +585,20 @@ mod tests {
     }
 
     #[test]
+    fn public_origin_requires_https() {
+        let err = normalize_public_origin("http://cleartext.example.com")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("https"), "{err}");
+        assert!(!err.contains("cleartext.example.com"), "{err}");
+        let ws = normalize_public_origin("ws://x.example")
+            .unwrap_err()
+            .to_string();
+        assert!(ws.contains("https"), "{ws}");
+        assert!(!ws.contains("ws://"), "{ws}");
+    }
+
+    #[test]
     fn cloudflare_args_never_include_token_or_bind_all() {
         let named = cloudflare_args("127.0.0.1:7432".parse().unwrap(), true);
         assert_eq!(named, ["tunnel", "--no-autoupdate", "run"]);
@@ -554,38 +632,28 @@ mod tests {
         assert!(err.contains("--tunnel cloudflare"));
     }
 
-    fn wrap_fake(dir: &Path, inner: &Path, argv: Option<&Path>, pid: Option<&Path>) -> PathBuf {
-        let wrap_dir = dir.join("wrap");
-        fs::create_dir_all(&wrap_dir).unwrap();
-        let mut body = String::from("#!/bin/sh\nset -eu\n");
-        if let Some(path) = argv {
-            body.push_str(&format!(
-                "printf '%s\\n' \"$0\" \"$@\" > '{}'\n",
-                path.display()
-            ));
-        }
-        if let Some(path) = pid {
-            body.push_str(&format!("printf '%s\\n' \"$$\" > '{}'\n", path.display()));
-        }
-        body.push_str(&format!("exec '{}' \"$@\"\n", inner.display()));
-        write_fake(&wrap_dir, &body)
-    }
-
     const FAKE_SH: &str = r#"#!/bin/sh
+if [ -n "${BERTH_TEST_ARGV-}" ]; then
+  printf '%s\n' "$0" "$@" > "$BERTH_TEST_ARGV"
+fi
+if [ -n "${BERTH_TEST_PID-}" ]; then
+  printf '%s\n' "$$" > "$BERTH_TEST_PID"
+fi
 printf '%s\n' "INF | https://unit-test.trycloudflare.com |" >&2
 exec sleep 60
 "#;
 
     #[tokio::test]
     async fn fake_quick_tunnel_parses_url_and_omits_token_from_argv() {
+        let env = EnvGuard::acquire(&["BERTH_TEST_ARGV", "BERTH_TEST_PID"]);
         let dir = tempfile::tempdir().unwrap();
-        let bin = write_fake(dir.path(), FAKE_SH);
         let argv_path = dir.path().join("argv");
+        env.set("BERTH_TEST_ARGV", argv_path.to_str().unwrap());
+        let bin = write_fake(dir.path(), FAKE_SH);
         let token = "brt_must_not_leak";
-        let wrap = wrap_fake(dir.path(), &bin, Some(&argv_path), None);
         let local: SocketAddr = "127.0.0.1:7432".parse().unwrap();
 
-        let (child, origin) = run_cloudflared(&wrap, local, None, None).await.unwrap();
+        let (child, origin) = run_cloudflared(&bin, local, None, None).await.unwrap();
         assert_eq!(
             origin.as_deref(),
             Some("https://unit-test.trycloudflare.com")
@@ -603,14 +671,15 @@ exec sleep 60
 
     #[tokio::test]
     async fn named_tunnel_token_stays_out_of_argv() {
+        let env = EnvGuard::acquire(&["BERTH_TEST_ARGV", "BERTH_TEST_PID"]);
         let dir = tempfile::tempdir().unwrap();
-        let bin = write_fake(dir.path(), FAKE_SH);
         let argv_path = dir.path().join("argv");
-        let wrap = wrap_fake(dir.path(), &bin, Some(&argv_path), None);
+        env.set("BERTH_TEST_ARGV", argv_path.to_str().unwrap());
+        let bin = write_fake(dir.path(), FAKE_SH);
         let token = "eyJ_named_tunnel_token_secret";
         let local: SocketAddr = "127.0.0.1:7432".parse().unwrap();
         let (child, origin) =
-            run_cloudflared(&wrap, local, Some(token), Some("https://berth.example.com"))
+            run_cloudflared(&bin, local, Some(token), Some("https://berth.example.com"))
                 .await
                 .unwrap();
         assert_eq!(origin.as_deref(), Some("https://berth.example.com"));
@@ -624,24 +693,56 @@ exec sleep 60
     }
 
     #[tokio::test]
-    async fn child_is_killed_on_shutdown() {
+    async fn named_early_exit_includes_stderr() {
+        let _env = EnvGuard::acquire(&["BERTH_TEST_ARGV", "BERTH_TEST_PID"]);
         let dir = tempfile::tempdir().unwrap();
-        let bin = write_fake(dir.path(), FAKE_SH);
-        let pid_path = dir.path().join("pid");
-        let wrap = wrap_fake(dir.path(), &bin, None, Some(&pid_path));
-        let local: SocketAddr = "127.0.0.1:7432".parse().unwrap();
-        let (child, _) = run_cloudflared(&wrap, local, None, None).await.unwrap();
-        let mut pid = None;
-        for _ in 0..100 {
-            if let Ok(raw) = fs::read_to_string(&pid_path)
-                && let Ok(parsed) = raw.trim().parse()
-            {
-                pid = Some(parsed);
-                break;
+        let bin = write_fake(
+            dir.path(),
+            r#"#!/bin/sh
+printf '%s\n' "ERR failed to run tunnel: invalid token" >&2
+exit 7
+"#,
+        );
+        let probe = std::process::Command::new(&bin)
+            .args(["tunnel", "--no-autoupdate", "run"])
+            .output()
+            .unwrap();
+        assert!(
+            !probe.status.success(),
+            "fake must exit: status={:?} stderr={:?}",
+            probe.status,
+            String::from_utf8_lossy(&probe.stderr)
+        );
+        let err = match run_cloudflared(
+            &bin,
+            "127.0.0.1:7432".parse().unwrap(),
+            Some("named_secret"),
+            Some("https://berth.example.com"),
+        )
+        .await
+        {
+            Ok((child, _)) => {
+                child.shutdown().await;
+                panic!("expected named tunnel to fail");
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let pid = pid.expect("fake cloudflared wrote a pid");
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("exited"), "{err}");
+        assert!(err.contains("invalid token"), "{err}");
+        assert!(!err.contains("named_secret"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn child_is_killed_on_shutdown() {
+        let env = EnvGuard::acquire(&["BERTH_TEST_ARGV", "BERTH_TEST_PID"]);
+        let dir = tempfile::tempdir().unwrap();
+        let pid_path = dir.path().join("pid");
+        env.set("BERTH_TEST_PID", pid_path.to_str().unwrap());
+        let bin = write_fake(dir.path(), FAKE_SH);
+        let local: SocketAddr = "127.0.0.1:7432".parse().unwrap();
+        let (child, _) = run_cloudflared(&bin, local, None, None).await.unwrap();
+        let raw = wait_file(&pid_path).await;
+        let pid: u32 = raw.trim().parse().expect("pid");
         assert!(pid_alive(pid), "fake cloudflared should be running");
         child.shutdown().await;
         let mut gone = false;

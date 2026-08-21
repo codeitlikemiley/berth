@@ -129,6 +129,9 @@ berth end
 Install `cloudflared` first (`brew install cloudflared` on macOS; on Linux,
 `echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main' | sudo tee /etc/apt/sources.list.d/cloudflared.list && sudo apt-get update && sudo apt-get install cloudflared`).
 
+noVNC (`berth view`) is node-local on the mapped guest port; the tunnel does
+not publish it. Agents use the tunneled session WS / `berth mcp`.
+
 ## Name
 
 Working title. A berth is where a ship is parked and made fast. Alternatives

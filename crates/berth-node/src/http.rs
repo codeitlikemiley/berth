@@ -199,6 +199,11 @@ pub fn router(state: AppState) -> Router {
 }
 
 pub async fn serve(bind: SocketAddr, tunnel: Option<TunnelKind>) -> Result<()> {
+    if tunnel.is_some() && !bind.ip().is_loopback() {
+        return Err(Error::Tunnel(
+            "--tunnel requires a loopback bind (cloudflared is the public edge)".into(),
+        ));
+    }
     if matches!(tunnel, Some(TunnelKind::Cloudflare)) {
         tunnel::resolve_cloudflared()?;
     }
@@ -223,17 +228,39 @@ pub async fn serve(bind: SocketAddr, tunnel: Option<TunnelKind>) -> Result<()> {
     let shutdown_state = state.clone();
     let drain_state = state.clone();
     axum::serve(listener, router(state))
-        .with_graceful_shutdown(async move {
-            wait_shutdown_signal().await;
-            // Fail closed before axum stops accepting; drain after serve returns.
-            shutdown_state.begin_shutdown();
-        })
+        .with_graceful_shutdown(shutdown_on_signal_or_tunnel(shutdown_state, tunnel_child))
         .await?;
-    if let Some(child) = tunnel_child {
-        child.shutdown().await;
-    }
     drain_state.drain().await;
     Ok(())
+}
+
+async fn shutdown_on_signal_or_tunnel(
+    shutdown_state: AppState,
+    mut tunnel_child: Option<tunnel::TunnelChild>,
+) {
+    if tunnel_child.is_none() {
+        wait_shutdown_signal().await;
+        shutdown_state.begin_shutdown();
+        return;
+    }
+    {
+        let child = tunnel_child.as_mut().expect("tunnel child");
+        tokio::select! {
+            _ = wait_shutdown_signal() => {}
+            status = child.wait() => {
+                match status {
+                    Ok(st) => eprintln!("cloudflared exited ({st}); shutting down"),
+                    Err(err) => eprintln!("cloudflared wait failed: {err}; shutting down"),
+                }
+                shutdown_state.begin_shutdown();
+                return;
+            }
+        }
+    }
+    shutdown_state.begin_shutdown();
+    if let Some(child) = tunnel_child.take() {
+        child.shutdown().await;
+    }
 }
 
 async fn wait_shutdown_signal() {
@@ -1118,5 +1145,14 @@ mod tests {
             session_ws_url(bind, None, "s_1"),
             "ws://127.0.0.1:7432/v1/sessions/s_1"
         );
+    }
+
+    #[tokio::test]
+    async fn serve_tunnel_rejects_non_loopback_bind() {
+        let err = serve("0.0.0.0:0".parse().unwrap(), Some(TunnelKind::Cloudflare))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("loopback"), "{msg}");
     }
 }
