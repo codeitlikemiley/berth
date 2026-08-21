@@ -29,23 +29,23 @@ Develop on macOS with Docker Desktop or OrbStack. You do not need a Linux
 workstation.
 
 ```sh
-# once
+# once — Node 22 on PATH (or a pre-built apps/console/dist) for the real dashboard
 docker build -t berthos-linux-xfce:dev images/linux-xfce
 cargo install --path crates/berth-cli
 berth doctor
 ```
 
 `berth doctor` must be green (Docker daemon, guest image, `~/.berth` writable).
-cloudflared is a warning unless you want `--tunnel cloudflare`. Unpaired is a
-warning until `berth pair`.
+It does **not** probe the embedded SPA. cloudflared is a warning unless you
+want `--tunnel cloudflare`. Unpaired is a warning until `berth pair`.
 
 ### Node 22 at compile time
 
 The dashboard is compiled into berth. **Node 22 is required at compile time**
 for the real UI (`npm` on PATH, or a pre-built `apps/console/dist`).
 `cargo install --path crates/berth-cli` without Node embeds the placeholder
-page, not the dashboard. Install Node 22 on this Mac before `cargo install` if
-you will open the console.
+page, not the dashboard. If `http://127.0.0.1:7432/` shows that placeholder,
+install Node 22 and re-run `cargo install --path crates/berth-cli`.
 
 ### Human path (console)
 
@@ -62,7 +62,8 @@ Open [http://127.0.0.1:7432/](http://127.0.0.1:7432/) on this machine.
 **Pair this browser.** On loopback the code is shown (`GET /v1/pairing` only).
 A tunneled browser types the stderr code — the code is never placed on the
 URL. Default pair does **not** revoke other bearers, so you can pair the CLI
-**and** this browser. `berth pair --revoke-others` or Doctor → **Revoke other
+**and** this browser. `berth pair --revoke-others` or
+[http://127.0.0.1:7432/doctor](http://127.0.0.1:7432/doctor) → **Revoke other
 clients** rotates everyone else (this browser stays in; CLI must re-pair).
 
 Then:
@@ -139,8 +140,8 @@ berth end
 ```
 
 A tunneled browser can load the console and type the stderr pairing code. That
-pair still does not revoke the CLI unless you pass `--revoke-others` or use
-Doctor **Revoke other clients**.
+pair still does not revoke the CLI unless you pass `--revoke-others` or open
+`/doctor` → **Revoke other clients**.
 
 Install `cloudflared` first (`brew install cloudflared` on macOS; on Linux,
 `echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main' | sudo tee /etc/apt/sources.list.d/cloudflared.list && sudo apt-get update && sudo apt-get install cloudflared`).

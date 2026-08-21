@@ -6,11 +6,11 @@
 
 ```
 # on the parked box (Mac with Docker, or any Linux with Docker)
-berth node up --name home-nuc
+berth node up
 
 # on the laptop
-berth pair --node home-nuc          # prints a join code / tailscale/cloudflare
-berth up --node home-nuc --os linux
+berth pair --url http://127.0.0.1:7432 --code ABCD-EFGH
+berth up --os linux
 claude mcp add --transport stdio berth -- berth mcp
 ```
 
@@ -248,12 +248,12 @@ Keep image under ~1.5 GB uncompressed if possible.
 **Files:** `crates/berth-cli`
 
 ```
-berth node up [--name] [--tunnel cloudflare]
-berth pair --url https://… --code XXXX
-berth up --node <name> [--os linux]
+berth node up [--tunnel cloudflare]
+berth pair --url https://… --code XXXX [--node]
+berth up [--node] [--os linux]
 berth mcp                      # stdio, uses last session or BERTH_SESSION
 berth view                     # open viewer URL
-berth end
+berth end [--force]
 berth status
 ```
 

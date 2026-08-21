@@ -29,9 +29,9 @@ Open computer-session layer: protocol + private node + later mesh. Not another a
 
 ### What humans did before Slice A
 
-| Need | Current path |
+| Need | Pre-Slice A path |
 | --- | --- |
-| Pair | Copy `pairing code: ABCD-EFGH` from `berth node up` stderr (`crates/berth-node/src/http.rs` `serve()`). Laptop runs `berth pair --url … --code`. Token lands in `~/.berth/config.toml` (mode 0600). Today `Db::issue_bearer` **revokes every previous bearer** (`db.rs`); a second pair logs out the first client. |
+| Pair | Copy `pairing code: ABCD-EFGH` from `berth node up` stderr (`crates/berth-node/src/http.rs` `serve()`). Laptop ran `berth pair --url … --code`. Token landed in `~/.berth/config.toml` (mode 0600). `Db::issue_bearer` **revoked every previous bearer** (`db.rs`); a second pair logged out the first client. |
 | See sessions | `berth status` → `GET /v1/leases/{id}` for the **one** id in `session.toml`. No list. |
 | See cost | `print_quote` / CLI `format_quote`: `$X USD for Ns min (not charged)` on stderr/stdout. sqlite stores `quote_json`, `billable_seconds`, `elapsed_seconds`. Nothing is charged. |
 | Watch the guest | `berth view` prints `http://127.0.0.1:{mapped}/vnc.html`. Tunnel does **not** publish noVNC (`README.md`). |
@@ -53,7 +53,7 @@ Authed:    POST /v1/leases
 
 `GET /healthz` returns `{"ok": true}` only. Default bind `127.0.0.1:7432` (`crates/berth-cli/src/lib.rs` `NodeCmd::Up`). Auth is `Authorization: Bearer` after `POST /v1/pair` `{code}` → `{token}` (`brt_` + 64 hex). Pairing code is `XXXX-XXXX` from `random_pairing_code()` in `crates/berth-node/src/id.rs`, stored in `~/.berth/pair.code` (hash in sqlite `pair_tokens`). Token is never placed on a URL (`normalize_url` rejects `?` / `#`; advertised `ws_url` is tested to contain neither `?` nor `token`).
 
-`PairRequest` today is `{ code: String }` only (`http.rs`). `issue_bearer` always `UPDATE pair_tokens SET revoked_at` for `kind = 'bearer'`. Tests lock this (`pair_issues_bearer_and_rotates`). Slice A changes that default (K4).
+`PairRequest` was `{ code: String }` only (`http.rs`). `issue_bearer` always ran `UPDATE pair_tokens SET revoked_at` for `kind = 'bearer'`. Tests locked this (`pair_issues_bearer_and_rotates`). Slice A changed that default (K4). Today: `{ code, revoke_others?: bool }` with `revoke_others` default **false**; test `pair_issues_bearer_and_keeps_previous`.
 
 ### sqlite before Slice A
 
@@ -85,7 +85,7 @@ Thesis slide 1 is the Mac mini in the closet. Operators will not SSH to scrape s
 
 ## Goals & Non-Goals
 
-### Goals (Slice A — ship next)
+### Goals (Slice A)
 
 - Serve a human console from the **same** `berth-node` process, loopback bind unchanged, SPA at `/`.
 - Pair in the browser without putting the code or bearer in the URL, Vite env, or screenshot URLs, and **without logging out CLI/MCP**.
@@ -348,9 +348,9 @@ fn issue_bearer(&self, revoke_others: bool) -> Result<String> {
 ```
 
 - Console pair: `{code}` only.
-- Console “Revoke other clients” (doctor page): `{code, revoke_others: true}` then store the new token (this browser stays in; CLI/MCP must `berth pair` again).
+- Console “Revoke other clients” (`/doctor`): `{code, revoke_others: true}` then store the new token (this browser stays in; CLI/MCP must `berth pair` again).
 - CLI: `berth pair --url --code [--revoke-others]`. Default **false**. `NodeClient::pair` sends `{"code", "revoke_others": bool}`.
-- Existing test `pair_issues_bearer_and_rotates` splits into: default keeps t1 valid after t2; `revoke_others: true` invalidates t1; ninth pair without revoke → 409.
+- Shipped test `pair_issues_bearer_and_keeps_previous`: default keeps t1 valid after t2; `revoke_others: true` invalidates t1; ninth pair without revoke → 409.
 
 `GET /v1/node` includes `active_bearers: u32` (count, not hashes). Do not list tokens.
 
@@ -520,7 +520,7 @@ Empty body. Operator = pairing bearer (Slice A: every valid bearer).
 
 Stale sqlite `active` rows with `live=false` do **not** block unpark (they are not occupied). Operator can unpark an empty box with leftover stale rows.
 
-### Frontend (no frontend exists today)
+### Frontend layout
 
 ```
 apps/console/
@@ -1081,7 +1081,7 @@ flowchart LR
 
 **Dependencies:** none (HEAD `main` MVP)
 
-**Description:** Authed `/v1/leases` is `get(list_leases).post(create_lease)` on one path (`ORDER BY started_at DESC`, cap 500, `truncated`). Authed `GET /v1/node` as specified (`ok` matches probes; `active_bearers`; tunnel `child_alive` via `AtomicBool`; no secrets). **`parked` is PR3.** Unauthed `GET /v1/pairing` using `loopback_operator`. Authed preview PNG/204/404 with `Cache-Control: private, no-store`. `create_lease`: `insert_lease` → **`live.insert` → `from_row(..., true)`**; shutdown after start is 503 not 201. `POST /v1/pair` default does not revoke; cap 8. Access log formatter without headers. Operator HTTP belongs in `docs/console.md` (PR8), not the agent spec. No `node_state` yet. No SSE.
+**Description:** Authed `/v1/leases` is `get(list_leases).post(create_lease)` on one path (`ORDER BY started_at DESC`, cap 500, `truncated`). Authed `GET /v1/node` as specified (`ok` matches probes; `active_bearers`; tunnel `child_alive` via `AtomicBool`; no secrets). **`parked` is PR3.** Unauthed `GET /v1/pairing` using `loopback_operator`. Authed preview PNG/204/404 with `Cache-Control: private, no-store`. `create_lease`: `insert_lease` → **`live.insert` → `from_row(..., true)`**; shutdown after start is 503 not 201. `POST /v1/pair` default does not revoke; cap 8. Access log formatter without headers. Operator HTTP belongs in `docs/CONSOLE.md` (PR8), not the agent spec. No `node_state` yet. No SSE.
 
 **Accept:**
 
