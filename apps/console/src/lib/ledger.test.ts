@@ -3,9 +3,11 @@ import { describe, expect, it } from "vitest";
 import type { LeaseView, Quote } from "@/api/types";
 import {
   FORCE_BADGE_COPY,
+  formatUsd,
   incomeUsd,
   occupancyBadge,
   occupancyBadgeCopy,
+  occupancyUsd,
   quotedUsd,
   usdPerSecond,
 } from "./ledger";
@@ -48,6 +50,11 @@ function row(partial: Partial<LeaseView> = {}): LeaseView {
 describe("ledger 2/4/40 isolated", () => {
   it("usd_per_second is 0.0000134", () => {
     expect(usdPerSecond(isolated240)).toBeCloseTo(0.0000134, 12);
+  });
+
+  it("review occupancy at 60s min is $0.000804", () => {
+    expect(occupancyUsd(isolated240)).toBe(0.000804);
+    expect(formatUsd(occupancyUsd(isolated240))).toBe("$0.000804");
   });
 
   it("stopped graceful billable_seconds=60 → occupancy $0.000804 and income $0.000804", () => {

@@ -5,6 +5,11 @@ export function usdPerSecond(q: Quote): number {
   return Number(q.gas_per_second) * Number(q.usd_per_gas);
 }
 
+/** Quote has no elapsed clock yet; review uses rate × min_seconds. */
+export function occupancyUsd(quote: Quote): number {
+  return usdPerSecond(quote) * quote.min_seconds;
+}
+
 export function quotedUsd(lease: LeaseView, nowUnix = Date.now() / 1000): number {
   const min = lease.quote.min_seconds;
   const rate = usdPerSecond(lease.quote);

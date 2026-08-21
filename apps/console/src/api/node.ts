@@ -4,9 +4,23 @@ import type {
   LeaseList,
   LeaseView,
   NodeStatus,
+  Quote,
+  WizardLease,
 } from "./types";
 
-export type { BerthApi, ConsoleMode, NodeStatus } from "./types";
+export type { BerthApi, ConsoleMode, NodeStatus, WizardLease } from "./types";
+
+export function leaseRequestBody(req: WizardLease) {
+  // class/license/term match crates/berth-cli mvp_lease_request; resources/density from the wizard
+  return {
+    os: req.os,
+    class: "private",
+    license: "linux",
+    density: req.density,
+    term: "on_demand",
+    resources: req.resources,
+  };
+}
 
 let instance: BerthApi | null = null;
 
@@ -137,6 +151,24 @@ export function createApi(
     async forceEnd(id: string) {
       return readJson<LeaseView>(
         await request(`${leasePath(id)}/force`, { method: "POST" }),
+      );
+    },
+    async quote(req: WizardLease) {
+      return readJson<Quote>(
+        await request("/v1/quote", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(leaseRequestBody(req)),
+        }),
+      );
+    },
+    async createLease(req: WizardLease) {
+      return readJson<LeaseView>(
+        await request("/v1/leases", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(leaseRequestBody(req)),
+        }),
       );
     },
     async node() {

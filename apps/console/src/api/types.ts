@@ -79,6 +79,12 @@ export type NodeStatus = {
 
 export type NodeView = NodeStatus;
 
+export type WizardLease = {
+  os: "linux";
+  density: "isolated" | "shared";
+  resources: { vcpu: number; mem_gib: number; disk_gib: number };
+};
+
 export type BerthApi = {
   pair: (
     code: string,
@@ -89,6 +95,8 @@ export type BerthApi = {
   getLease: (id: string) => Promise<LeaseView>;
   endLease: (id: string) => Promise<LeaseView>;
   forceEnd: (id: string) => Promise<LeaseView>;
+  quote: (req: WizardLease) => Promise<Quote>;
+  createLease: (req: WizardLease) => Promise<LeaseView>;
   node: () => Promise<NodeStatus>;
   park: () => Promise<NodeStatus>;
   unpark: () => Promise<NodeStatus>;

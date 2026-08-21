@@ -5,6 +5,7 @@ import { getToken } from "@/lib/auth";
 import { DoctorPage } from "@/pages/doctor";
 import { HomePage } from "@/pages/home";
 import { LeasePage } from "@/pages/lease";
+import { LeaseWizardPage } from "@/pages/lease-wizard";
 import { PairPage } from "@/pages/pair";
 
 function RequireAuth({ children }: { children: ReactNode }) {
@@ -26,7 +27,14 @@ export function App() {
           </RequireAuth>
         }
       />
-      <Route path="/leases/new" element={<Navigate to="/" replace />} />
+      <Route
+        path="/leases/new"
+        element={
+          <RequireAuth>
+            <LeaseWizardPage />
+          </RequireAuth>
+        }
+      />
       <Route
         path="/leases/:id"
         element={
