@@ -4,7 +4,7 @@ import { BrowserRouter } from "react-router-dom";
 
 import { bindApi, createApi } from "@/api/node";
 import { App } from "@/app";
-import { getToken, setToken } from "@/lib/auth";
+import { dropRejectedBearer, getToken, setToken } from "@/lib/auth";
 import { initTheme } from "@/lib/theme";
 
 import "./index.css";
@@ -16,10 +16,11 @@ const api = createApi("node", {
   getToken,
   setToken: (token) => {
     setToken(token);
-    if (token === null && window.location.pathname !== "/pair") {
+    if (token === null && !getToken() && window.location.pathname !== "/pair") {
       window.location.replace("/pair");
     }
   },
+  dropRejectedBearer,
 });
 bindApi(api);
 

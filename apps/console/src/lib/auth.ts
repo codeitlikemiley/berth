@@ -38,10 +38,23 @@ export function getToken(): string | null {
 export function setToken(token: string | null): void {
   if (token === null) {
     sessionStorage.removeItem(BEARER_KEY);
-    localStorage.removeItem(BEARER_KEY);
     return;
   }
   sessionStorage.setItem(BEARER_KEY, token);
+}
+
+/** 401 must not wipe a newer remembered bearer from another tab. */
+export function dropRejectedBearer(rejected: string | null): void {
+  if (rejected === null) {
+    sessionStorage.removeItem(BEARER_KEY);
+    return;
+  }
+  if (sessionStorage.getItem(BEARER_KEY) === rejected) {
+    sessionStorage.removeItem(BEARER_KEY);
+  }
+  if (localStorage.getItem(BEARER_KEY) === rejected) {
+    localStorage.removeItem(BEARER_KEY);
+  }
 }
 
 export function rememberToken(token: string): void {

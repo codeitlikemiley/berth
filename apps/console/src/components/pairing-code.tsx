@@ -1,15 +1,27 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 
 export function PairingCode({ code }: { code: string }) {
   const [copied, setCopied] = useState(false);
+  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (timeoutRef.current !== null) {
+        clearTimeout(timeoutRef.current);
+      }
+    };
+  }, []);
 
   async function copy() {
     try {
       await navigator.clipboard.writeText(code);
+      if (timeoutRef.current !== null) {
+        clearTimeout(timeoutRef.current);
+      }
       setCopied(true);
-      window.setTimeout(() => setCopied(false), 1500);
+      timeoutRef.current = setTimeout(() => setCopied(false), 1500);
     } catch {
       setCopied(false);
     }

@@ -52,6 +52,7 @@ export function createApi(
     base: string;
     getToken: () => string | null;
     setToken: (t: string | null) => void;
+    dropRejectedBearer: (rejected: string | null) => void;
   },
 ): BerthApi {
   if (mode === "control-plane") {
@@ -68,7 +69,10 @@ export function createApi(
     }
     const res = await fetch(`${base}${path}`, { ...init, headers });
     if (res.status === 401 && path !== "/v1/pair") {
-      opts.setToken(null);
+      opts.dropRejectedBearer(token);
+      if (!opts.getToken()) {
+        opts.setToken(null);
+      }
     }
     return res;
   }

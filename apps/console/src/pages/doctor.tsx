@@ -17,36 +17,46 @@ import { getToken, refreshRememberedToken, url_is_loopback } from "@/lib/auth";
 export function DoctorPage() {
   const loopback = url_is_loopback(window.location.origin);
   const codeRef = useRef<HTMLInputElement>(null);
+  // docker ping on GET /v1/node can outlast revoke; ignore stale snapshots
+  const genRef = useRef(0);
   const [node, setNode] = useState<NodeStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [pending, setPending] = useState(false);
+  const [pending, setPending] = useState(true);
+  const [unauthed, setUnauthed] = useState(false);
 
   useEffect(() => {
-    let cancelled = false;
+    const gen = ++genRef.current;
+    setPending(true);
     void (async () => {
       try {
         const next = await api().node();
-        if (!cancelled) {
-          setNode(next);
+        if (gen !== genRef.current) {
+          return;
         }
+        setNode(next);
+        setError(null);
       } catch (err) {
-        if (cancelled) {
+        if (gen !== genRef.current) {
           return;
         }
         if (!getToken()) {
-          setError("unauthorized");
+          setUnauthed(true);
           return;
         }
         setError(err instanceof Error ? err.message : "doctor failed");
+      } finally {
+        if (gen === genRef.current) {
+          setPending(false);
+        }
       }
     })();
     return () => {
-      cancelled = true;
+      genRef.current += 1;
     };
   }, []);
 
-  if (!getToken() || error === "unauthorized") {
+  if (unauthed || !getToken()) {
     return <Navigate to="/pair" replace />;
   }
 
@@ -54,19 +64,29 @@ export function DoctorPage() {
     run: () => Promise<NodeStatus>,
     failed: string,
   ): Promise<void> {
+    const gen = ++genRef.current;
     setError(null);
     setNotice(null);
     setPending(true);
     try {
-      setNode(await run());
+      const next = await run();
+      if (gen !== genRef.current) {
+        return;
+      }
+      setNode(next);
     } catch (err) {
+      if (gen !== genRef.current) {
+        return;
+      }
       if (!getToken()) {
-        setError("unauthorized");
+        setUnauthed(true);
         return;
       }
       setError(err instanceof Error ? err.message : failed);
     } finally {
-      setPending(false);
+      if (gen === genRef.current) {
+        setPending(false);
+      }
     }
   }
 
@@ -78,6 +98,7 @@ export function DoctorPage() {
     ) {
       return;
     }
+    const gen = ++genRef.current;
     setError(null);
     setNotice(null);
     setPending(true);
@@ -96,23 +117,32 @@ export function DoctorPage() {
         }
       }
       await api().pair(code, { revokeOthers: true });
-      const next = getToken();
-      if (next) {
-        refreshRememberedToken(next);
+      const nextToken = getToken();
+      if (nextToken) {
+        refreshRememberedToken(nextToken);
       }
       if (codeRef.current) {
         codeRef.current.value = "";
       }
-      setNode(await api().node());
+      const next = await api().node();
+      if (gen !== genRef.current) {
+        return;
+      }
+      setNode(next);
       setNotice("Other clients revoked. CLI must re-pair.");
     } catch (err) {
+      if (gen !== genRef.current) {
+        return;
+      }
       if (!getToken()) {
-        setError("unauthorized");
+        setUnauthed(true);
         return;
       }
       setError(err instanceof Error ? err.message : "revoke failed");
     } finally {
-      setPending(false);
+      if (gen === genRef.current) {
+        setPending(false);
+      }
     }
   }
 
@@ -140,12 +170,25 @@ export function DoctorPage() {
                 void withNode(() => api().unpark(), "unpark failed")
               }
             />
+          ) : error ? (
+            <div className="flex flex-col items-start gap-2">
+              <p className="text-sm">Could not load node</p>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={pending}
+                onClick={() =>
+                  void withNode(() => api().node(), "doctor failed")
+                }
+              >
+                Retry
+              </Button>
+            </div>
           ) : (
             <p className="text-sm text-muted-foreground">Loading</p>
           )}
-          {error && error !== "unauthorized" ? (
-            <p className="text-sm text-destructive">{error}</p>
-          ) : null}
+          {error ? <p className="text-sm text-destructive">{error}</p> : null}
           {notice ? <p className="text-sm">{notice}</p> : null}
           <div className="flex flex-col gap-3 border-t border-border pt-4">
             <p className="text-sm text-muted-foreground">
