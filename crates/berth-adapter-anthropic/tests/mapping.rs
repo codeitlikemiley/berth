@@ -23,7 +23,7 @@ fn load_use(name: &str) -> ToolUse {
 
 fn map_one(name: &str) -> Action {
     let uses = [load_use(name)];
-    let batch = actions_from_tool_uses("s_1", "a_1", &uses, None).unwrap();
+    let batch = actions_from_tool_uses("s_1", "a_1", &uses, None, None).unwrap();
     assert_eq!(batch.kind, ActionBatchKind::Actions);
     assert_eq!(batch.session_id, "s_1");
     assert_eq!(batch.items.len(), 1);
@@ -91,7 +91,7 @@ fn table_member_mapping() {
         .iter()
         .map(|raw| {
             let use_block: ToolUse = serde_json::from_str(raw).unwrap();
-            actions_from_tool_uses("s", "a", &[use_block], None)
+            actions_from_tool_uses("s", "a", &[use_block], None, None)
                 .unwrap()
                 .items
                 .remove(0)
@@ -161,7 +161,7 @@ fn skips_non_computer_tool_uses() {
     let uses = computer_tool_uses(&content).unwrap();
     assert_eq!(uses.len(), 1);
     assert_eq!(uses[0].id, "toolu_shot");
-    let batch = actions_from_tool_uses("s_1", "a_1", &uses, None).unwrap();
+    let batch = actions_from_tool_uses("s_1", "a_1", &uses, None, None).unwrap();
     assert_eq!(batch.items, vec![Action::Screenshot {}]);
 }
 
@@ -178,7 +178,8 @@ fn scales_when_tool_use_size_differs_from_last_frame() {
             "display_height_px": 800
         }),
     };
-    let batch = actions_from_tool_uses("s_1", "a_1", &[use_block], Some((1000, 800))).unwrap();
+    let batch =
+        actions_from_tool_uses("s_1", "a_1", &[use_block], Some((1000, 800)), None).unwrap();
     match &batch.items[0] {
         Action::Click { xy, .. } => assert_eq!(*xy, [500, 400]),
         other => panic!("{other:?}"),
@@ -203,13 +204,14 @@ fn pass_through_when_frame_matches_or_missing() {
         "a",
         std::slice::from_ref(&use_block),
         Some((1280, 800)),
+        None,
     )
     .unwrap();
     match &same.items[0] {
         Action::Click { xy, .. } => assert_eq!(*xy, [100, 200]),
         other => panic!("{other:?}"),
     }
-    let none = actions_from_tool_uses("s", "a", &[use_block], None).unwrap();
+    let none = actions_from_tool_uses("s", "a", &[use_block], None, None).unwrap();
     match &none.items[0] {
         Action::Click { xy, .. } => assert_eq!(*xy, [100, 200]),
         other => panic!("{other:?}"),
@@ -225,7 +227,7 @@ fn empty_type_and_missing_coordinate_are_errors() {
         toolset_name: Some("computer".into()),
         input: json!({ "text": "" }),
     };
-    assert!(actions_from_tool_uses("s", "a", &[empty_type], None).is_err());
+    assert!(actions_from_tool_uses("s", "a", &[empty_type], None, None).is_err());
 
     let no_xy = ToolUse {
         r#type: Some("tool_use".into()),
@@ -234,7 +236,43 @@ fn empty_type_and_missing_coordinate_are_errors() {
         toolset_name: Some("computer".into()),
         input: json!({}),
     };
-    assert!(actions_from_tool_uses("s", "a", &[no_xy], None).is_err());
+    assert!(actions_from_tool_uses("s", "a", &[no_xy], None, None).is_err());
+}
+
+#[test]
+fn omitted_click_and_scroll_use_last_cursor() {
+    let click = ToolUse {
+        r#type: Some("tool_use".into()),
+        id: "c".into(),
+        name: "left_click".into(),
+        toolset_name: Some("computer".into()),
+        input: json!({}),
+    };
+    let batch = actions_from_tool_uses("s", "a", &[click], None, Some([512, 384])).unwrap();
+    match &batch.items[0] {
+        Action::Click { xy, button, .. } => {
+            assert_eq!(*xy, [512, 384]);
+            assert_eq!(*button, Button::Left);
+        }
+        other => panic!("{other:?}"),
+    }
+
+    let scroll = ToolUse {
+        r#type: Some("tool_use".into()),
+        id: "s".into(),
+        name: "scroll".into(),
+        toolset_name: Some("computer".into()),
+        input: json!({ "scroll_direction": "down", "scroll_amount": 3 }),
+    };
+    let batch = actions_from_tool_uses("s", "a", &[scroll], None, Some([10, 20])).unwrap();
+    match &batch.items[0] {
+        Action::Scroll { xy, dx, dy } => {
+            assert_eq!(*xy, [10, 20]);
+            assert_eq!(*dx, 0);
+            assert_eq!(*dy, 3);
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]
@@ -247,7 +285,7 @@ fn unimplemented_members_error() {
             toolset_name: Some("computer".into()),
             input: json!({}),
         };
-        let err = actions_from_tool_uses("s", "a", &[use_block], None).unwrap_err();
+        let err = actions_from_tool_uses("s", "a", &[use_block], None, None).unwrap_err();
         assert!(err.to_string().contains(name), "{err}");
     }
 }
@@ -287,7 +325,7 @@ fn screenshot_result_is_image_others_ok() {
             },
         ],
     };
-    let results = results_from_ack(&[shot, click], &ack, &[sample_frame()]);
+    let results = results_from_ack(&[shot, click], &ack, &[sample_frame()], None);
     assert_eq!(results.len(), 2);
     assert!(!results[0].is_error);
     match &results[0].content[0] {
@@ -327,7 +365,7 @@ fn failed_ack_is_error_not_ok() {
             },
         ],
     };
-    let results = results_from_ack(&[click, shot], &ack, &[]);
+    let results = results_from_ack(&[click, shot], &ack, &[], None);
     assert!(results[0].is_error);
     match &results[0].content[0] {
         ContentBlock::Text { text } => assert_eq!(text, "denied"),
@@ -353,7 +391,7 @@ fn screenshot_without_frame_is_error() {
             error: None,
         }],
     };
-    let results = results_from_ack(&[shot], &ack, &[]);
+    let results = results_from_ack(&[shot], &ack, &[], None);
     assert!(results[0].is_error);
     match &results[0].content[0] {
         ContentBlock::Text { text } => assert!(text.contains("no frame")),
@@ -374,7 +412,7 @@ fn tool_result_json_shape() {
             error: None,
         }],
     };
-    let results = results_from_ack(&[shot], &ack, &[sample_frame()]);
+    let results = results_from_ack(&[shot], &ack, &[sample_frame()], None);
     let json = serde_json::to_value(&results[0]).unwrap();
     assert_eq!(json["type"], "tool_result");
     assert_eq!(json["tool_use_id"], "toolu_shot");
@@ -382,4 +420,50 @@ fn tool_result_json_shape() {
     assert!(json.get("is_error").is_none());
     assert_eq!(json["content"][0]["type"], "image");
     assert_eq!(json["content"][0]["source"]["type"], "base64");
+}
+
+#[test]
+fn cursor_position_result_is_xy_text() {
+    let use_block = ToolUse {
+        r#type: Some("tool_use".into()),
+        id: "toolu_cur".into(),
+        name: "cursor_position".into(),
+        toolset_name: Some("computer".into()),
+        input: json!({}),
+    };
+    let ack = Ack {
+        kind: AckKind::Ack,
+        id: "a_1".into(),
+        results: vec![AckResult {
+            i: 0,
+            ok: true,
+            frame: false,
+            error: None,
+        }],
+    };
+    let from_arg = results_from_ack(
+        std::slice::from_ref(&use_block),
+        &ack,
+        &[],
+        Some([512, 384]),
+    );
+    match &from_arg[0].content[0] {
+        ContentBlock::Text { text } => assert_eq!(text, "X=512, Y=384"),
+        other => panic!("{other:?}"),
+    }
+
+    let mut frame = sample_frame();
+    frame.cursor = Some([1, 2]);
+    let from_frame = results_from_ack(std::slice::from_ref(&use_block), &ack, &[frame], None);
+    match &from_frame[0].content[0] {
+        ContentBlock::Text { text } => assert_eq!(text, "X=1, Y=2"),
+        other => panic!("{other:?}"),
+    }
+
+    let missing = results_from_ack(std::slice::from_ref(&use_block), &ack, &[], None);
+    assert!(missing[0].is_error);
+    match &missing[0].content[0] {
+        ContentBlock::Text { text } => assert!(text.contains("unknown")),
+        other => panic!("{other:?}"),
+    }
 }

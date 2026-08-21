@@ -174,17 +174,19 @@ pub fn computer_tool_uses(value: &Value) -> Result<Vec<ToolUse>> {
 ///
 /// Coordinates pass through last-frame pixel space. If a block includes
 /// `display_width_px`/`display_height_px` (or `width`/`height`) that differ
-/// from `last_frame`, coordinates are scaled with [`ActionBatch::scale_coordinates`].
+/// from `last_frame`, coordinates are scaled with [`Action::scale_coordinates`].
+/// Omitted click/scroll `coordinate` uses `last_cursor` (current cursor).
 pub fn actions_from_tool_uses(
     session_id: impl Into<String>,
     batch_id: impl Into<String>,
     uses: &[ToolUse],
     last_frame: Option<(u32, u32)>,
+    last_cursor: Option<Point>,
 ) -> Result<ActionBatch> {
     let computer: Vec<&ToolUse> = uses.iter().filter(|u| u.is_computer()).collect();
     let mut items = Vec::with_capacity(computer.len());
     for use_block in &computer {
-        items.push(action_from_use(use_block, last_frame)?);
+        items.push(action_from_use(use_block, last_frame, last_cursor)?);
     }
     Ok(ActionBatch {
         kind: ActionBatchKind::Actions,
@@ -196,10 +198,16 @@ pub fn actions_from_tool_uses(
 
 /// Map Ack + Frames onto one tool_result per computer tool_use.
 ///
-/// Screenshot/zoom become an image block; other successful actions become `OK`.
+/// Screenshot/zoom become an image block; `cursor_position` becomes `X=n, Y=m`
+/// from a frame cursor or `last_cursor`; other successful actions become `OK`.
 /// Failed ack results become `is_error` with the error text. This does not
 /// invent a successful result when `ok` is false.
-pub fn results_from_ack(uses: &[ToolUse], ack: &Ack, frames: &[Frame]) -> Vec<ToolResult> {
+pub fn results_from_ack(
+    uses: &[ToolUse],
+    ack: &Ack,
+    frames: &[Frame],
+    last_cursor: Option<Point>,
+) -> Vec<ToolResult> {
     let computer: Vec<&ToolUse> = uses.iter().filter(|u| u.is_computer()).collect();
     let mut frame_i = 0usize;
     let mut out = Vec::with_capacity(computer.len());
@@ -236,6 +244,26 @@ pub fn results_from_ack(uses: &[ToolUse], ack: &Ack, frames: &[Frame]) -> Vec<To
                     ));
                 }
             },
+            Ok("cursor_position") => {
+                let cursor = if result.map(|r| r.frame).unwrap_or(false) {
+                    let c = frames.get(frame_i).and_then(|f| f.cursor);
+                    frame_i += 1;
+                    c.or(last_cursor)
+                } else {
+                    frames.iter().rev().find_map(|f| f.cursor).or(last_cursor)
+                };
+                match cursor {
+                    Some([x, y]) => {
+                        out.push(ToolResult::ok_text(&use_block.id, format!("X={x}, Y={y}")));
+                    }
+                    None => {
+                        out.push(ToolResult::err_text(
+                            &use_block.id,
+                            "cursor position unknown",
+                        ));
+                    }
+                }
+            }
             Ok(_) | Err(_) => {
                 if result.map(|r| r.frame).unwrap_or(false) {
                     frame_i += 1;
@@ -247,23 +275,32 @@ pub fn results_from_ack(uses: &[ToolUse], ack: &Ack, frames: &[Frame]) -> Vec<To
     out
 }
 
-fn action_from_use(use_block: &ToolUse, last_frame: Option<(u32, u32)>) -> Result<Action> {
+fn action_from_use(
+    use_block: &ToolUse,
+    last_frame: Option<(u32, u32)>,
+    last_cursor: Option<Point>,
+) -> Result<Action> {
     let member = use_block.member()?;
-    let mut action = action_from_member(member, &use_block.input)?;
-    if let (Some((from_w, from_h)), Some((to_w, to_h))) =
-        (display_size(&use_block.input), last_frame)
+    let mut action = action_from_member(member, &use_block.input, last_cursor)?;
+    // last_cursor is already last-frame pixels; only scale explicit tool_use coords.
+    let has_explicit_coords = use_block.input.get("coordinate").is_some()
+        || use_block.input.get("start_coordinate").is_some()
+        || use_block.input.get("region").is_some();
+    if has_explicit_coords
+        && let (Some((from_w, from_h)), Some((to_w, to_h))) =
+            (display_size(&use_block.input), last_frame)
     {
         action.scale_coordinates(from_w, from_h, to_w, to_h);
     }
     Ok(action)
 }
 
-fn action_from_member(member: &str, input: &Value) -> Result<Action> {
+fn action_from_member(member: &str, input: &Value, last_cursor: Option<Point>) -> Result<Action> {
     match member {
         "screenshot" => Ok(Action::Screenshot {}),
-        "left_click" => click(input, Button::Left),
-        "right_click" => click(input, Button::Right),
-        "middle_click" => click(input, Button::Middle),
+        "left_click" => click(input, Button::Left, last_cursor),
+        "right_click" => click(input, Button::Right, last_cursor),
+        "middle_click" => click(input, Button::Middle, last_cursor),
         "double_click" => Ok(Action::DoubleClick {
             xy: point(input, "coordinate")?,
             button: Button::Left,
@@ -277,7 +314,7 @@ fn action_from_member(member: &str, input: &Value) -> Result<Action> {
         "mouse_move" => Ok(Action::Move {
             xy: point(input, "coordinate")?,
         }),
-        "scroll" => scroll(input),
+        "scroll" => scroll(input, last_cursor),
         "type" => {
             let text = text_field(input, "text")?;
             if text.is_empty() {
@@ -307,16 +344,16 @@ fn action_from_member(member: &str, input: &Value) -> Result<Action> {
     }
 }
 
-fn click(input: &Value, button: Button) -> Result<Action> {
+fn click(input: &Value, button: Button, last_cursor: Option<Point>) -> Result<Action> {
     Ok(Action::Click {
         button,
-        xy: point(input, "coordinate")?,
+        xy: point_or_cursor(input, "coordinate", last_cursor)?,
         mods: mods_from_text(input),
     })
 }
 
-fn scroll(input: &Value) -> Result<Action> {
-    let xy = point(input, "coordinate")?;
+fn scroll(input: &Value, last_cursor: Option<Point>) -> Result<Action> {
+    let xy = point_or_cursor(input, "coordinate", last_cursor)?;
     let amount = match input.get("scroll_amount") {
         None => 1,
         Some(v) => i32_number(v, "scroll_amount")?,
@@ -421,6 +458,17 @@ fn as_u32(value: &Value) -> Option<u32> {
         return None;
     }
     Some(f as u32)
+}
+
+fn point_or_cursor(input: &Value, key: &str, last_cursor: Option<Point>) -> Result<Point> {
+    if input.get(key).is_none() {
+        return last_cursor.ok_or_else(|| {
+            Error::Invalid(format!(
+                "{key} omitted; need a last-frame cursor for the current position"
+            ))
+        });
+    }
+    point(input, key)
 }
 
 fn point(input: &Value, key: &str) -> Result<Point> {

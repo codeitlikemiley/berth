@@ -79,33 +79,40 @@ pub fn clear_session(home: &Path) -> Result<()> {
     }
 }
 
-/// Last session.toml, optionally overridden by BERTH_SESSION=session_id.
-pub fn resolve_session(home: &Path) -> Result<Session> {
-    let file = load_session(home)?;
-    let env_id = std::env::var("BERTH_SESSION")
+fn berth_session_env() -> Option<String> {
+    std::env::var("BERTH_SESSION")
         .ok()
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+        .filter(|s| !s.is_empty())
+}
+
+/// Last session.toml, optionally overridden by BERTH_SESSION=session_id.
+pub fn existing_session(home: &Path) -> Result<Option<Session>> {
+    let file = load_session(home)?;
+    let env_id = berth_session_env();
     match (file, env_id) {
         (Some(mut session), Some(id)) => {
             if session.session_id != id {
                 session.session_id = id;
                 session.ws_url = None;
             }
-            Ok(session)
+            Ok(Some(session))
         }
-        (Some(session), None) => Ok(session),
-        (None, Some(id)) => Ok(Session {
+        (Some(session), None) => Ok(Some(session)),
+        (None, Some(id)) => Ok(Some(Session {
             node: DEFAULT_NODE.into(),
             lease_id: String::new(),
             session_id: id,
             viewer_url: None,
             ws_url: None,
-        }),
-        (None, None) => Err(Error::Usage(
-            "no active session; call berth_lease first".into(),
-        )),
+        })),
+        (None, None) => Ok(None),
     }
+}
+
+pub fn resolve_session(home: &Path) -> Result<Session> {
+    existing_session(home)?
+        .ok_or_else(|| Error::Usage("no active session; call berth_lease first".into()))
 }
 
 pub fn http_to_ws(base: &str, session_id: &str) -> String {

@@ -2,7 +2,7 @@ use berth_protocol::{Action, ActionBatch, ActionBatchKind, Button, LeaseRequest,
 
 use crate::client::NodeClient;
 use crate::config::{
-    Config, DEFAULT_NODE, Session, clear_session, http_to_ws, load_session, resolve_session,
+    Config, DEFAULT_NODE, Session, clear_session, existing_session, http_to_ws, resolve_session,
     save_session,
 };
 use crate::error::{Error, Result};
@@ -30,7 +30,7 @@ impl Mcp {
     }
 
     async fn lease(&self, args: &serde_json::Value) -> Result<ToolResult> {
-        if let Some(cur) = load_session(&self.home)? {
+        if let Some(cur) = existing_session(&self.home)? {
             return Ok(ToolResult::text(format_lease(
                 "current lease",
                 &cur.lease_id,
@@ -305,11 +305,11 @@ fn i32_from(value: &serde_json::Value, field: &str) -> Result<i32> {
 }
 
 fn format_lease(kind: &str, lease_id: &str, session_id: &str, viewer: Option<&str>) -> String {
-    let mut lines = vec![
-        kind.to_string(),
-        format!("lease_id={lease_id}"),
-        format!("session_id={session_id}"),
-    ];
+    let mut lines = vec![kind.to_string()];
+    if !lease_id.is_empty() {
+        lines.push(format!("lease_id={lease_id}"));
+    }
+    lines.push(format!("session_id={session_id}"));
     if let Some(url) = viewer {
         lines.push(format!("viewer_url={url}"));
     }

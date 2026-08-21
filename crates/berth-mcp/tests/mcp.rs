@@ -17,6 +17,44 @@ use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, 
 const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 const TOKEN: &str = "brt_secret";
 
+static ENV: Mutex<()> = Mutex::new(());
+
+struct EnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl EnvGuard {
+    fn acquire() -> Self {
+        let _lock = ENV.lock().unwrap_or_else(|p| p.into_inner());
+        clear_berth_session();
+        Self { _lock }
+    }
+
+    fn set_session(&self, id: &str) {
+        set_berth_session(id);
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        clear_berth_session();
+    }
+}
+
+fn home() -> (tempfile::TempDir, EnvGuard) {
+    (tempfile::tempdir().unwrap(), EnvGuard::acquire())
+}
+
+fn clear_berth_session() {
+    // SAFETY: ENV serializes process-env mutation in this test crate.
+    unsafe { std::env::remove_var("BERTH_SESSION") };
+}
+
+fn set_berth_session(id: &str) {
+    // SAFETY: ENV serializes process-env mutation in this test crate.
+    unsafe { std::env::set_var("BERTH_SESSION", id) };
+}
+
 fn sample_quote() -> Value {
     json!({
         "vcpu": 2,
@@ -80,17 +118,23 @@ fn text_of(result: &ToolResult) -> String {
 struct WsMock {
     token: String,
     fail: bool,
+    omit_frame: bool,
     batches: Vec<ActionBatch>,
     uris: Vec<String>,
     auths: Vec<Option<String>>,
 }
 
 async fn spawn_ws(token: &str, fail: bool) -> (String, Arc<Mutex<WsMock>>) {
+    spawn_ws_cfg(token, fail, false).await
+}
+
+async fn spawn_ws_cfg(token: &str, fail: bool, omit_frame: bool) -> (String, Arc<Mutex<WsMock>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let mock = Arc::new(Mutex::new(WsMock {
         token: token.to_string(),
         fail,
+        omit_frame,
         batches: Vec::new(),
         uris: Vec::new(),
         auths: Vec::new(),
@@ -141,11 +185,17 @@ async fn serve_ws(stream: tokio::net::TcpStream, mock: Arc<Mutex<WsMock>>) {
             continue;
         };
         let batch: ActionBatch = serde_json::from_str(text.as_str()).unwrap();
-        let fail = {
+        let (fail, omit_frame) = {
             let mut g = mock.lock().expect("mock");
             g.batches.push(batch.clone());
-            g.fail
+            (g.fail, g.omit_frame)
         };
+        let send_frame = !fail
+            && !omit_frame
+            && batch
+                .items
+                .iter()
+                .any(|i| matches!(i, Action::Screenshot {}));
         let ack = json!({
             "type": "ack",
             "id": batch.id,
@@ -153,7 +203,7 @@ async fn serve_ws(stream: tokio::net::TcpStream, mock: Arc<Mutex<WsMock>>) {
                 json!({
                     "i": i,
                     "ok": !fail,
-                    "frame": !fail && matches!(item, Action::Screenshot {}),
+                    "frame": send_frame && matches!(item, Action::Screenshot {}),
                     "error": if fail { Value::String("denied".into()) } else { Value::Null }
                 })
             }).collect::<Vec<_>>()
@@ -165,12 +215,7 @@ async fn serve_ws(stream: tokio::net::TcpStream, mock: Arc<Mutex<WsMock>>) {
         {
             break;
         }
-        if !fail
-            && batch
-                .items
-                .iter()
-                .any(|i| matches!(i, Action::Screenshot {}))
-        {
+        if send_frame {
             let frame = json!({
                 "type": "frame",
                 "session_id": batch.session_id,
@@ -187,7 +232,7 @@ async fn serve_ws(stream: tokio::net::TcpStream, mock: Arc<Mutex<WsMock>>) {
 
 #[tokio::test]
 async fn initialize_and_tools_list() {
-    let dir = tempfile::tempdir().unwrap();
+    let (dir, _env) = home();
     let mcp = Mcp::new(dir.path());
     let init = mcp
         .handle_rpc(json!({
@@ -229,7 +274,7 @@ async fn initialize_and_tools_list() {
 
 #[tokio::test]
 async fn lease_post_body_isolated_2_4_40() {
-    let dir = tempfile::tempdir().unwrap();
+    let (dir, _env) = home();
     let server = Server::run();
     server.expect(
         Expectation::matching(all_of![
@@ -275,7 +320,7 @@ async fn lease_post_body_isolated_2_4_40() {
 
 #[tokio::test]
 async fn seconds_below_60_ignored() {
-    let dir = tempfile::tempdir().unwrap();
+    let (dir, _env) = home();
     let server = Server::run();
     server.expect(
         Expectation::matching(all_of![
@@ -297,7 +342,7 @@ async fn seconds_below_60_ignored() {
 
 #[tokio::test]
 async fn windows_macos_rejected_without_http() {
-    let dir = tempfile::tempdir().unwrap();
+    let (dir, _env) = home();
     let server = Server::run();
     let url = format!("http://{}", server.addr());
     seed_pair(dir.path(), &url, TOKEN);
@@ -315,7 +360,7 @@ async fn windows_macos_rejected_without_http() {
 
 #[tokio::test]
 async fn existing_session_does_not_create_second_lease() {
-    let dir = tempfile::tempdir().unwrap();
+    let (dir, _env) = home();
     let server = Server::run();
     let url = format!("http://{}", server.addr());
     seed_pair(dir.path(), &url, TOKEN);
@@ -329,7 +374,7 @@ async fn existing_session_does_not_create_second_lease() {
 
 #[tokio::test]
 async fn lease_unauthorized() {
-    let dir = tempfile::tempdir().unwrap();
+    let (dir, _env) = home();
     let server = Server::run();
     server.expect(
         Expectation::matching(all_of![
@@ -353,7 +398,7 @@ async fn lease_unauthorized() {
 
 #[tokio::test]
 async fn screenshot_returns_png_from_frame() {
-    let dir = tempfile::tempdir().unwrap();
+    let (dir, _env) = home();
     let (ws_url, mock) = spawn_ws(TOKEN, false).await;
     seed_pair(dir.path(), "http://127.0.0.1:7432", TOKEN);
     seed_session(dir.path(), &ws_url);
@@ -380,7 +425,7 @@ async fn screenshot_returns_png_from_frame() {
 
 #[tokio::test]
 async fn click_sends_action_batch() {
-    let dir = tempfile::tempdir().unwrap();
+    let (dir, _env) = home();
     let (ws_url, mock) = spawn_ws(TOKEN, false).await;
     seed_pair(dir.path(), "http://127.0.0.1:7432", TOKEN);
     seed_session(dir.path(), &ws_url);
@@ -407,7 +452,7 @@ async fn click_sends_action_batch() {
 
 #[tokio::test]
 async fn type_key_scroll_ok() {
-    let dir = tempfile::tempdir().unwrap();
+    let (dir, _env) = home();
     let (ws_url, mock) = spawn_ws(TOKEN, false).await;
     seed_pair(dir.path(), "http://127.0.0.1:7432", TOKEN);
     seed_session(dir.path(), &ws_url);
@@ -433,7 +478,7 @@ async fn type_key_scroll_ok() {
 
 #[tokio::test]
 async fn failed_ack_is_error() {
-    let dir = tempfile::tempdir().unwrap();
+    let (dir, _env) = home();
     let (ws_url, _) = spawn_ws(TOKEN, true).await;
     seed_pair(dir.path(), "http://127.0.0.1:7432", TOKEN);
     seed_session(dir.path(), &ws_url);
@@ -447,7 +492,7 @@ async fn failed_ack_is_error() {
 
 #[tokio::test]
 async fn ws_unauthorized() {
-    let dir = tempfile::tempdir().unwrap();
+    let (dir, _env) = home();
     let (ws_url, _) = spawn_ws(TOKEN, false).await;
     seed_pair(dir.path(), "http://127.0.0.1:7432", "brt_stale");
     seed_session(dir.path(), &ws_url);
@@ -458,7 +503,7 @@ async fn ws_unauthorized() {
 
 #[tokio::test]
 async fn action_without_session_tells_agent_to_lease() {
-    let dir = tempfile::tempdir().unwrap();
+    let (dir, _env) = home();
     let mcp = Mcp::new(dir.path());
     let result = mcp.call_tool("berth_screenshot", json!({})).await;
     assert!(result.is_error);
@@ -467,7 +512,7 @@ async fn action_without_session_tells_agent_to_lease() {
 
 #[tokio::test]
 async fn end_404_clears_session() {
-    let dir = tempfile::tempdir().unwrap();
+    let (dir, _env) = home();
     let server = Server::run();
     server.expect(
         Expectation::matching(all_of![
@@ -492,7 +537,7 @@ async fn end_404_clears_session() {
 
 #[tokio::test]
 async fn end_unauthorized_keeps_session() {
-    let dir = tempfile::tempdir().unwrap();
+    let (dir, _env) = home();
     let server = Server::run();
     server.expect(
         Expectation::matching(all_of![
@@ -517,10 +562,37 @@ async fn end_unauthorized_keeps_session() {
 
 #[tokio::test]
 async fn missing_click_coords_error() {
-    let dir = tempfile::tempdir().unwrap();
+    let (dir, _env) = home();
     seed_session(dir.path(), "ws://127.0.0.1:9/v1/sessions/s_1");
     let mcp = Mcp::new(dir.path());
     let result = mcp.call_tool("berth_click", json!({})).await;
     assert!(result.is_error);
     assert!(text_of(&result).contains("x is required"));
+}
+
+#[tokio::test]
+async fn berth_session_env_is_existing_session() {
+    let (dir, env) = home();
+    let server = Server::run();
+    let url = format!("http://{}", server.addr());
+    seed_pair(dir.path(), &url, TOKEN);
+    env.set_session("s_env");
+    let mcp = Mcp::new(dir.path());
+    let result = mcp.call_tool("berth_lease", json!({ "os": "linux" })).await;
+    assert!(!result.is_error, "{}", text_of(&result));
+    assert!(text_of(&result).contains("current lease"));
+    assert!(text_of(&result).contains("session_id=s_env"));
+    assert!(!dir.path().join("session.toml").exists());
+}
+
+#[tokio::test]
+async fn screenshot_ack_without_frame_is_error() {
+    let (dir, _env) = home();
+    let (ws_url, _) = spawn_ws_cfg(TOKEN, false, true).await;
+    seed_pair(dir.path(), "http://127.0.0.1:7432", TOKEN);
+    seed_session(dir.path(), &ws_url);
+    let mcp = Mcp::new(dir.path());
+    let result = mcp.call_tool("berth_screenshot", json!({})).await;
+    assert!(result.is_error);
+    assert!(text_of(&result).contains("no frame"));
 }
