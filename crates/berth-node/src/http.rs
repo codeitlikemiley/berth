@@ -231,8 +231,15 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/pair", post(pair))
         .route("/v1/pairing", get(get_pairing))
         .merge(authed)
+        .fallback(console_fallback)
         .layer(middleware::from_fn(access_log))
         .with_state(state)
+}
+
+async fn console_fallback(State(state): State<AppState>, req: Request) -> Response {
+    let origin = state.origin();
+    let loopback = loopback_operator(req.headers(), origin.as_deref());
+    crate::console::response(req.uri().path(), loopback)
 }
 
 pub async fn serve(bind: SocketAddr, tunnel: Option<TunnelKind>) -> Result<()> {
@@ -252,6 +259,7 @@ pub async fn serve(bind: SocketAddr, tunnel: Option<TunnelKind>) -> Result<()> {
     let actual = listener.local_addr()?;
     state.set_bind(actual);
     eprintln!("listening on {actual}");
+    eprintln!("console: http://{actual}/");
     let tunnel_child = match tunnel {
         Some(TunnelKind::Cloudflare) => {
             let named = std::env::var("TUNNEL_TOKEN")
@@ -821,7 +829,7 @@ fn origin_hostname(origin: &str) -> &str {
     hostname_from_host(rest.split('/').next().unwrap_or(rest))
 }
 
-fn loopback_operator(headers: &HeaderMap, origin: Option<&str>) -> bool {
+pub(crate) fn loopback_operator(headers: &HeaderMap, origin: Option<&str>) -> bool {
     let Some(host) = headers.get(HOST).and_then(|v| v.to_str().ok()) else {
         return false;
     };
@@ -1763,6 +1771,154 @@ mod tests {
         assert_eq!(line, "GET /v1/pairing 200 3ms");
         assert!(!line.contains("ABCD"));
         assert!(!line.contains("brt_"));
+        assert_eq!(format_access_log("GET", "/", 200, 4), "GET / 200 4ms");
+    }
+
+    async fn body_text(res: Response) -> String {
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn html_asset_paths(html: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for attr in ["src=\"", "href=\""] {
+            let mut rest = html;
+            while let Some(i) = rest.find(attr) {
+                rest = &rest[i + attr.len()..];
+                if let Some(end) = rest.find('"') {
+                    let p = &rest[..end];
+                    if p.starts_with("/assets/") {
+                        out.push(p.to_string());
+                    }
+                    rest = &rest[end + 1..];
+                }
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn console_root_ok_no_secrets_loopback_csp() {
+        let (_dir, state) = test_state();
+        let code = state.pairing_code().unwrap();
+        let app = router(state);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("host", "127.0.0.1:7432")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers()
+                .get(CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-cache")
+        );
+        let ctype = res
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(ctype.contains("text/html"), "{ctype}");
+        let csp = res
+            .headers()
+            .get("content-security-policy")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            csp.contains("frame-src http://127.0.0.1:* http://localhost:* http://[::1]:*"),
+            "{csp}"
+        );
+        assert!(csp.contains("default-src 'self'"), "{csp}");
+        assert!(csp.contains("script-src 'self'"), "{csp}");
+        assert!(csp.contains("style-src 'self'"), "{csp}");
+        assert!(!csp.contains("unsafe-eval"), "{csp}");
+        assert!(!csp.contains("unsafe-inline"), "{csp}");
+        let body = body_text(res).await;
+        assert!(!body.contains(&code), "{body}");
+        assert!(!body.contains("brt_"), "{body}");
+        assert!(
+            !body
+                .to_ascii_lowercase()
+                .contains("content-security-policy"),
+            "{body}"
+        );
+        assert!(!body.contains("?code="), "{body}");
+    }
+
+    #[tokio::test]
+    async fn console_csp_trycloudflare_frames_none() {
+        let (_dir, state) = test_state();
+        let app = router(state);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("host", "random-words-here.trycloudflare.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let csp = res
+            .headers()
+            .get("content-security-policy")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(csp.contains("frame-src 'none'"), "{csp}");
+        assert!(!csp.contains("127.0.0.1:*"), "{csp}");
+        let body = body_text(res).await;
+        assert!(
+            !body
+                .to_ascii_lowercase()
+                .contains("content-security-policy"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn console_client_route_and_hashed_assets() {
+        let (_dir, state) = test_state();
+        let app = router(state);
+        let index = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/pair")
+                    .header("host", "127.0.0.1:7432")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(index.status(), StatusCode::OK);
+        let html = body_text(index).await;
+        for path in html_asset_paths(&html) {
+            let asset = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(&path)
+                        .header("host", "127.0.0.1:7432")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(asset.status(), StatusCode::OK, "{path}");
+            let cache = asset
+                .headers()
+                .get(CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            assert!(cache.contains("immutable"), "{path} {cache}");
+        }
     }
 
     #[test]

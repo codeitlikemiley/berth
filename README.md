@@ -35,6 +35,10 @@ berth doctor
 cloudflared is a warning unless you want `--tunnel cloudflare`. Unpaired is a
 warning until `berth pair`.
 
+The dashboard is compiled into berth. **Node 22 at compile time** (`npm` on
+PATH, or a pre-built `apps/console/dist`). `cargo install --path crates/berth-cli`
+without Node embeds the placeholder, not the UI.
+
 ### Two machines (headline)
 
 The node still binds **loopback**. `cloudflared` is the public edge. Pairing is

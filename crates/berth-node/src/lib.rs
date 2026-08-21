@@ -7,6 +7,7 @@
 
 mod action;
 mod allowlist;
+mod console;
 mod db;
 mod docker;
 mod error;
