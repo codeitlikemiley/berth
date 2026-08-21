@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::lease::{Density, LeaseRequest, Os, Term};
+use crate::lease::{Density, LeaseRequest, MvpError, Os, Term, validate_mvp};
 
 /// Seed USD / vCPU-second from `docs/MATH.md`.
 pub const P_CPU: f64 = 0.000_003_5;
@@ -59,7 +59,12 @@ pub struct Quote {
 impl Quote {
     /// Wall-clock on-demand quote from MATH.md seed prices. No protocol cut
     /// (that is a mesh settlement concern; MVP only prints the meter).
-    pub fn from_request(req: &LeaseRequest) -> Self {
+    ///
+    /// Refuses anything `validate_mvp` rejects so licensed-cloud / mesh / non-Linux
+    /// requests cannot pick up the private Linux seed formula (and so `os_mult` is
+    /// never applied on a licensed-cloud quote).
+    pub fn from_request(req: &LeaseRequest) -> Result<Self, MvpError> {
+        validate_mvp(req)?;
         let os_mult = os_mult(req.os);
         let density_mult = density_mult(req.density);
         let usd_per_second = (P_CPU * f64::from(req.resources.vcpu)
@@ -68,7 +73,7 @@ impl Quote {
             * density_mult
             * os_mult;
         let gas_per_second = usd_per_second / USD_PER_GAS;
-        Self {
+        Ok(Self {
             vcpu: req.resources.vcpu,
             mem_gib: req.resources.mem_gib,
             disk_gib: req.resources.disk_gib,
@@ -84,7 +89,7 @@ impl Quote {
             currency: CURRENCY_GAS.into(),
             usd_per_gas: format_decimal(USD_PER_GAS),
             preemptible: req.preemptible.unwrap_or(false),
-        }
+        })
     }
 
     pub fn usd_per_second(&self) -> Result<f64, std::num::ParseFloatError> {

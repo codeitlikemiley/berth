@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use berth_protocol::{
     Ack, Action, ActionBatch, Button, Class, DENSITY_MULT_ISOLATED, DENSITY_MULT_SHARED, Density,
     Frame, Isolation, Lease, LeaseRequest, License, MvpError, Os, P_CPU, P_DISK, P_MEM, Quote,
-    Resources, Term, USD_PER_GAS, default_min_seconds, scale_coordinates, validate_mvp,
+    Term, USD_PER_GAS, default_min_seconds, scale_coordinates, validate_mvp,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -25,6 +25,30 @@ fn load_json(name: &str) -> serde_json::Value {
 
 fn load<T: DeserializeOwned>(name: &str) -> T {
     serde_json::from_value(load_json(name)).unwrap_or_else(|e| panic!("{name}: {e}"))
+}
+
+fn mvp_lease_json(patch: serde_json::Value) -> serde_json::Value {
+    let mut base = json!({
+        "os": "linux",
+        "class": "private",
+        "license": "linux",
+        "density": "isolated",
+        "pooled": false,
+        "term": "on_demand",
+        "resources": { "vcpu": 2, "mem_gib": 4, "disk_gib": 40 },
+        "min_seconds": 60,
+        "max_seconds": 3600
+    });
+    if let (Some(base_obj), Some(patch_obj)) = (base.as_object_mut(), patch.as_object()) {
+        for (k, v) in patch_obj {
+            base_obj.insert(k.clone(), v.clone());
+        }
+    }
+    base
+}
+
+fn parse_lease(patch: serde_json::Value) -> LeaseRequest {
+    serde_json::from_value(mvp_lease_json(patch)).expect("lease json")
 }
 
 fn roundtrip<T>(value: &T)
@@ -207,87 +231,138 @@ fn click_defaults_button_and_repeat() {
 #[test]
 fn validate_mvp_table() {
     struct Case {
+        patch: serde_json::Value,
         os: Os,
         class: Class,
+        density: Density,
+        term: Term,
         ok: bool,
         snippet: Option<&'static str>,
+        err: Option<MvpError>,
     }
     let cases = [
         Case {
+            patch: json!({}),
             os: Os::Linux,
             class: Class::Private,
+            density: Density::Isolated,
+            term: Term::OnDemand,
             ok: true,
             snippet: None,
+            err: None,
         },
         Case {
+            patch: json!({"density": "shared"}),
+            os: Os::Linux,
+            class: Class::Private,
+            density: Density::Shared,
+            term: Term::OnDemand,
+            ok: true,
+            snippet: None,
+            err: None,
+        },
+        Case {
+            patch: json!({"class": "licensed-cloud"}),
             os: Os::Linux,
             class: Class::LicensedCloud,
-            ok: true,
-            snippet: None,
+            density: Density::Isolated,
+            term: Term::OnDemand,
+            ok: false,
+            snippet: Some("licensed-cloud"),
+            err: Some(MvpError::UnsupportedClass(Class::LicensedCloud)),
         },
         Case {
+            patch: json!({"class": "mesh"}),
             os: Os::Linux,
             class: Class::Mesh,
+            density: Density::Isolated,
+            term: Term::OnDemand,
             ok: false,
             snippet: Some("class=mesh"),
+            err: Some(MvpError::UnsupportedClass(Class::Mesh)),
         },
         Case {
+            patch: json!({"os": "windows"}),
             os: Os::Windows,
             class: Class::Private,
+            density: Density::Isolated,
+            term: Term::OnDemand,
             ok: false,
             snippet: Some("Windows"),
+            err: Some(MvpError::UnsupportedOs(Os::Windows)),
         },
         Case {
+            patch: json!({"os": "macos"}),
             os: Os::Macos,
             class: Class::Private,
+            density: Density::Isolated,
+            term: Term::OnDemand,
             ok: false,
             snippet: Some("macOS"),
+            err: Some(MvpError::UnsupportedOs(Os::Macos)),
         },
         Case {
+            patch: json!({"os": "windows", "class": "mesh"}),
             os: Os::Windows,
             class: Class::Mesh,
+            density: Density::Isolated,
+            term: Term::OnDemand,
             ok: false,
             snippet: Some("Windows"),
+            err: Some(MvpError::UnsupportedOs(Os::Windows)),
         },
         Case {
+            patch: json!({"os": "macos", "class": "mesh"}),
             os: Os::Macos,
             class: Class::Mesh,
+            density: Density::Isolated,
+            term: Term::OnDemand,
             ok: false,
             snippet: Some("macOS"),
+            err: Some(MvpError::UnsupportedOs(Os::Macos)),
+        },
+        Case {
+            patch: json!({"density": "exclusive"}),
+            os: Os::Linux,
+            class: Class::Private,
+            density: Density::Exclusive,
+            term: Term::OnDemand,
+            ok: false,
+            snippet: Some("density=exclusive"),
+            err: Some(MvpError::UnsupportedDensity(Density::Exclusive)),
+        },
+        Case {
+            patch: json!({"term": "monthly"}),
+            os: Os::Linux,
+            class: Class::Private,
+            density: Density::Isolated,
+            term: Term::Monthly,
+            ok: false,
+            snippet: Some("term=monthly"),
+            err: Some(MvpError::UnsupportedTerm(Term::Monthly)),
+        },
+        Case {
+            patch: json!({"term": "annual"}),
+            os: Os::Linux,
+            class: Class::Private,
+            density: Density::Isolated,
+            term: Term::Annual,
+            ok: false,
+            snippet: Some("term=annual"),
+            err: Some(MvpError::UnsupportedTerm(Term::Annual)),
         },
     ];
 
     for case in cases {
-        let req = LeaseRequest {
-            os: case.os,
-            class: case.class,
-            license: License::Linux,
-            density: Density::Isolated,
-            pooled: false,
-            term: Term::OnDemand,
-            resources: Resources {
-                vcpu: 2,
-                mem_gib: 4,
-                disk_gib: 40,
-            },
-            workspace: None,
-            object: None,
-            cpu_overcommit: None,
-            min_seconds: 60,
-            max_seconds: 3600,
-            exclusive_hardware: false,
-            capabilities: Vec::new(),
-            image: None,
-            region: None,
-            isolation: Isolation::Vm,
-            network: None,
-            recording: None,
-            human_confirm: Vec::new(),
-            preemptible: None,
-        };
+        let req = parse_lease(case.patch.clone());
+        assert_eq!(req.os, case.os, "patch {}", case.patch);
+        assert_eq!(req.class, case.class, "patch {}", case.patch);
+        assert_eq!(req.density, case.density, "patch {}", case.patch);
+        assert_eq!(req.term, case.term, "patch {}", case.patch);
         let result = validate_mvp(&req);
         if case.ok {
             result.unwrap();
+            Quote::from_request(&req).unwrap();
         } else {
             let err = result.unwrap_err();
             let msg = err.to_string();
@@ -296,12 +371,9 @@ fn validate_mvp_table() {
                 msg.contains(snippet),
                 "error {msg:?} should mention {snippet}"
             );
-            match (case.os, case.class, err) {
-                (Os::Windows, _, MvpError::UnsupportedOs(Os::Windows))
-                | (Os::Macos, _, MvpError::UnsupportedOs(Os::Macos))
-                | (Os::Linux, Class::Mesh, MvpError::MeshNotSupported) => {}
-                other => panic!("unexpected error combo {other:?}"),
-            }
+            assert_eq!(err, case.err.expect("expected error"));
+            let quote_err = Quote::from_request(&req).unwrap_err();
+            assert_eq!(quote_err, err);
         }
     }
 }
@@ -311,7 +383,7 @@ fn quote_seed_prices_from_math_md() {
     // 2 vCPU / 4 GiB / 40 GiB isolated Linux: 3600s → $0.0482 / hr (MATH.md).
     let isolated: LeaseRequest = load("lease_request_mvp.json");
     assert_eq!(isolated.density, Density::Isolated);
-    let quote = Quote::from_request(&isolated);
+    let quote = Quote::from_request(&isolated).unwrap();
     assert_eq!(quote.os, Os::Linux);
     assert_eq!(quote.os_mult, 1.0);
     assert_eq!(quote.density_mult, DENSITY_MULT_ISOLATED);
@@ -330,7 +402,7 @@ fn quote_seed_prices_from_math_md() {
     let mut shared = isolated.clone();
     shared.density = Density::Shared;
     shared.min_seconds = 0;
-    let shared_quote = Quote::from_request(&shared);
+    let shared_quote = Quote::from_request(&shared).unwrap();
     assert_eq!(shared_quote.density_mult, DENSITY_MULT_SHARED);
     assert_eq!(
         shared_quote.min_seconds,
@@ -374,6 +446,20 @@ fn scale_coordinates_table() {
             to: (1280, 800),
             want: [100, 200],
         },
+        // Anisotropic: x doubles, y is identity. Swapping width/height would yield [100, 400].
+        Case {
+            xy: [100, 200],
+            from: (200, 400),
+            to: (400, 400),
+            want: [200, 200],
+        },
+        // 3→4 is not integer; truncation gives 2, round-nearest gives 3.
+        Case {
+            xy: [2, 2],
+            from: (3, 3),
+            to: (4, 4),
+            want: [3, 3],
+        },
     ];
     for case in cases {
         let got = scale_coordinates(case.xy, case.from.0, case.from.1, case.to.0, case.to.1);
@@ -388,6 +474,14 @@ fn scale_coordinates_table() {
     batch.scale_coordinates(640, 400, 1280, 800);
     match &batch.items[1] {
         Action::Click { xy, .. } => assert_eq!(*xy, [200, 400]),
+        other => panic!("{other:?}"),
+    }
+    match &batch.items[2] {
+        Action::DoubleClick { xy, .. } => assert_eq!(*xy, [200, 400]),
+        other => panic!("{other:?}"),
+    }
+    match &batch.items[3] {
+        Action::Move { xy } => assert_eq!(*xy, [200, 400]),
         other => panic!("{other:?}"),
     }
     match &batch.items[4] {

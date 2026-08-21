@@ -86,6 +86,16 @@ pub enum Term {
     Annual,
 }
 
+impl Term {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OnDemand => "on_demand",
+            Self::Monthly => "monthly",
+            Self::Annual => "annual",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Isolation {
@@ -200,15 +210,26 @@ pub fn default_min_seconds(os: Os, density: Density) -> u64 {
     }
 }
 
-/// MVP control-plane gate: Linux only, no public mesh.
+/// MVP control-plane gate: private Linux, isolated|shared, on_demand.
 pub fn validate_mvp(req: &LeaseRequest) -> Result<(), MvpError> {
     match req.os {
         Os::Linux => {}
         Os::Windows => return Err(MvpError::UnsupportedOs(Os::Windows)),
         Os::Macos => return Err(MvpError::UnsupportedOs(Os::Macos)),
     }
-    if req.class == Class::Mesh {
-        return Err(MvpError::MeshNotSupported);
+    match req.class {
+        Class::Private => {}
+        Class::Mesh | Class::LicensedCloud => {
+            return Err(MvpError::UnsupportedClass(req.class));
+        }
+    }
+    match req.density {
+        Density::Isolated | Density::Shared => {}
+        Density::Exclusive => return Err(MvpError::UnsupportedDensity(req.density)),
+    }
+    match req.term {
+        Term::OnDemand => {}
+        Term::Monthly | Term::Annual => return Err(MvpError::UnsupportedTerm(req.term)),
     }
     Ok(())
 }
@@ -216,7 +237,9 @@ pub fn validate_mvp(req: &LeaseRequest) -> Result<(), MvpError> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MvpError {
     UnsupportedOs(Os),
-    MeshNotSupported,
+    UnsupportedClass(Class),
+    UnsupportedDensity(Density),
+    UnsupportedTerm(Term),
 }
 
 impl std::fmt::Display for MvpError {
@@ -237,7 +260,21 @@ impl std::fmt::Display for MvpError {
             Self::UnsupportedOs(Os::Linux) => {
                 write!(f, "unsupported os for MVP")
             }
-            Self::MeshNotSupported => write!(f, "class=mesh is not supported in the MVP"),
+            Self::UnsupportedClass(class) => write!(
+                f,
+                "class={} is not supported in the MVP; only class=private is available",
+                class.as_str()
+            ),
+            Self::UnsupportedDensity(density) => write!(
+                f,
+                "density={} is not supported in the MVP; only density=isolated or density=shared is available",
+                density.as_str()
+            ),
+            Self::UnsupportedTerm(term) => write!(
+                f,
+                "term={} is not supported in the MVP; only term=on_demand is available",
+                term.as_str()
+            ),
         }
     }
 }
