@@ -106,6 +106,10 @@ impl AppState {
         self.inner.shutting_down.send_replace(true);
     }
 
+    fn is_shutting_down(&self) -> bool {
+        *self.inner.shutting_down.borrow()
+    }
+
     fn shutdown_rx(&self) -> watch::Receiver<bool> {
         self.inner.shutting_down.subscribe()
     }
@@ -193,13 +197,15 @@ pub async fn serve(bind: SocketAddr) -> Result<()> {
     state.set_bind(actual);
     eprintln!("listening on {actual}");
     let shutdown_state = state.clone();
+    let drain_state = state.clone();
     axum::serve(listener, router(state))
         .with_graceful_shutdown(async move {
             wait_shutdown_signal().await;
+            // Fail closed before axum stops accepting; drain after serve returns.
             shutdown_state.begin_shutdown();
-            shutdown_state.drain().await;
         })
         .await?;
+    drain_state.drain().await;
     Ok(())
 }
 
@@ -242,6 +248,7 @@ impl IntoResponse for Error {
                 StatusCode::BAD_REQUEST
             }
             Error::Stopped => StatusCode::CONFLICT,
+            Error::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let body = Json(serde_json::json!({ "error": self.to_string() }));
@@ -300,10 +307,17 @@ async fn create_lease(
     State(state): State<AppState>,
     Json(mut req): Json<LeaseRequest>,
 ) -> Result<(StatusCode, Json<LeaseView>)> {
+    if state.is_shutting_down() {
+        return Err(Error::ShuttingDown);
+    }
     req.min_seconds = req.min_seconds.max(CONTAINER_MIN_SECONDS);
     req.validate_mvp()?;
     let quote = Quote::from_request(&req)?;
     let mut guest = Guest::start(state.inner.mode, &state.inner.docker, &req).await?;
+    if state.is_shutting_down() {
+        let _ = guest.stop().await;
+        return Err(Error::ShuttingDown);
+    }
     let session_id = guest.session_id().to_string();
     let workspace_id = guest.workspace_id().to_string();
     let viewer_port = guest.viewer_port();
@@ -856,6 +870,29 @@ mod tests {
         assert_eq!(frame_json["type"], "frame");
         assert_eq!(frame_json["session_id"], session_id);
         assert_eq!(frame_json["mime"], "image/png");
+    }
+
+    #[tokio::test]
+    async fn create_lease_rejected_while_shutting_down() {
+        let (_dir, state) = test_state();
+        let code = state.pairing_code().unwrap();
+        let app = router(state.clone());
+        let token = pair_token(&app, &code).await;
+        state.begin_shutdown();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/leases")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(sample_lease().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(state.inner.db.active_leases().unwrap().is_empty());
     }
 
     #[tokio::test]

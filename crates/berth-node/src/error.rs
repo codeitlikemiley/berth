@@ -19,6 +19,7 @@ pub enum Error {
     Unauthorized,
     NotFound,
     BadRequest(String),
+    ShuttingDown,
     Internal(String),
 }
 
@@ -51,6 +52,7 @@ impl fmt::Display for Error {
             Self::Unauthorized => write!(f, "unauthorized"),
             Self::NotFound => write!(f, "not found"),
             Self::BadRequest(msg) => write!(f, "{msg}"),
+            Self::ShuttingDown => write!(f, "node is shutting down"),
             Self::Internal(msg) => write!(f, "{msg}"),
         }
     }
@@ -73,6 +75,7 @@ impl std::error::Error for Error {
             | Self::Unauthorized
             | Self::NotFound
             | Self::BadRequest(_)
+            | Self::ShuttingDown
             | Self::Internal(_) => None,
         }
     }
