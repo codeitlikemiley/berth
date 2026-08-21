@@ -61,7 +61,11 @@ enum Command {
         revoke_others: bool,
     },
     /// End a session
-    End,
+    End {
+        /// Forfeit host income for this lease
+        #[arg(long)]
+        force: bool,
+    },
     /// Print the session viewer URL
     View,
     /// Show session status
@@ -132,7 +136,7 @@ pub fn execute(cli: Cli, home: &Path) -> Result<String> {
         } => cmd_pair(home, &url, &code, &node, revoke_others),
         Command::Up { os, node } => cmd_up(home, &os, &node),
         Command::View => cmd_view(home),
-        Command::End => cmd_end(home),
+        Command::End { force } => cmd_end(home, force),
         Command::Status => cmd_status(home),
         Command::Mcp => {
             berth_mcp::serve_blocking(home)?;
@@ -203,11 +207,16 @@ fn cmd_status(home: &Path) -> Result<String> {
     Ok(format_status(&session.node, &node.url, &lease))
 }
 
-fn cmd_end(home: &Path) -> Result<String> {
+fn cmd_end(home: &Path, force: bool) -> Result<String> {
     let session = require_session(home)?;
     let cfg = Config::load(home)?;
     let node = cfg.node(&session.node)?;
-    let result = NodeClient::new(&node.url, Some(&node.token))?.delete_lease(&session.lease_id);
+    let client = NodeClient::new(&node.url, Some(&node.token))?;
+    let result = if force {
+        client.force_lease(&session.lease_id)
+    } else {
+        client.delete_lease(&session.lease_id)
+    };
     match result {
         Ok(lease) => {
             clear_session(home)?;
@@ -504,6 +513,53 @@ mod tests {
     }
 
     #[test]
+    fn up_unparked_surfaces_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(all_of![
+                request::method_path("POST", "/v1/leases"),
+                request::headers(contains(("authorization", "Bearer brt_secret"))),
+            ])
+            .respond_with(
+                status_code(409)
+                    .append_header("content-type", "application/json")
+                    .body(r#"{"error":"node is unparked"}"#),
+            ),
+        );
+        let url = format!("http://{}", server.addr());
+        seed_pair(dir.path(), &url, "brt_secret");
+        let err = run(dir.path(), &["up", "--os", "linux"]).unwrap_err();
+        assert!(err.to_string().contains("node is unparked"));
+        assert!(load_session(dir.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn end_force_posts_force_and_clears_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(all_of![
+                request::method_path("POST", "/v1/leases/l_1/force"),
+                request::headers(contains(("authorization", "Bearer brt_secret"))),
+            ])
+            .respond_with(json_encoded({
+                let mut lease = sample_lease("stopped", Some(60));
+                lease["end_reason"] = json!("forced");
+                lease["forfeited"] = json!(true);
+                lease
+            })),
+        );
+        let url = format!("http://{}", server.addr());
+        seed_pair(dir.path(), &url, "brt_secret");
+        seed_session(dir.path());
+        let out = run(dir.path(), &["end", "--force"]).unwrap();
+        assert!(out.contains("l_1"));
+        assert!(out.contains("billable_seconds=60"));
+        assert!(load_session(dir.path()).unwrap().is_none());
+    }
+
+    #[test]
     fn end_404_clears_session() {
         let dir = tempfile::tempdir().unwrap();
         let server = Server::run();
@@ -545,6 +601,14 @@ mod tests {
     fn parse_mcp() {
         let cli = Cli::try_parse_from(["berth", "mcp"]).unwrap();
         assert!(matches!(cli.command, Command::Mcp));
+    }
+
+    #[test]
+    fn parse_end_force() {
+        let end = Cli::try_parse_from(["berth", "end"]).unwrap();
+        assert!(matches!(end.command, Command::End { force: false }));
+        let force = Cli::try_parse_from(["berth", "end", "--force"]).unwrap();
+        assert!(matches!(force.command, Command::End { force: true }));
     }
 
     #[test]

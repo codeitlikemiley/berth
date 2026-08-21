@@ -42,6 +42,12 @@ pub struct LeaseView {
     #[serde(default)]
     #[allow(dead_code)]
     pub live: bool,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub end_reason: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub forfeited: bool,
 }
 
 impl NodeClient {
@@ -89,6 +95,12 @@ impl NodeClient {
     pub fn delete_lease(&self, lease_id: &str) -> Result<LeaseView> {
         let url = format!("{}/v1/leases/{lease_id}", self.base);
         let res = self.authed(self.http.delete(url)).send()?;
+        decode(res)
+    }
+
+    pub fn force_lease(&self, lease_id: &str) -> Result<LeaseView> {
+        let url = format!("{}/v1/leases/{lease_id}/force", self.base);
+        let res = self.authed(self.http.post(url)).send()?;
         decode(res)
     }
 

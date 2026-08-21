@@ -21,6 +21,8 @@ pub enum Error {
     BadRequest(String),
     ShuttingDown,
     TooManyBearers,
+    Unparked,
+    Occupied { live_lease_id: String },
     Tunnel(String),
     Internal(String),
 }
@@ -64,6 +66,8 @@ impl fmt::Display for Error {
                     "too many paired clients (max 8); re-pair with revoke_others"
                 )
             }
+            Self::Unparked => write!(f, "node is unparked"),
+            Self::Occupied { .. } => write!(f, "cannot unpark while a lease is live"),
             Self::Tunnel(msg) | Self::Internal(msg) => write!(f, "{msg}"),
         }
     }
@@ -88,6 +92,8 @@ impl std::error::Error for Error {
             | Self::BadRequest(_)
             | Self::ShuttingDown
             | Self::TooManyBearers
+            | Self::Unparked
+            | Self::Occupied { .. }
             | Self::Tunnel(_)
             | Self::Internal(_) => None,
         }

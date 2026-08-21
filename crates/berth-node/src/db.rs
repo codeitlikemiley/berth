@@ -40,7 +40,15 @@ CREATE TABLE IF NOT EXISTS leases (
     stopped_at INTEGER,
     min_seconds INTEGER NOT NULL,
     elapsed_seconds INTEGER,
-    billable_seconds INTEGER
+    billable_seconds INTEGER,
+    end_reason TEXT,
+    forfeited INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS node_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    parked INTEGER NOT NULL DEFAULT 1,
+    updated_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -60,9 +68,28 @@ const MAX_BEARERS: i64 = 8;
 const LEASE_SELECT: &str = "SELECT leases.id, leases.session_id, leases.status, leases.quote_json,
         leases.ws_url, leases.viewer_url, leases.started_at, leases.min_seconds,
         leases.elapsed_seconds, leases.billable_seconds, sessions.container_id,
-        leases.stopped_at, leases.workspace_id
+        leases.stopped_at, leases.workspace_id, leases.end_reason, leases.forfeited
  FROM leases
  LEFT JOIN sessions ON sessions.id = leases.session_id";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EndReason {
+    Graceful,
+    Forced,
+}
+
+impl EndReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Graceful => "graceful",
+            Self::Forced => "forced",
+        }
+    }
+
+    fn forfeited(self) -> bool {
+        matches!(self, Self::Forced)
+    }
+}
 
 pub(crate) fn billable_seconds(min_seconds: u64, elapsed: u64) -> u64 {
     elapsed.max(min_seconds)
@@ -88,6 +115,8 @@ pub(crate) struct LeaseRow {
     pub container_id: Option<String>,
     pub stopped_at: Option<i64>,
     pub workspace_id: String,
+    pub end_reason: Option<String>,
+    pub forfeited: bool,
 }
 
 pub(crate) struct NewLease {
@@ -120,6 +149,15 @@ impl Db {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN container_id TEXT", []);
+        let _ = conn.execute("ALTER TABLE leases ADD COLUMN end_reason TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE leases ADD COLUMN forfeited INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        conn.execute(
+            "INSERT OR IGNORE INTO node_state (id, parked, updated_at) VALUES (1, 1, ?1)",
+            params![unix_now()],
+        )?;
         secure_file(&sidecar(path, "-wal"))?;
         secure_file(&sidecar(path, "-shm"))?;
         Ok(Self {
@@ -362,7 +400,7 @@ impl Db {
         Ok(out)
     }
 
-    pub(crate) fn stop_lease(&self, lease_id: &str) -> Result<LeaseRow> {
+    pub(crate) fn stop_lease(&self, lease_id: &str, reason: EndReason) -> Result<LeaseRow> {
         let now = unix_now();
         let mut conn = self.lock();
         let tx = conn.transaction()?;
@@ -375,9 +413,17 @@ impl Db {
         let billable = billable_seconds(min, elapsed);
         tx.execute(
             "UPDATE leases
-             SET status = 'stopped', stopped_at = ?1, elapsed_seconds = ?2, billable_seconds = ?3
-             WHERE id = ?4",
-            params![now, elapsed as i64, billable as i64, lease_id],
+             SET status = 'stopped', stopped_at = ?1, elapsed_seconds = ?2, billable_seconds = ?3,
+                 end_reason = ?4, forfeited = ?5
+             WHERE id = ?6",
+            params![
+                now,
+                elapsed as i64,
+                billable as i64,
+                reason.as_str(),
+                i64::from(reason.forfeited()),
+                lease_id
+            ],
         )?;
         tx.execute(
             "UPDATE sessions SET status = 'stopped', stopped_at = ?1 WHERE id = ?2",
@@ -385,6 +431,34 @@ impl Db {
         )?;
         tx.commit()?;
         get_lease_conn(&conn, lease_id)
+    }
+
+    pub(crate) fn parked(&self) -> Result<bool> {
+        let parked: i64 =
+            self.lock()
+                .query_row("SELECT parked FROM node_state WHERE id = 1", [], |row| {
+                    row.get(0)
+                })?;
+        Ok(parked != 0)
+    }
+
+    pub(crate) fn set_parked(&self, parked: bool) -> Result<()> {
+        self.lock().execute(
+            "UPDATE node_state SET parked = ?1, updated_at = ?2 WHERE id = 1",
+            params![i64::from(parked), unix_now()],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn lease_id_for_session(&self, session_id: &str) -> Result<Option<String>> {
+        self.lock()
+            .query_row(
+                "SELECT id FROM leases WHERE session_id = ?1 LIMIT 1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
     }
 }
 
@@ -415,6 +489,8 @@ fn lease_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LeaseRow> {
         container_id: row.get(10)?,
         stopped_at: row.get(11)?,
         workspace_id: row.get(12)?,
+        end_reason: row.get(13)?,
+        forfeited: row.get(14)?,
     })
 }
 
@@ -586,16 +662,65 @@ mod tests {
         assert_eq!(row.workspace_id, "ws_1");
         assert!(row.billable_seconds.is_none());
         assert!(row.stopped_at.is_none());
-        let stopped = db.stop_lease("l_1").unwrap();
+        assert!(row.end_reason.is_none());
+        assert!(!row.forfeited);
+        let stopped = db.stop_lease("l_1", EndReason::Graceful).unwrap();
         assert_eq!(stopped.status, "stopped");
         assert_eq!(stopped.billable_seconds, Some(60));
         assert!(stopped.stopped_at.is_some());
+        assert_eq!(stopped.end_reason.as_deref(), Some("graceful"));
+        assert!(!stopped.forfeited);
         let listed = db.list_leases().unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, "l_1");
         assert_eq!(listed[0].status, "stopped");
-        let again = db.stop_lease("l_1").unwrap();
+        let again = db.stop_lease("l_1", EndReason::Forced).unwrap();
         assert_eq!(again.billable_seconds, Some(60));
+        assert_eq!(again.end_reason.as_deref(), Some("graceful"));
+        assert!(!again.forfeited);
         assert!(matches!(db.get_lease("missing"), Err(Error::NotFound)));
+    }
+
+    #[test]
+    fn fresh_db_is_parked_and_survives_reopen() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("node.db");
+        {
+            let db = Db::open(&path).unwrap();
+            assert!(db.parked().unwrap());
+            db.set_parked(false).unwrap();
+            assert!(!db.parked().unwrap());
+        }
+        let db = Db::open(&path).unwrap();
+        assert!(!db.parked().unwrap());
+        db.set_parked(true).unwrap();
+        assert!(db.parked().unwrap());
+    }
+
+    #[test]
+    fn force_stop_forfeits_and_records_billable() {
+        let (_dir, db) = tmp_db();
+        db.insert_lease(&NewLease {
+            lease_id: "l_f".into(),
+            session_id: "s_f".into(),
+            workspace_id: "ws_f".into(),
+            request_json: "{}".into(),
+            quote_json: "{}".into(),
+            ws_url: "ws://127.0.0.1:7432/v1/sessions/s_f".into(),
+            viewer_url: None,
+            min_seconds: 60,
+            viewer_port: None,
+            container_id: None,
+        })
+        .unwrap();
+        let stopped = db.stop_lease("l_f", EndReason::Forced).unwrap();
+        assert_eq!(stopped.status, "stopped");
+        assert_eq!(stopped.billable_seconds, Some(60));
+        assert_eq!(stopped.end_reason.as_deref(), Some("forced"));
+        assert!(stopped.forfeited);
+        assert_eq!(
+            db.lease_id_for_session("s_f").unwrap().as_deref(),
+            Some("l_f")
+        );
     }
 }

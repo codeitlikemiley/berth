@@ -18,7 +18,7 @@ use berth_protocol::{ActionBatch, LeaseRequest, Quote, parse_allowlist};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
-use crate::db::{Db, LeaseRow, NewLease};
+use crate::db::{Db, EndReason, LeaseRow, NewLease};
 use crate::docker::image_from_env;
 use crate::error::{Error, Result};
 use crate::guest::{Guest, GuestMode};
@@ -66,6 +66,9 @@ pub struct LeaseView {
     pub stopped_at: Option<i64>,
     pub workspace_id: String,
     pub live: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_reason: Option<String>,
+    pub forfeited: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -90,6 +93,8 @@ impl LeaseView {
             stopped_at: row.stopped_at,
             workspace_id: row.workspace_id.clone(),
             live,
+            end_reason: row.end_reason.clone(),
+            forfeited: row.forfeited,
         })
     }
 }
@@ -196,7 +201,7 @@ impl AppState {
             let _ = self
                 .reap_session(&row.session_id, row.container_id.as_deref())
                 .await;
-            let _ = self.inner.db.stop_lease(&row.id);
+            let _ = self.inner.db.stop_lease(&row.id, EndReason::Graceful);
         }
     }
 }
@@ -218,7 +223,11 @@ pub fn router(state: AppState) -> Router {
     let authed = Router::new()
         .route("/v1/leases", get(list_leases).post(create_lease))
         .route("/v1/leases/{id}", get(get_lease).delete(delete_lease))
+        .route("/v1/leases/{id}/force", post(force_lease))
         .route("/v1/node", get(get_node))
+        .route("/v1/node/park", post(park_node))
+        .route("/v1/node/unpark", post(unpark_node))
+        .route("/v1/quote", post(quote_lease))
         .route("/v1/sessions/{id}", get(session_ws))
         .route("/v1/sessions/{id}/preview", get(session_preview))
         .route_layer(middleware::from_fn_with_state(
@@ -356,12 +365,20 @@ impl IntoResponse for Error {
             Error::Mvp(_) | Error::InvalidResources | Error::BadRequest(_) => {
                 StatusCode::BAD_REQUEST
             }
-            Error::Stopped | Error::TooManyBearers => StatusCode::CONFLICT,
+            Error::Stopped | Error::TooManyBearers | Error::Unparked | Error::Occupied { .. } => {
+                StatusCode::CONFLICT
+            }
             Error::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        let body = Json(serde_json::json!({ "error": self.to_string() }));
-        (status, body).into_response()
+        let body = match &self {
+            Error::Occupied { live_lease_id } => serde_json::json!({
+                "error": self.to_string(),
+                "live_lease_id": live_lease_id,
+            }),
+            _ => serde_json::json!({ "error": self.to_string() }),
+        };
+        (status, Json(body)).into_response()
     }
 }
 
@@ -436,6 +453,9 @@ async fn create_lease(
     State(state): State<AppState>,
     Json(mut req): Json<LeaseRequest>,
 ) -> Result<(StatusCode, Json<LeaseView>)> {
+    if !state.inner.db.parked()? {
+        return Err(Error::Unparked);
+    }
     if state.is_shutting_down() {
         return Err(Error::ShuttingDown);
     }
@@ -517,7 +537,18 @@ async fn delete_lease(
     State(state): State<AppState>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Json<LeaseView>> {
-    let row = state.inner.db.get_lease(&id)?;
+    stop_and_view(&state, &id, EndReason::Graceful).await
+}
+
+async fn force_lease(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+) -> Result<Json<LeaseView>> {
+    stop_and_view(&state, &id, EndReason::Forced).await
+}
+
+async fn stop_and_view(state: &AppState, id: &str, reason: EndReason) -> Result<Json<LeaseView>> {
+    let row = state.inner.db.get_lease(id)?;
     if row.status != "stopped" {
         let handle = {
             let live = state.inner.live.lock().await;
@@ -532,7 +563,7 @@ async fn delete_lease(
         }
         state.inner.live.lock().await.remove(&row.session_id);
     }
-    let row = state.inner.db.stop_lease(&id)?;
+    let row = state.inner.db.stop_lease(id, reason)?;
     let live = {
         let live = state.inner.live.lock().await;
         live.contains_key(&row.session_id)
@@ -542,6 +573,33 @@ async fn delete_lease(
         state.origin().as_deref(),
         live,
     )?))
+}
+
+async fn quote_lease(Json(mut req): Json<LeaseRequest>) -> Result<Json<Quote>> {
+    req.min_seconds = req.min_seconds.max(CONTAINER_MIN_SECONDS);
+    req.validate_mvp()?;
+    Ok(Json(Quote::from_request(&req)?))
+}
+
+async fn park_node(State(state): State<AppState>) -> Result<Json<NodeView>> {
+    state.inner.db.set_parked(true)?;
+    Ok(Json(node_view(&state).await?))
+}
+
+async fn unpark_node(State(state): State<AppState>) -> Result<Json<NodeView>> {
+    {
+        let live = state.inner.live.lock().await;
+        if let Some(session_id) = live.keys().next() {
+            let live_lease_id = state
+                .inner
+                .db
+                .lease_id_for_session(session_id)?
+                .unwrap_or_else(|| session_id.clone());
+            return Err(Error::Occupied { live_lease_id });
+        }
+    }
+    state.inner.db.set_parked(false)?;
+    Ok(Json(node_view(&state).await?))
 }
 
 async fn session_ws(
@@ -588,13 +646,18 @@ async fn session_preview(
 }
 
 async fn get_node(State(state): State<AppState>) -> Result<Json<NodeView>> {
+    Ok(Json(node_view(&state).await?))
+}
+
+async fn node_view(state: &AppState) -> Result<NodeView> {
     let (docker, guest_image) = probe_docker_and_image(state.inner.mode).await;
     let home_writable = home_writable(&state.inner.data_dir);
     let (allowlist, allowlist_source) = node_allowlist();
     let live_sessions = state.inner.live.lock().await.len();
     let origin = state.origin();
-    Ok(Json(NodeView {
+    Ok(NodeView {
         ok: docker.ok && guest_image.ok && home_writable,
+        parked: state.inner.db.parked()?,
         bind: state.inner.bind.lock().expect("bind lock").to_string(),
         origin,
         class: "private",
@@ -604,17 +667,18 @@ async fn get_node(State(state): State<AppState>) -> Result<Json<NodeView>> {
         docker,
         guest_image,
         home_writable,
-        tunnel: tunnel_view(&state),
+        tunnel: tunnel_view(state),
         active_bearers: state.inner.db.active_bearers()?,
         live_sessions,
         shutting_down: state.is_shutting_down(),
         host_desktop_driven: false,
-    }))
+    })
 }
 
 #[derive(Debug, Serialize)]
 struct NodeView {
     ok: bool,
+    parked: bool,
     bind: String,
     origin: Option<String>,
     class: &'static str,
@@ -1297,6 +1361,8 @@ mod tests {
         assert_eq!(lease["quote"]["density_mult"], 1.0);
         assert_eq!(lease["status"], "active");
         assert_eq!(lease["live"], true);
+        assert_eq!(lease["forfeited"], false);
+        assert!(lease.get("end_reason").is_none() || lease["end_reason"].is_null());
         assert!(lease["started_at"].as_i64().unwrap() > 0);
         assert!(
             lease["workspace_id"].as_str().unwrap().starts_with("ws_"),
@@ -1335,6 +1401,8 @@ mod tests {
         assert_eq!(stopped["status"], "stopped");
         assert_eq!(stopped["billable_seconds"], 60);
         assert_eq!(stopped["live"], false);
+        assert_eq!(stopped["end_reason"], "graceful");
+        assert_eq!(stopped["forfeited"], false);
         assert!(stopped["stopped_at"].as_i64().unwrap() > 0);
 
         let got = app
@@ -1497,6 +1565,8 @@ mod tests {
         let json = body_json(got).await;
         assert_eq!(json["status"], "stopped");
         assert_eq!(json["billable_seconds"], 60);
+        assert_eq!(json["end_reason"], "graceful");
+        assert_eq!(json["forfeited"], false);
     }
 
     #[tokio::test]
@@ -1537,6 +1607,8 @@ mod tests {
         let json = body_json(deleted).await;
         assert_eq!(json["status"], "stopped");
         assert_eq!(json["billable_seconds"], 60);
+        assert_eq!(json["end_reason"], "graceful");
+        assert_eq!(json["forfeited"], false);
     }
 
     #[tokio::test]
@@ -2084,7 +2156,7 @@ mod tests {
         assert_eq!(json["live_sessions"], 0);
         assert_eq!(json["shutting_down"], false);
         assert_eq!(json["host_desktop_driven"], false);
-        assert!(json.get("parked").is_none());
+        assert_eq!(json["parked"], true);
         let src = json["allowlist_source"].as_str().unwrap();
         assert!(matches!(src, "default" | "env" | "deny-all"), "{src}");
         assert!(json["allowlist"].is_array());
@@ -2172,5 +2244,253 @@ mod tests {
         assert_eq!(gone.status(), StatusCode::NOT_FOUND);
         let json = body_json(gone).await;
         assert_eq!(json["error"], "not found");
+    }
+
+    async fn authed_json(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        token: &str,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {token}"));
+        let req_body = match body {
+            Some(v) => {
+                builder = builder.header("content-type", "application/json");
+                Body::from(v.to_string())
+            }
+            None => Body::empty(),
+        };
+        let res = app
+            .clone()
+            .oneshot(builder.body(req_body).unwrap())
+            .await
+            .unwrap();
+        let status = res.status();
+        (status, body_json(res).await)
+    }
+
+    #[tokio::test]
+    async fn park_unpark_quote_force_require_bearer() {
+        let (_dir, state) = test_state();
+        let app = router(state);
+        for (method, uri) in [
+            ("POST", "/v1/node/park"),
+            ("POST", "/v1/node/unpark"),
+            ("POST", "/v1/quote"),
+            ("POST", "/v1/leases/l_missing/force"),
+        ] {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{method} {uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unpark_blocked_while_live_then_ok_after_end() {
+        let (_dir, state) = test_state();
+        let code = state.pairing_code().unwrap();
+        let app = router(state.clone());
+        let token = pair_token(&app, &code).await;
+
+        let lease = create_sample_lease(&app, &token).await;
+        let lease_id = lease["lease_id"].as_str().unwrap().to_string();
+
+        let (status, json) = authed_json(&app, "POST", "/v1/node/unpark", &token, None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(json["error"], "cannot unpark while a lease is live");
+        assert_eq!(json["live_lease_id"], lease_id);
+
+        let (status, json) = authed_json(&app, "POST", "/v1/node/park", &token, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["parked"], true);
+        assert_eq!(json["live_sessions"], 1);
+
+        let (status, stopped) = authed_json(
+            &app,
+            "DELETE",
+            &format!("/v1/leases/{lease_id}"),
+            &token,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(stopped["end_reason"], "graceful");
+        assert_eq!(stopped["forfeited"], false);
+        assert_eq!(stopped["billable_seconds"], 60);
+
+        let (status, json) = authed_json(&app, "POST", "/v1/node/unpark", &token, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["parked"], false);
+        assert_eq!(json["live_sessions"], 0);
+
+        let before = state.inner.db.list_leases().unwrap().len();
+        let (status, json) =
+            authed_json(&app, "POST", "/v1/leases", &token, Some(sample_lease())).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(json["error"], "node is unparked");
+        assert_eq!(state.inner.db.list_leases().unwrap().len(), before);
+        assert!(state.inner.live.lock().await.is_empty());
+
+        let (status, json) = authed_json(&app, "POST", "/v1/node/unpark", &token, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["parked"], false);
+
+        let (status, json) = authed_json(&app, "POST", "/v1/node/park", &token, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["parked"], true);
+        let created = create_sample_lease(&app, &token).await;
+        assert_eq!(created["live"], true);
+        assert_eq!(created["forfeited"], false);
+    }
+
+    #[tokio::test]
+    async fn stale_sqlite_active_does_not_block_unpark() {
+        let (_dir, state) = test_state();
+        let code = state.pairing_code().unwrap();
+        let app = router(state.clone());
+        let token = pair_token(&app, &code).await;
+        let _lease = create_sample_lease(&app, &token).await;
+        state.inner.live.lock().await.clear();
+        let (status, json) = authed_json(&app, "POST", "/v1/node/unpark", &token, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["parked"], false);
+        assert_eq!(json["live_sessions"], 0);
+        assert_eq!(state.inner.db.active_leases().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn force_forfeits_keeps_billable_noop_if_stopped() {
+        let (_dir, state) = test_state();
+        let code = state.pairing_code().unwrap();
+        let app = router(state.clone());
+        let token = pair_token(&app, &code).await;
+
+        let missing = authed_json(&app, "POST", "/v1/leases/l_missing/force", &token, None).await;
+        assert_eq!(missing.0, StatusCode::NOT_FOUND);
+
+        let lease = create_sample_lease(&app, &token).await;
+        let lease_id = lease["lease_id"].as_str().unwrap().to_string();
+        let (status, forced) = authed_json(
+            &app,
+            "POST",
+            &format!("/v1/leases/{lease_id}/force"),
+            &token,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(forced["status"], "stopped");
+        assert_eq!(forced["billable_seconds"], 60);
+        assert_eq!(forced["end_reason"], "forced");
+        assert_eq!(forced["forfeited"], true);
+        assert_eq!(forced["live"], false);
+        assert!(state.inner.live.lock().await.is_empty());
+
+        let (status, again) = authed_json(
+            &app,
+            "POST",
+            &format!("/v1/leases/{lease_id}/force"),
+            &token,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(again["end_reason"], "forced");
+        assert_eq!(again["forfeited"], true);
+        assert_eq!(again["billable_seconds"], 60);
+
+        let graceful = create_sample_lease(&app, &token).await;
+        let gid = graceful["lease_id"].as_str().unwrap().to_string();
+        let (status, deleted) =
+            authed_json(&app, "DELETE", &format!("/v1/leases/{gid}"), &token, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(deleted["end_reason"], "graceful");
+        assert_eq!(deleted["forfeited"], false);
+        assert_eq!(deleted["billable_seconds"], 60);
+
+        let (status, forced_after) = authed_json(
+            &app,
+            "POST",
+            &format!("/v1/leases/{gid}/force"),
+            &token,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(forced_after["end_reason"], "graceful");
+        assert_eq!(forced_after["forfeited"], false);
+    }
+
+    #[tokio::test]
+    async fn quote_does_not_start_guest_and_works_unparked() {
+        let (_dir, state) = test_state();
+        let code = state.pairing_code().unwrap();
+        let app = router(state.clone());
+        let token = pair_token(&app, &code).await;
+
+        let lease = create_sample_lease(&app, &token).await;
+        assert_eq!(state.inner.live.lock().await.len(), 1);
+        let before = state.inner.db.list_leases().unwrap().len();
+
+        let (status, quote) =
+            authed_json(&app, "POST", "/v1/quote", &token, Some(sample_lease())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(quote["min_seconds"], 60);
+        assert_eq!(quote["os"], "linux");
+        assert_eq!(quote["density_mult"], 1.0);
+        assert!(quote.get("lease_id").is_none());
+        assert_eq!(state.inner.live.lock().await.len(), 1);
+        assert_eq!(state.inner.db.list_leases().unwrap().len(), before);
+        assert_eq!(lease["quote"]["gas_per_second"], quote["gas_per_second"]);
+
+        let lease_id = lease["lease_id"].as_str().unwrap();
+        let (status, _) = authed_json(
+            &app,
+            "DELETE",
+            &format!("/v1/leases/{lease_id}"),
+            &token,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, json) = authed_json(&app, "POST", "/v1/node/unpark", &token, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["parked"], false);
+
+        let live_before = state.inner.live.lock().await.len();
+        let (status, quote) =
+            authed_json(&app, "POST", "/v1/quote", &token, Some(sample_lease())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(quote["min_seconds"], 60);
+        assert_eq!(state.inner.live.lock().await.len(), live_before);
+        assert!(state.inner.db.active_leases().unwrap().is_empty());
+
+        let windows = serde_json::json!({
+            "os": "windows",
+            "class": "private",
+            "license": "w365-agents",
+            "density": "isolated",
+            "term": "on_demand",
+            "resources": { "vcpu": 2, "mem_gib": 4, "disk_gib": 40 }
+        });
+        let (status, json) = authed_json(&app, "POST", "/v1/quote", &token, Some(windows)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let err = json["error"].as_str().unwrap();
+        assert!(err.contains("Windows"), "{err}");
     }
 }
