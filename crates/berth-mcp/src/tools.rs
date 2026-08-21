@@ -2,8 +2,8 @@ use berth_protocol::{Action, ActionBatch, ActionBatchKind, Button, LeaseRequest,
 
 use crate::client::NodeClient;
 use crate::config::{
-    Config, DEFAULT_NODE, Session, clear_session, existing_session, http_to_ws, resolve_session,
-    save_session,
+    Config, DEFAULT_NODE, Session, clear_session, existing_session, resolve_session,
+    resolve_ws_url, save_session,
 };
 use crate::error::{Error, Result};
 use crate::{Mcp, McpContent, ToolResult};
@@ -57,6 +57,7 @@ impl Mcp {
         let node = cfg.node(DEFAULT_NODE)?;
         let client = NodeClient::new(&node.url, Some(&node.token))?;
         let lease = client.create_lease(&req).await?;
+        let ws_url = resolve_ws_url(Some(&lease.ws_url), &node.url, &lease.session_id);
         save_session(
             &self.home,
             &Session {
@@ -64,7 +65,7 @@ impl Mcp {
                 lease_id: lease.lease_id.clone(),
                 session_id: lease.session_id.clone(),
                 viewer_url: lease.viewer_url.clone(),
-                ws_url: Some(lease.ws_url.clone()),
+                ws_url: Some(ws_url),
             },
         )?;
         Ok(ToolResult::text(format_lease(
@@ -177,10 +178,7 @@ impl Mcp {
         let session = resolve_session(&self.home)?;
         let cfg = Config::load(&self.home)?;
         let node = cfg.node(&session.node)?;
-        let ws_url = session
-            .ws_url
-            .filter(|u| u.contains(&session.session_id) && !u.contains('?'))
-            .unwrap_or_else(|| http_to_ws(&node.url, &session.session_id));
+        let ws_url = resolve_ws_url(session.ws_url.as_deref(), &node.url, &session.session_id);
         let client = NodeClient::new(&node.url, Some(&node.token))?;
         let id = format!(
             "a_mcp_{}",

@@ -12,7 +12,7 @@ use clap::{Parser, Subcommand};
 use crate::client::{LeaseView, NodeClient};
 use crate::config::{
     Config, DEFAULT_NODE, DEFAULT_URL, NodeConfig, Session, berth_home, clear_session,
-    load_session, normalize_url, require_session, save_session, validate_node_name,
+    load_session, normalize_url, require_session, resolve_ws_url, save_session, validate_node_name,
 };
 pub use crate::error::{Error, Result};
 
@@ -72,7 +72,15 @@ enum NodeCmd {
         /// Listen address (loopback default; never host-network)
         #[arg(long, default_value = "127.0.0.1:7432")]
         bind: SocketAddr,
+        /// Public edge. Node still binds loopback. `cloudflare` runs cloudflared.
+        #[arg(long, value_enum)]
+        tunnel: Option<TunnelArg>,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
+enum TunnelArg {
+    Cloudflare,
 }
 
 pub fn exit(cli: Cli) -> ExitCode {
@@ -99,8 +107,11 @@ pub fn exit(cli: Cli) -> ExitCode {
 
 pub fn execute(cli: Cli, home: &Path) -> Result<String> {
     match cli.command {
-        Command::Node(NodeCmd::Up { bind }) => {
-            berth_node::serve_blocking(bind)?;
+        Command::Node(NodeCmd::Up { bind, tunnel }) => {
+            let tunnel = tunnel.map(|t| match t {
+                TunnelArg::Cloudflare => berth_node::TunnelKind::Cloudflare,
+            });
+            berth_node::serve_blocking(bind, tunnel)?;
             Ok(String::new())
         }
         Command::Pair { url, code, node } => cmd_pair(home, &url, &code, &node),
@@ -147,6 +158,7 @@ fn cmd_up(home: &Path, os: &str, node: &str) -> Result<String> {
     let cfg = Config::load(home)?;
     let node_cfg = cfg.node(node)?;
     let lease = NodeClient::new(&node_cfg.url, Some(&node_cfg.token))?.create_lease(&req)?;
+    let ws_url = resolve_ws_url(Some(&lease.ws_url), &node_cfg.url, &lease.session_id);
     save_session(
         home,
         &Session {
@@ -154,7 +166,7 @@ fn cmd_up(home: &Path, os: &str, node: &str) -> Result<String> {
             lease_id: lease.lease_id.clone(),
             session_id: lease.session_id.clone(),
             viewer_url: lease.viewer_url.clone(),
-            ws_url: Some(lease.ws_url.clone()),
+            ws_url: Some(ws_url),
         },
     )?;
     Ok(format_up(&lease))
@@ -486,6 +498,65 @@ mod tests {
     fn parse_mcp() {
         let cli = Cli::try_parse_from(["berth", "mcp"]).unwrap();
         assert!(matches!(cli.command, Command::Mcp));
+    }
+
+    #[test]
+    fn parse_node_up_tunnel() {
+        let cli = Cli::try_parse_from([
+            "berth",
+            "node",
+            "up",
+            "--tunnel",
+            "cloudflare",
+            "--bind",
+            "127.0.0.1:7432",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Node(NodeCmd::Up {
+                tunnel: Some(TunnelArg::Cloudflare),
+                ..
+            })
+        ));
+        assert!(Cli::try_parse_from(["berth", "node", "up", "--tunnel", "mesh"]).is_err());
+        let plain = Cli::try_parse_from(["berth", "node", "up"]).unwrap();
+        assert!(matches!(
+            plain.command,
+            Command::Node(NodeCmd::Up { tunnel: None, .. })
+        ));
+    }
+
+    #[test]
+    fn node_up_tunnel_missing_cloudflared() {
+        static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _lock = ENV.lock().unwrap_or_else(|p| p.into_inner());
+        struct ClearEnv;
+        impl Drop for ClearEnv {
+            fn drop(&mut self) {
+                // SAFETY: lock serializes BERTH_CLOUDFLARED mutation in this test.
+                unsafe { std::env::remove_var("BERTH_CLOUDFLARED") };
+            }
+        }
+        let _clear = ClearEnv;
+        // SAFETY: lock serializes BERTH_CLOUDFLARED mutation in this test.
+        unsafe { std::env::set_var("BERTH_CLOUDFLARED", "/no/such/berth-cloudflared") };
+        let dir = tempfile::tempdir().unwrap();
+        let err = run(
+            dir.path(),
+            &[
+                "node",
+                "up",
+                "--tunnel",
+                "cloudflare",
+                "--bind",
+                "127.0.0.1:0",
+            ],
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("brew install cloudflared"), "{msg}");
+        assert!(msg.contains("pkg.cloudflare.com/cloudflared"), "{msg}");
     }
 
     #[test]

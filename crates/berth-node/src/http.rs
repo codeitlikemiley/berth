@@ -20,6 +20,7 @@ use crate::error::{Error, Result};
 use crate::guest::{Guest, GuestMode};
 use crate::id::{new_id, u64_from_i64};
 use crate::session::SessionManager;
+use crate::tunnel::{self, TunnelKind};
 
 /// Container sessions boot in seconds; MATH.md isolated-VM 300s floor does not apply.
 const CONTAINER_MIN_SECONDS: u64 = 60;
@@ -32,6 +33,7 @@ pub struct AppState {
 struct Inner {
     db: Db,
     bind: Mutex<SocketAddr>,
+    origin: Mutex<Option<String>>,
     live: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<Guest>>>>,
     docker: tokio::sync::Mutex<Option<SessionManager>>,
     mode: GuestMode,
@@ -53,12 +55,12 @@ pub struct LeaseView {
 }
 
 impl LeaseView {
-    fn from_row(row: &LeaseRow) -> Result<Self> {
+    fn from_row(row: &LeaseRow, origin: Option<&str>) -> Result<Self> {
         let quote: Quote = serde_json::from_str(&row.quote_json)?;
         Ok(Self {
             lease_id: row.id.clone(),
             session_id: row.session_id.clone(),
-            ws_url: row.ws_url.clone(),
+            ws_url: session_ws_url_stored(&row.ws_url, origin, &row.session_id),
             viewer_url: row.viewer_url.clone(),
             quote,
             status: row.status.clone(),
@@ -86,6 +88,7 @@ impl AppState {
             inner: Arc::new(Inner {
                 db,
                 bind: Mutex::new(bind),
+                origin: Mutex::new(None),
                 live: tokio::sync::Mutex::new(HashMap::new()),
                 docker: tokio::sync::Mutex::new(None),
                 mode,
@@ -96,6 +99,14 @@ impl AppState {
 
     fn set_bind(&self, bind: SocketAddr) {
         *self.inner.bind.lock().expect("bind lock") = bind;
+    }
+
+    fn set_origin(&self, origin: String) {
+        *self.inner.origin.lock().expect("origin lock") = Some(origin);
+    }
+
+    fn origin(&self) -> Option<String> {
+        self.inner.origin.lock().expect("origin lock").clone()
     }
 
     fn pairing_code(&self) -> Result<String> {
@@ -187,7 +198,10 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-pub async fn serve(bind: SocketAddr) -> Result<()> {
+pub async fn serve(bind: SocketAddr, tunnel: Option<TunnelKind>) -> Result<()> {
+    if matches!(tunnel, Some(TunnelKind::Cloudflare)) {
+        tunnel::resolve_cloudflared()?;
+    }
     let db_path = default_db_path()?;
     let state = AppState::open(&db_path, bind)?;
     let code = state.pairing_code()?;
@@ -196,6 +210,16 @@ pub async fn serve(bind: SocketAddr) -> Result<()> {
     let actual = listener.local_addr()?;
     state.set_bind(actual);
     eprintln!("listening on {actual}");
+    let tunnel_child = match tunnel {
+        Some(TunnelKind::Cloudflare) => {
+            let (child, origin) = tunnel::start_cloudflare(actual).await?;
+            if let Some(origin) = origin {
+                state.set_origin(origin);
+            }
+            Some(child)
+        }
+        None => None,
+    };
     let shutdown_state = state.clone();
     let drain_state = state.clone();
     axum::serve(listener, router(state))
@@ -205,6 +229,9 @@ pub async fn serve(bind: SocketAddr) -> Result<()> {
             shutdown_state.begin_shutdown();
         })
         .await?;
+    if let Some(child) = tunnel_child {
+        child.shutdown().await;
+    }
     drain_state.drain().await;
     Ok(())
 }
@@ -232,11 +259,11 @@ async fn wait_shutdown_signal() {
     }
 }
 
-pub fn serve_blocking(bind: SocketAddr) -> Result<()> {
+pub fn serve_blocking(bind: SocketAddr, tunnel: Option<TunnelKind>) -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(serve(bind))
+    rt.block_on(serve(bind, tunnel))
 }
 
 impl IntoResponse for Error {
@@ -324,7 +351,8 @@ async fn create_lease(
     let container_id = guest.container_id().map(str::to_string);
     let lease_id = new_id("l");
     let bind = *state.inner.bind.lock().expect("bind lock");
-    let ws_url = format!("ws://{}/v1/sessions/{session_id}", advertise(bind));
+    let origin = state.origin();
+    let ws_url = session_ws_url(bind, origin.as_deref(), &session_id);
     let viewer_url = viewer_port.map(|p| format!("http://127.0.0.1:{p}/vnc.html"));
     let persist = NewLease {
         lease_id: lease_id.clone(),
@@ -369,7 +397,7 @@ async fn get_lease(
     UrlPath(id): UrlPath<String>,
 ) -> Result<Json<LeaseView>> {
     let row = state.inner.db.get_lease(&id)?;
-    Ok(Json(LeaseView::from_row(&row)?))
+    Ok(Json(LeaseView::from_row(&row, state.origin().as_deref())?))
 }
 
 async fn delete_lease(
@@ -392,7 +420,7 @@ async fn delete_lease(
         state.inner.live.lock().await.remove(&row.session_id);
     }
     let row = state.inner.db.stop_lease(&id)?;
-    Ok(Json(LeaseView::from_row(&row)?))
+    Ok(Json(LeaseView::from_row(&row, state.origin().as_deref())?))
 }
 
 async fn session_ws(
@@ -504,6 +532,31 @@ fn advertise(bind: SocketAddr) -> SocketAddr {
     } else {
         bind
     }
+}
+
+fn session_ws_url(bind: SocketAddr, origin: Option<&str>, session_id: &str) -> String {
+    match origin {
+        Some(origin) => session_ws_url_origin(origin, session_id),
+        None => format!("ws://{}/v1/sessions/{session_id}", advertise(bind)),
+    }
+}
+
+fn session_ws_url_stored(stored: &str, origin: Option<&str>, session_id: &str) -> String {
+    match origin {
+        Some(origin) => session_ws_url_origin(origin, session_id),
+        None => stored.to_string(),
+    }
+}
+
+fn session_ws_url_origin(origin: &str, session_id: &str) -> String {
+    let ws = if let Some(rest) = origin.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = origin.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else {
+        format!("wss://{origin}")
+    };
+    format!("{ws}/v1/sessions/{session_id}")
 }
 
 fn print_quote(lease_id: &str, quote: &Quote) {
@@ -974,5 +1027,96 @@ mod tests {
         let json = body_json(deleted).await;
         assert_eq!(json["status"], "stopped");
         assert_eq!(json["billable_seconds"], 60);
+    }
+
+    #[tokio::test]
+    async fn advertised_ws_url_uses_public_origin() {
+        let (_dir, state) = test_state();
+        state.set_origin("https://random-words-here.trycloudflare.com".into());
+        let code = state.pairing_code().unwrap();
+        let app = router(state);
+        let token = pair_token(&app, &code).await;
+        let created = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/leases")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(sample_lease().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let lease = body_json(created).await;
+        let session_id = lease["session_id"].as_str().unwrap();
+        assert_eq!(
+            lease["ws_url"],
+            format!("wss://random-words-here.trycloudflare.com/v1/sessions/{session_id}")
+        );
+        assert!(!lease["ws_url"].as_str().unwrap().contains("127.0.0.1"));
+        assert!(!lease["ws_url"].as_str().unwrap().contains('?'));
+        assert!(!lease["ws_url"].as_str().unwrap().contains("token"));
+        assert_eq!(lease["viewer_url"], "http://127.0.0.1:6080/vnc.html");
+    }
+
+    #[tokio::test]
+    async fn get_lease_rewrites_stored_loopback_ws_when_origin_set() {
+        let (_dir, state) = test_state();
+        let code = state.pairing_code().unwrap();
+        let app = router(state.clone());
+        let token = pair_token(&app, &code).await;
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/leases")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(sample_lease().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let lease = body_json(created).await;
+        let session_id = lease["session_id"].as_str().unwrap().to_string();
+        assert!(
+            lease["ws_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("ws://127.0.0.1")
+        );
+        state.set_origin("https://older-node.trycloudflare.com".into());
+        let lease_id = lease["lease_id"].as_str().unwrap();
+        let got = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/leases/{lease_id}"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_json(got).await;
+        assert_eq!(
+            json["ws_url"],
+            format!("wss://older-node.trycloudflare.com/v1/sessions/{session_id}")
+        );
+    }
+
+    #[test]
+    fn session_ws_url_https_to_wss() {
+        let bind: SocketAddr = "127.0.0.1:7432".parse().unwrap();
+        assert_eq!(
+            session_ws_url(bind, Some("https://n.example"), "s_1"),
+            "wss://n.example/v1/sessions/s_1"
+        );
+        assert_eq!(
+            session_ws_url(bind, None, "s_1"),
+            "ws://127.0.0.1:7432/v1/sessions/s_1"
+        );
     }
 }

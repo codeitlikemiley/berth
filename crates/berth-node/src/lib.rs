@@ -13,9 +13,11 @@ mod guest;
 mod http;
 mod id;
 mod session;
+mod tunnel;
 
 pub use action::{ACTION_BIN, FRAME_HEIGHT, FRAME_WIDTH};
 pub use docker::{DEFAULT_IMAGE, WORKSPACE_MOUNT, volume_name};
 pub use error::{Error, Result};
 pub use http::{serve, serve_blocking};
 pub use session::{ExecOutput, Session, SessionManager};
+pub use tunnel::TunnelKind;

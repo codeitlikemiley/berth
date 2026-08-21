@@ -181,6 +181,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "http-body-util",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

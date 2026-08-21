@@ -96,6 +96,54 @@ pub fn normalize_url(raw: &str) -> Result<String> {
     Ok(raw.to_string())
 }
 
+pub fn http_to_ws(base: &str, session_id: &str) -> String {
+    let base = base.trim().trim_end_matches('/');
+    let ws = if let Some(rest) = base.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = base.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else if base.starts_with("ws://") || base.starts_with("wss://") {
+        base.to_string()
+    } else {
+        format!("ws://{base}")
+    };
+    format!("{ws}/v1/sessions/{session_id}")
+}
+
+pub fn resolve_ws_url(ws_url: Option<&str>, node_url: &str, session_id: &str) -> String {
+    let fallback = http_to_ws(node_url, session_id);
+    let Some(url) = ws_url else {
+        return fallback;
+    };
+    if url.contains('?') || !url.contains(session_id) {
+        return fallback;
+    }
+    if url_is_loopback(url) && !url_is_loopback(node_url) {
+        return fallback;
+    }
+    url.to_string()
+}
+
+fn url_is_loopback(url: &str) -> bool {
+    url_host(url).is_some_and(host_is_loopback)
+}
+
+fn url_host(url: &str) -> Option<&str> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .or_else(|| url.strip_prefix("wss://"))
+        .or_else(|| url.strip_prefix("ws://"))?;
+    if let Some(rest) = rest.strip_prefix('[') {
+        return rest.split(']').next();
+    }
+    rest.split(['/', ':', '?']).next().filter(|h| !h.is_empty())
+}
+
+fn host_is_loopback(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+}
+
 pub fn load_session(home: &Path) -> Result<Option<Session>> {
     let path = home.join("session.toml");
     match fs::read_to_string(&path) {
@@ -283,6 +331,42 @@ token = "brt_test"
             "http://127.0.0.1:7432"
         );
         assert!(normalize_url("ftp://x").is_err());
+    }
+
+    #[test]
+    fn resolve_ws_rewrites_loopback_onto_https_origin() {
+        assert_eq!(
+            resolve_ws_url(
+                Some("ws://127.0.0.1:7432/v1/sessions/s_1"),
+                "https://unit-test.trycloudflare.com",
+                "s_1"
+            ),
+            "wss://unit-test.trycloudflare.com/v1/sessions/s_1"
+        );
+        assert_eq!(
+            resolve_ws_url(
+                Some("wss://unit-test.trycloudflare.com/v1/sessions/s_1"),
+                "https://unit-test.trycloudflare.com",
+                "s_1"
+            ),
+            "wss://unit-test.trycloudflare.com/v1/sessions/s_1"
+        );
+        assert_eq!(
+            resolve_ws_url(
+                Some("ws://127.0.0.1:7432/v1/sessions/s_1"),
+                "http://127.0.0.1:7432",
+                "s_1"
+            ),
+            "ws://127.0.0.1:7432/v1/sessions/s_1"
+        );
+        assert_eq!(
+            resolve_ws_url(
+                Some("wss://unit-test.trycloudflare.com/v1/sessions/s_1?token=brt_secret"),
+                "https://unit-test.trycloudflare.com",
+                "s_1"
+            ),
+            "wss://unit-test.trycloudflare.com/v1/sessions/s_1"
+        );
     }
 
     fn leftover_tmps(dir: &Path) -> Vec<String> {

@@ -20,6 +20,7 @@ pub enum Error {
     NotFound,
     BadRequest(String),
     ShuttingDown,
+    Tunnel(String),
     Internal(String),
 }
 
@@ -53,7 +54,7 @@ impl fmt::Display for Error {
             Self::NotFound => write!(f, "not found"),
             Self::BadRequest(msg) => write!(f, "{msg}"),
             Self::ShuttingDown => write!(f, "node is shutting down"),
-            Self::Internal(msg) => write!(f, "{msg}"),
+            Self::Tunnel(msg) | Self::Internal(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -76,6 +77,7 @@ impl std::error::Error for Error {
             | Self::NotFound
             | Self::BadRequest(_)
             | Self::ShuttingDown
+            | Self::Tunnel(_)
             | Self::Internal(_) => None,
         }
     }

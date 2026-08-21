@@ -84,9 +84,9 @@ Read the review: [docs/REVIEW.md](docs/REVIEW.md).
 
 ## Status
 
-Private Linux outpost on one machine (node + CLI + MCP). No tunnel.
-The guest is Linux in Docker (linux/arm64 on Apple Silicon). The host
-desktop is never driven.
+Private Linux outpost (node + CLI + MCP). Optional Cloudflare tunnel for a
+second machine. The guest is Linux in Docker (linux/arm64 on Apple Silicon).
+The host desktop is never driven.
 
 ```sh
 # this Mac, with Docker Desktop or OrbStack
@@ -104,6 +104,30 @@ berth end
 `berth pair --url` defaults to `http://127.0.0.1:7432`. Token and URL land
 in `~/.berth/config.toml`. `berth mcp` is stdio JSON-RPC (tools talk to the
 guest, not the host desktop).
+
+### Two machines (Cloudflare tunnel)
+
+The node still binds loopback. `cloudflared` is the public edge. Pairing is
+still `POST /v1/pair` with `{code}` — the token is never placed on the
+tunnel URL.
+
+```sh
+# parked node
+berth node up --tunnel cloudflare
+# pairing code: ABCD-EFGH
+# quick tunnel; pair with https://….trycloudflare.com
+# named (TUNNEL_TOKEN set): named tunnel; pair with your hostname
+# optional advertised origin: TUNNEL_HOSTNAME or BERTH_PUBLIC_URL
+
+# laptop, or this Mac via the public URL (a phone hotspot is valid)
+berth pair --url https://<name>.trycloudflare.com --code ABCD-EFGH
+berth up --os linux
+claude mcp add --transport stdio berth -- berth mcp
+berth end
+```
+
+Install `cloudflared` first (`brew install cloudflared` on macOS; on Linux,
+`echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main' | sudo tee /etc/apt/sources.list.d/cloudflared.list && sudo apt-get update && sudo apt-get install cloudflared`).
 
 ## Name
 

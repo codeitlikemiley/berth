@@ -129,6 +129,40 @@ pub fn http_to_ws(base: &str, session_id: &str) -> String {
     format!("{ws}/v1/sessions/{session_id}")
 }
 
+pub fn resolve_ws_url(ws_url: Option<&str>, node_url: &str, session_id: &str) -> String {
+    let fallback = http_to_ws(node_url, session_id);
+    let Some(url) = ws_url else {
+        return fallback;
+    };
+    if url.contains('?') || !url.contains(session_id) {
+        return fallback;
+    }
+    if url_is_loopback(url) && !url_is_loopback(node_url) {
+        return fallback;
+    }
+    url.to_string()
+}
+
+fn url_is_loopback(url: &str) -> bool {
+    url_host(url).is_some_and(host_is_loopback)
+}
+
+fn url_host(url: &str) -> Option<&str> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .or_else(|| url.strip_prefix("wss://"))
+        .or_else(|| url.strip_prefix("ws://"))?;
+    if let Some(rest) = rest.strip_prefix('[') {
+        return rest.split(']').next();
+    }
+    rest.split(['/', ':', '?']).next().filter(|h| !h.is_empty())
+}
+
+fn host_is_loopback(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+}
+
 fn write_secret_file(path: &Path, contents: &str) -> Result<()> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         secure_mkdir(parent)?;
@@ -206,4 +240,53 @@ fn set_mode(path: &Path, mode: u32) -> Result<()> {
     perms.set_mode(mode);
     fs::set_permissions(path, perms)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_ws_rewrites_loopback_onto_https_origin() {
+        assert_eq!(
+            resolve_ws_url(
+                Some("ws://127.0.0.1:7432/v1/sessions/s_1"),
+                "https://unit-test.trycloudflare.com",
+                "s_1"
+            ),
+            "wss://unit-test.trycloudflare.com/v1/sessions/s_1"
+        );
+        assert_eq!(
+            resolve_ws_url(
+                Some("wss://unit-test.trycloudflare.com/v1/sessions/s_1"),
+                "https://unit-test.trycloudflare.com",
+                "s_1"
+            ),
+            "wss://unit-test.trycloudflare.com/v1/sessions/s_1"
+        );
+        assert_eq!(
+            resolve_ws_url(
+                Some("ws://127.0.0.1:7432/v1/sessions/s_1"),
+                "http://127.0.0.1:7432",
+                "s_1"
+            ),
+            "ws://127.0.0.1:7432/v1/sessions/s_1"
+        );
+        assert_eq!(
+            resolve_ws_url(
+                Some("ws://localhost:7432/v1/sessions/s_1"),
+                "https://unit-test.trycloudflare.com",
+                "s_1"
+            ),
+            "wss://unit-test.trycloudflare.com/v1/sessions/s_1"
+        );
+        assert_eq!(
+            resolve_ws_url(
+                Some("wss://unit-test.trycloudflare.com/v1/sessions/s_1?token=brt_secret"),
+                "https://unit-test.trycloudflare.com",
+                "s_1"
+            ),
+            "wss://unit-test.trycloudflare.com/v1/sessions/s_1"
+        );
+    }
 }
