@@ -10,7 +10,7 @@ import {
 import type { LeaseView } from "@/api/types";
 import { QuoteLabel } from "@/components/quote-label";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { incomeUsd, quotedUsd } from "@/lib/ledger";
+import { incomeUsd, occupancyBadge, quotedUsd } from "@/lib/ledger";
 
 export function MeterChart({
   leases,
@@ -29,6 +29,9 @@ export function MeterChart({
   const incomeSum = leases.reduce(
     (sum, lease) => sum + incomeUsd(lease, nowUnix),
     0,
+  );
+  const anyForfeited = leases.some(
+    (lease) => occupancyBadge(lease) === "forfeited",
   );
 
   return (
@@ -63,7 +66,8 @@ export function MeterChart({
             Quoted occupancy (not charged). <QuoteLabel usd={quotedSum} />
           </p>
           <p>
-            Income (forfeited → $0) <QuoteLabel usd={incomeSum} />
+            {anyForfeited ? "Income (forced disconnects earn $0)" : "Income"}{" "}
+            <QuoteLabel usd={incomeSum} />
           </p>
         </div>
         {truncated ? (

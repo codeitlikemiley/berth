@@ -6,6 +6,7 @@ import type { LeaseView, NodeView } from "@/api/types";
 import { MeterChart } from "@/components/meter-chart";
 import { ParkControl } from "@/components/park-control";
 import { QuoteLabel } from "@/components/quote-label";
+import { ThemeToggle } from "@/components/theme-toggle";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -169,9 +170,15 @@ export function HomePage() {
     <main className="mx-auto flex min-h-dvh max-w-6xl flex-col gap-6 p-6">
       <header className="flex flex-wrap items-center justify-between gap-4">
         <h1 className="text-xl font-medium">Berth</h1>
-        <Button asChild>
-          <Link to="/leases/new">New lease</Link>
-        </Button>
+        <div className="flex flex-wrap items-center gap-2">
+          <ThemeToggle />
+          <Button asChild variant="outline" size="sm">
+            <Link to="/doctor">Doctor</Link>
+          </Button>
+          <Button asChild>
+            <Link to="/leases/new">New lease</Link>
+          </Button>
+        </div>
       </header>
 
       {node ? (

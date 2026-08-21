@@ -2,7 +2,7 @@ const THEME_KEY = "berth.theme";
 
 export type Theme = "system" | "light" | "dark";
 
-function storedTheme(): Theme {
+export function getTheme(): Theme {
   const raw = localStorage.getItem(THEME_KEY);
   if (raw === "light" || raw === "dark" || raw === "system") {
     return raw;
@@ -20,11 +20,11 @@ function applyTheme(theme: Theme): void {
 }
 
 export function initTheme(): void {
-  applyTheme(storedTheme());
+  applyTheme(getTheme());
   window
     .matchMedia("(prefers-color-scheme: dark)")
     .addEventListener("change", () => {
-      if (storedTheme() === "system") {
+      if (getTheme() === "system") {
         applyTheme("system");
       }
     });
