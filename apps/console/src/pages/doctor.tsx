@@ -3,6 +3,7 @@ import { Link, Navigate } from "react-router-dom";
 
 import { api, type NodeStatus } from "@/api/node";
 import { DoctorList } from "@/components/doctor-list";
+import { ThemeToggle } from "@/components/theme-toggle";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -14,6 +15,10 @@ import {
 import { Input } from "@/components/ui/input";
 import { getToken, refreshRememberedToken, url_is_loopback } from "@/lib/auth";
 
+function clockLabel(ms: number): string {
+  return new Date(ms).toTimeString().slice(0, 8);
+}
+
 export function DoctorPage() {
   const loopback = url_is_loopback(window.location.origin);
   const codeRef = useRef<HTMLInputElement>(null);
@@ -24,20 +29,25 @@ export function DoctorPage() {
   const [notice, setNotice] = useState<string | null>(null);
   const [pending, setPending] = useState(true);
   const [unauthed, setUnauthed] = useState(false);
+  const [checkedAt, setCheckedAt] = useState<number | null>(null);
 
   useEffect(() => {
-    const gen = ++genRef.current;
-    setPending(true);
-    void (async () => {
+    let cancelled = false;
+    // Health has to be re-read, not remembered: a node that died after mount
+    // must stop reading green. The poll shares genRef with the action handlers
+    // but never bumps it, so an action started mid-flight still wins.
+    const tick = async () => {
+      const gen = genRef.current;
       try {
         const next = await api().node();
-        if (gen !== genRef.current) {
+        if (cancelled || gen !== genRef.current) {
           return;
         }
         setNode(next);
+        setCheckedAt(Date.now());
         setError(null);
       } catch (err) {
-        if (gen !== genRef.current) {
+        if (cancelled || gen !== genRef.current) {
           return;
         }
         if (!getToken()) {
@@ -46,12 +56,16 @@ export function DoctorPage() {
         }
         setError(err instanceof Error ? err.message : "doctor failed");
       } finally {
-        if (gen === genRef.current) {
+        if (!cancelled && gen === genRef.current) {
           setPending(false);
         }
       }
-    })();
+    };
+    void tick();
+    const id = window.setInterval(() => void tick(), 2000);
     return () => {
+      cancelled = true;
+      window.clearInterval(id);
       genRef.current += 1;
     };
   }, []);
@@ -74,6 +88,7 @@ export function DoctorPage() {
         return;
       }
       setNode(next);
+      setCheckedAt(Date.now());
     } catch (err) {
       if (gen !== genRef.current) {
         return;
@@ -129,6 +144,7 @@ export function DoctorPage() {
         return;
       }
       setNode(next);
+      setCheckedAt(Date.now());
       setNotice("Other clients revoked. CLI must re-pair.");
     } catch (err) {
       if (gen !== genRef.current) {
@@ -148,11 +164,14 @@ export function DoctorPage() {
 
   return (
     <main className="mx-auto flex min-h-dvh max-w-xl flex-col gap-4 p-6">
-      <p className="text-sm">
-        <Link to="/" className="text-muted-foreground hover:underline">
-          Home
-        </Link>
-      </p>
+      <div className="flex items-center justify-between gap-4">
+        <p className="text-sm">
+          <Link to="/" className="text-muted-foreground hover:underline">
+            Home
+          </Link>
+        </p>
+        <ThemeToggle />
+      </div>
       <Card>
         <CardHeader>
           <CardTitle>Doctor</CardTitle>
@@ -162,14 +181,16 @@ export function DoctorPage() {
         </CardHeader>
         <CardContent className="flex flex-col gap-6">
           {node ? (
-            <DoctorList
-              node={node}
-              pending={pending}
-              onPark={() => void withNode(() => api().park(), "park failed")}
-              onUnpark={() =>
-                void withNode(() => api().unpark(), "unpark failed")
-              }
-            />
+            <div className={error ? "opacity-60" : undefined}>
+              <DoctorList
+                node={node}
+                pending={pending}
+                onPark={() => void withNode(() => api().park(), "park failed")}
+                onUnpark={() =>
+                  void withNode(() => api().unpark(), "unpark failed")
+                }
+              />
+            </div>
           ) : error ? (
             <div className="flex flex-col items-start gap-2">
               <p className="text-sm">Could not load node</p>
@@ -188,7 +209,19 @@ export function DoctorPage() {
           ) : (
             <p className="text-sm text-muted-foreground">Loading</p>
           )}
-          {error ? <p className="text-sm text-destructive">{error}</p> : null}
+          {error ? (
+            <p className="text-sm text-destructive">
+              {node
+                ? `${error} \u2014 node unreachable; readings above are from ${
+                    checkedAt ? clockLabel(checkedAt) : "an earlier check"
+                  }.`
+                : error}
+            </p>
+          ) : checkedAt ? (
+            <p className="text-xs text-muted-foreground">
+              checked {clockLabel(checkedAt)}
+            </p>
+          ) : null}
           {notice ? <p className="text-sm">{notice}</p> : null}
           <div className="flex flex-col gap-3 border-t border-border pt-4">
             <p className="text-sm text-muted-foreground">
