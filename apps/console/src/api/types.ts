@@ -44,7 +44,21 @@ export type LeaseList = {
   truncated: boolean;
 };
 
-export type NodeView = {
+export type DockerProbe = {
+  ok: boolean;
+  detail: string;
+};
+
+export type GuestImageProbe = {
+  ok: boolean;
+  name: string;
+};
+
+export type TunnelStatus =
+  | { kind: "none" }
+  | { kind: "cloudflare"; named: boolean; child_alive: boolean };
+
+export type NodeStatus = {
   ok: boolean;
   parked: boolean;
   bind: string;
@@ -53,23 +67,29 @@ export type NodeView = {
   image: string;
   allowlist: string[];
   allowlist_source: string;
-  docker: { ok: boolean; detail: string };
-  guest_image: { ok: boolean; name: string };
+  docker: DockerProbe;
+  guest_image: GuestImageProbe;
   home_writable: boolean;
-  tunnel: { kind: string; named?: boolean; child_alive?: boolean };
+  tunnel: TunnelStatus;
   active_bearers: number;
   live_sessions: number;
   shutting_down: boolean;
   host_desktop_driven: boolean;
 };
 
+export type NodeView = NodeStatus;
+
 export type BerthApi = {
-  pair: (code: string) => Promise<PairResponse>;
+  pair: (
+    code: string,
+    opts?: { revokeOthers?: boolean },
+  ) => Promise<PairResponse>;
+  pairingCode: () => Promise<{ code: string } | null>;
   listLeases: () => Promise<LeaseList>;
   getLease: (id: string) => Promise<LeaseView>;
   endLease: (id: string) => Promise<LeaseView>;
   forceEnd: (id: string) => Promise<LeaseView>;
-  node: () => Promise<NodeView>;
-  park: () => Promise<NodeView>;
-  unpark: () => Promise<NodeView>;
+  node: () => Promise<NodeStatus>;
+  park: () => Promise<NodeStatus>;
+  unpark: () => Promise<NodeStatus>;
 };

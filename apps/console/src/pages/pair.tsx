@@ -1,7 +1,8 @@
-import { type FormEvent, useState } from "react";
+import { type FormEvent, useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
 import { api } from "@/api/node";
+import { PairingCode } from "@/components/pairing-code";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -17,9 +18,27 @@ export function PairPage() {
   const navigate = useNavigate();
   const loopback = url_is_loopback(window.location.origin);
   const [code, setCode] = useState("");
+  const [shownCode, setShownCode] = useState<string | null>(null);
   const [remember, setRemember] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    void api()
+      .pairingCode()
+      .then((result) => {
+        if (!cancelled && result?.code) {
+          setShownCode(result.code);
+        }
+      })
+      .catch(() => {
+        // operator types the stderr code when this origin cannot show one
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   async function onSubmit(event: FormEvent) {
     event.preventDefault();
@@ -44,11 +63,14 @@ export function PairPage() {
         <CardHeader>
           <CardTitle>Pair this browser</CardTitle>
           <CardDescription>
-            Enter the pairing code printed by the node.
+            {shownCode
+              ? "Copy the code into the field below. Pairing keeps other clients signed in."
+              : "Enter the pairing code printed by the node."}
           </CardDescription>
         </CardHeader>
         <CardContent>
           <form onSubmit={onSubmit} className="flex flex-col gap-4">
+            {shownCode ? <PairingCode code={shownCode} /> : null}
             <label className="flex flex-col gap-2 text-sm">
               Code
               <Input

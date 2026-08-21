@@ -50,3 +50,14 @@ export function rememberToken(token: string): void {
   }
   localStorage.setItem(BEARER_KEY, token);
 }
+
+/** Revoke issues a new bearer; a stale remembered token would 401 on the next visit. */
+export function refreshRememberedToken(token: string): void {
+  if (!loopbackOrigin()) {
+    return;
+  }
+  if (localStorage.getItem(BEARER_KEY) === null) {
+    return;
+  }
+  localStorage.setItem(BEARER_KEY, token);
+}

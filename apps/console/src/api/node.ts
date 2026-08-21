@@ -3,10 +3,10 @@ import type {
   ConsoleMode,
   LeaseList,
   LeaseView,
-  NodeView,
+  NodeStatus,
 } from "./types";
 
-export type { BerthApi, ConsoleMode } from "./types";
+export type { BerthApi, ConsoleMode, NodeStatus } from "./types";
 
 let instance: BerthApi | null = null;
 
@@ -19,6 +19,18 @@ export function api(): BerthApi {
     throw new Error("api not initialized");
   }
   return instance;
+}
+
+async function readError(res: Response, fallback: string): Promise<string> {
+  const payload = (await res.json().catch(() => null)) as {
+    error?: string;
+    live_lease_id?: string;
+  } | null;
+  const message = payload?.error ?? fallback;
+  if (payload?.live_lease_id) {
+    return `${message} (${payload.live_lease_id})`;
+  }
+  return message;
 }
 
 async function readJson<T>(res: Response): Promise<T> {
@@ -65,26 +77,48 @@ export function createApi(
     return `/v1/leases/${encodeURIComponent(id)}`;
   }
 
+  async function readNode(res: Response, fallback: string): Promise<NodeStatus> {
+    if (!res.ok) {
+      throw new Error(await readError(res, fallback));
+    }
+    return (await res.json()) as NodeStatus;
+  }
+
   return {
-    async pair(code: string) {
+    async pair(code: string, pairOpts?: { revokeOthers?: boolean }) {
       const res = await request("/v1/pair", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ code }),
+        // omit revoke_others so a second pair does not rotate the CLI bearer
+        body: JSON.stringify(
+          pairOpts?.revokeOthers
+            ? { code, revoke_others: true }
+            : { code },
+        ),
       });
       if (res.status === 401) {
         throw new Error("invalid pairing code");
       }
       if (!res.ok) {
-        const payload = (await res.json().catch(() => null)) as {
-          error?: string;
-        } | null;
-        throw new Error(payload?.error ?? `pair failed (${res.status})`);
+        throw new Error(await readError(res, `pair failed (${res.status})`));
       }
       const data = (await res.json()) as { token: string };
       opts.setToken(data.token);
       return data;
     },
+
+    async pairingCode() {
+      const res = await request("/v1/pairing");
+      // trycloudflare / non-loopback: operator types the stderr code
+      if (res.status === 404) {
+        return null;
+      }
+      if (!res.ok) {
+        throw new Error(await readError(res, `pairing failed (${res.status})`));
+      }
+      return (await res.json()) as { code: string };
+    },
+
     async listLeases() {
       return readJson<LeaseList>(await request("/v1/leases"));
     },
@@ -102,16 +136,18 @@ export function createApi(
       );
     },
     async node() {
-      return readJson<NodeView>(await request("/v1/node"));
+      return readNode(await request("/v1/node"), "node failed");
     },
     async park() {
-      return readJson<NodeView>(
+      return readNode(
         await request("/v1/node/park", { method: "POST" }),
+        "park failed",
       );
     },
     async unpark() {
-      return readJson<NodeView>(
+      return readNode(
         await request("/v1/node/unpark", { method: "POST" }),
+        "unpark failed",
       );
     },
   };
