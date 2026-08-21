@@ -17,6 +17,7 @@ import { getToken } from "@/lib/auth";
 import { occupancyUsd } from "@/lib/ledger";
 import {
   UNPARKED_LEASE_COPY,
+  quoteMatchesDraft,
   wizardMayPost,
   wizardWhatReady,
   wizardWhereNextEnabled,
@@ -74,6 +75,14 @@ export function LeaseWizardPage() {
 
   const whatReady = wizardWhatReady(vcpu, memGib);
   const parked = node?.parked === true;
+  const draft = {
+    vcpu,
+    mem_gib: memGib,
+    disk_gib: diskGib,
+    density,
+  };
+  const liveQuote =
+    quote && quoteMatchesDraft(quote, draft) ? quote : null;
 
   const onAuthError = useCallback(() => {
     if (!getToken()) {
@@ -100,10 +109,12 @@ export function LeaseWizardPage() {
 
   useEffect(() => {
     let cancelled = false;
+    setNodePending(true);
     void (async () => {
       try {
         const next = await api().node();
-        if (!cancelled) setNode(next);
+        if (cancelled) return;
+        setNode(next);
       } catch (err) {
         if (cancelled) return;
         if (!getToken()) {
@@ -111,6 +122,8 @@ export function LeaseWizardPage() {
           return;
         }
         setError(err instanceof Error ? err.message : "load failed");
+      } finally {
+        if (!cancelled) setNodePending(false);
       }
     })();
     return () => {
@@ -119,9 +132,18 @@ export function LeaseWizardPage() {
   }, [navigate]);
 
   useEffect(() => {
-    if (step !== 2) return;
-    if (!whatReady) return;
+    if (step !== 2) {
+      setQuote(null);
+      setQuotePending(false);
+      return;
+    }
+    if (!whatReady) {
+      setQuote(null);
+      setQuotePending(false);
+      return;
+    }
     let cancelled = false;
+    setQuote(null);
     setQuotePending(true);
     void (async () => {
       try {
@@ -149,28 +171,29 @@ export function LeaseWizardPage() {
   }, [step, density, vcpu, memGib, diskGib, whatReady, navigate]);
 
   async function onNext() {
-    setError(null);
     if (step === 0) {
       if (!whatReady) {
         setError(INVALID_RESOURCES_COPY);
         return;
       }
+      if (error === INVALID_RESOURCES_COPY) setError(null);
       setStep(1);
       return;
     }
     if (step === 1) {
       const next = await refreshNode();
-      if (!next || !wizardWhereNextEnabled(next.parked)) {
+      if (!next || !next.parked) {
         if (next && !next.parked) setError(UNPARKED_LEASE_COPY);
         return;
       }
+      setError(null);
       setStep(2);
     }
   }
 
   async function onConfirm() {
-    if (!wizardMayPost("linux") || !whatReady) return;
-    if (!wizardWhereNextEnabled(parked)) {
+    if (!wizardMayPost("linux") || !whatReady || !liveQuote) return;
+    if (!parked) {
       setError(UNPARKED_LEASE_COPY);
       return;
     }
@@ -196,13 +219,12 @@ export function LeaseWizardPage() {
 
   const nextDisabled =
     confirmPending ||
-    nodePending ||
     (step === 0 && !whatReady) ||
-    (step === 1 && (!parked || nodePending));
+    (step === 1 && !wizardWhereNextEnabled(node, nodePending));
   const confirmDisabled =
     confirmPending ||
     quotePending ||
-    !quote ||
+    !liveQuote ||
     !parked ||
     !whatReady ||
     !wizardMayPost("linux");
@@ -319,7 +341,7 @@ export function LeaseWizardPage() {
                   : "Unparked"
                 : nodePending
                   ? "Loading"
-                  : "This process"}
+                  : "This node"}
             </CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-4">
@@ -334,9 +356,9 @@ export function LeaseWizardPage() {
                 <dt className="text-muted-foreground">parked</dt>
                 <dd>{node.parked ? "yes" : "no"}</dd>
               </dl>
-            ) : (
+            ) : nodePending ? (
               <p className="text-sm text-muted-foreground">Loading node…</p>
-            )}
+            ) : null}
             {node && !node.parked ? (
               <p className="text-sm text-destructive">{UNPARKED_LEASE_COPY}</p>
             ) : null}
@@ -356,15 +378,17 @@ export function LeaseWizardPage() {
             <p>
               {vcpu} vCPU / {memGib} GiB / {diskGib} GiB · {density} · linux
             </p>
-            {quotePending && !quote ? (
+            {quotePending && !liveQuote ? (
               <p className="text-muted-foreground">Loading quote…</p>
             ) : null}
-            {quote ? (
+            {liveQuote ? (
               <>
                 <p>
-                  Occupancy <QuoteLabel usd={occupancyUsd(quote)} />
+                  Occupancy <QuoteLabel usd={occupancyUsd(liveQuote)} />
                 </p>
-                <p className="text-muted-foreground">{quote.min_seconds}s min</p>
+                <p className="text-muted-foreground">
+                  {liveQuote.min_seconds}s min
+                </p>
               </>
             ) : null}
             {node ? (
@@ -378,7 +402,7 @@ export function LeaseWizardPage() {
                 </div>
               </div>
             ) : null}
-            {!parked ? (
+            {node && !node.parked ? (
               <p className="text-destructive">{UNPARKED_LEASE_COPY}</p>
             ) : null}
           </CardContent>
