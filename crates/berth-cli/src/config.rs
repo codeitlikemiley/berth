@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -130,26 +131,63 @@ fn write_secret_file(path: &Path, contents: &str) -> Result<()> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         secure_mkdir(parent)?;
     }
-    let tmp = path.with_extension("tmp");
-    {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| Error::Config("invalid config path".into()))?;
+
+    let mut last_exists = None;
+    for _ in 0..32 {
+        let tmp = unique_tmp_path(parent, name);
         let mut opts = OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
+        opts.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let mut file = opts.open(&tmp)?;
-        file.write_all(contents.as_bytes())?;
-        if !contents.ends_with('\n') {
-            file.write_all(b"\n")?;
+        match opts.open(&tmp) {
+            Ok(mut file) => {
+                let wrote = write_all_sync(&mut file, contents);
+                if let Err(err) = wrote {
+                    let _ = fs::remove_file(&tmp);
+                    return Err(err.into());
+                }
+                if let Err(err) = fs::rename(&tmp, path) {
+                    let _ = fs::remove_file(&tmp);
+                    return Err(err.into());
+                }
+                #[cfg(unix)]
+                set_mode(path, 0o600)?;
+                return Ok(());
+            }
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                last_exists = Some(err);
+            }
+            Err(err) => return Err(err.into()),
         }
-        file.sync_all()?;
     }
-    fs::rename(&tmp, path)?;
-    #[cfg(unix)]
-    set_mode(path, 0o600)?;
-    Ok(())
+    Err(last_exists.map(Into::into).unwrap_or_else(|| {
+        Error::Config(format!("could not create temp file for {}", path.display()))
+    }))
+}
+
+fn unique_tmp_path(parent: &Path, name: &str) -> PathBuf {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!(".{name}.{}.{n}.tmp", std::process::id()))
+}
+
+fn write_all_sync(file: &mut File, contents: &str) -> std::io::Result<()> {
+    file.write_all(contents.as_bytes())?;
+    if !contents.ends_with('\n') {
+        file.write_all(b"\n")?;
+    }
+    file.sync_all()
 }
 
 fn secure_mkdir(path: &Path) -> Result<()> {
@@ -245,6 +283,72 @@ token = "brt_test"
             "http://127.0.0.1:7432"
         );
         assert!(normalize_url("ftp://x").is_err());
+    }
+
+    fn leftover_tmps(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp") || name == "config.tmp")
+            .collect()
+    }
+
+    #[test]
+    fn save_does_not_use_shared_config_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.nodes.insert(
+            "default".into(),
+            NodeConfig {
+                url: "http://127.0.0.1:7432".into(),
+                token: "brt_a".into(),
+            },
+        );
+        cfg.save(dir.path()).unwrap();
+        cfg.nodes.get_mut("default").unwrap().token = "brt_b".into();
+        cfg.save(dir.path()).unwrap();
+        assert!(!dir.path().join("config.tmp").exists());
+        assert!(leftover_tmps(dir.path()).is_empty());
+        assert_eq!(
+            Config::load(dir.path())
+                .unwrap()
+                .node("default")
+                .unwrap()
+                .token,
+            "brt_b"
+        );
+    }
+
+    #[test]
+    fn concurrent_saves_use_unique_tmp_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        std::thread::scope(|s| {
+            for i in 0..8 {
+                let home = home.clone();
+                s.spawn(move || {
+                    let mut cfg = Config::default();
+                    cfg.nodes.insert(
+                        format!("n{i}"),
+                        NodeConfig {
+                            url: "http://127.0.0.1:7432".into(),
+                            token: format!("brt_{i}"),
+                        },
+                    );
+                    cfg.save(&home).unwrap();
+                });
+            }
+        });
+        assert!(!home.join("config.tmp").exists());
+        assert!(
+            leftover_tmps(&home).is_empty(),
+            "{:?}",
+            leftover_tmps(&home)
+        );
+        let cfg = Config::load(&home).unwrap();
+        assert!(!cfg.nodes.is_empty());
+        toml::from_str::<Config>(&fs::read_to_string(home.join("config.toml")).unwrap()).unwrap();
     }
 
     #[cfg(unix)]

@@ -84,27 +84,30 @@ Read the review: [docs/REVIEW.md](docs/REVIEW.md).
 
 ## Status
 
-Research and protocol seed. No runtime yet.
-
-Intended first binary:
+Private Linux outpost on one machine (node + CLI). No tunnel, no MCP yet.
+The guest is Linux in Docker (linux/arm64 on Apple Silicon). The host
+desktop is never driven.
 
 ```sh
-# on the parked box (NUC, mini PC, Mac mini)
+# this Mac, with Docker Desktop or OrbStack
 berth node up
+# prints a pairing code; listens on 127.0.0.1:7432
 
-# on the laptop where the agent runs
-berth up --os linux            # local, bootstrap
-berth up --node home-nuc       # the actual wedge: remote outpost
+# another terminal, same machine — copy the code from node up
+berth pair --code ABCD-EFGH
+berth up --os linux
+berth view          # prints the noVNC URL; does not open a browser
+berth end
 ```
 
-Then any MCP client — Claude Code, Codex, Grok Build, OpenClaw — talks to
-that session as if the computer were local.
+`berth pair --url` defaults to `http://127.0.0.1:7432`. Token and URL land
+in `~/.berth/config.toml`. MCP (`berth mcp`) is the next slice.
 
 ## Name
 
 Working title. A berth is where a ship is parked and made fast. Alternatives
 that capture the same shape: *yard*, *slip*, *chassis*, *outpost* (taken by
-Devin). Rename is cheap while there is no runtime.
+Devin). Rename is cheap this early.
 
 ## License
 

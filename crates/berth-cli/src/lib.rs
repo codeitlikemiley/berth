@@ -336,11 +336,133 @@ mod tests {
         ));
     }
 
+    fn unauthorized() -> impl httptest::responders::Responder {
+        status_code(401)
+            .append_header("content-type", "application/json")
+            .body(r#"{"error":"unauthorized"}"#)
+    }
+
+    fn seed_pair(home: &Path, url: &str, token: &str) {
+        let mut cfg = Config::default();
+        cfg.nodes.insert(
+            "default".into(),
+            NodeConfig {
+                url: url.into(),
+                token: token.into(),
+            },
+        );
+        cfg.save(home).unwrap();
+    }
+
+    fn seed_session(home: &Path) {
+        save_session(
+            home,
+            &Session {
+                node: "default".into(),
+                lease_id: "l_1".into(),
+                session_id: "s_1".into(),
+                viewer_url: Some("http://127.0.0.1:6080/vnc.html".into()),
+                ws_url: Some("ws://127.0.0.1:7432/v1/sessions/s_1".into()),
+            },
+        )
+        .unwrap();
+    }
+
     #[test]
     fn up_windows_rejected_before_pair() {
         let dir = tempfile::tempdir().unwrap();
         let err = run(dir.path(), &["up", "--os", "windows"]).unwrap_err();
         assert!(err.to_string().contains("Windows"));
+    }
+
+    #[test]
+    fn up_macos_rejected_without_http() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::run();
+        let url = format!("http://{}", server.addr());
+        seed_pair(dir.path(), &url, "brt_secret");
+        let err = run(dir.path(), &["up", "--os", "macos"]).unwrap_err();
+        assert!(err.to_string().contains("macOS"));
+    }
+
+    #[test]
+    fn up_lease_unauthorized() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(all_of![
+                request::method_path("POST", "/v1/leases"),
+                request::headers(contains(("authorization", "Bearer brt_stale"))),
+            ])
+            .respond_with(unauthorized()),
+        );
+        let url = format!("http://{}", server.addr());
+        seed_pair(dir.path(), &url, "brt_stale");
+        let err = run(dir.path(), &["up", "--os", "linux"]).unwrap_err();
+        assert!(err.to_string().contains("unauthorized"));
+        assert!(load_session(dir.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn status_lease_unauthorized() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(all_of![
+                request::method_path("GET", "/v1/leases/l_1"),
+                request::headers(contains(("authorization", "Bearer brt_stale"))),
+            ])
+            .respond_with(unauthorized()),
+        );
+        let url = format!("http://{}", server.addr());
+        seed_pair(dir.path(), &url, "brt_stale");
+        seed_session(dir.path());
+        let err = run(dir.path(), &["status"]).unwrap_err();
+        assert!(err.to_string().contains("unauthorized"));
+        assert!(load_session(dir.path()).unwrap().is_some());
+    }
+
+    #[test]
+    fn end_lease_unauthorized_keeps_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(all_of![
+                request::method_path("DELETE", "/v1/leases/l_1"),
+                request::headers(contains(("authorization", "Bearer brt_stale"))),
+            ])
+            .respond_with(unauthorized()),
+        );
+        let url = format!("http://{}", server.addr());
+        seed_pair(dir.path(), &url, "brt_stale");
+        seed_session(dir.path());
+        let err = run(dir.path(), &["end"]).unwrap_err();
+        assert!(err.to_string().contains("unauthorized"));
+        assert_eq!(require_session(dir.path()).unwrap().lease_id, "l_1");
+    }
+
+    #[test]
+    fn end_404_clears_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(all_of![
+                request::method_path("DELETE", "/v1/leases/l_1"),
+                request::headers(contains(("authorization", "Bearer brt_secret"))),
+            ])
+            .respond_with(
+                status_code(404)
+                    .append_header("content-type", "application/json")
+                    .body(r#"{"error":"not found"}"#),
+            ),
+        );
+        let url = format!("http://{}", server.addr());
+        seed_pair(dir.path(), &url, "brt_secret");
+        seed_session(dir.path());
+        let out = run(dir.path(), &["end"]).unwrap();
+        assert!(out.contains("l_1"));
+        assert!(out.contains("gone"));
+        assert!(load_session(dir.path()).unwrap().is_none());
     }
 
     #[test]
@@ -421,7 +543,13 @@ mod tests {
                 request::method_path("POST", "/v1/leases"),
                 request::headers(contains(("authorization", "Bearer brt_secret"))),
                 request::body(json_decoded(|v: &serde_json::Value| {
-                    v["os"] == "linux" && v["class"] == "private" && v["license"] == "linux"
+                    v["os"] == "linux"
+                        && v["class"] == "private"
+                        && v["license"] == "linux"
+                        && v["density"] == "isolated"
+                        && v["resources"]["vcpu"] == 2
+                        && v["resources"]["mem_gib"] == 4
+                        && v["resources"]["disk_gib"] == 40
                 })),
             ])
             .respond_with(json_encoded(sample_lease("active", None))),
