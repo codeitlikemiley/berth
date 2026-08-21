@@ -481,6 +481,9 @@ async fn create_lease(
     }
     req.min_seconds = req.min_seconds.max(CONTAINER_MIN_SECONDS);
     req.validate_mvp()?;
+    // Docker refuses an oversized container anyway, but only after a round trip
+    // and in its own words. The node knows what it has; say so first.
+    check_capacity(state.inner.mode, &req).await?;
     let quote = Quote::from_request(&req)?;
     let mut guest = Guest::start(state.inner.mode, &state.inner.docker, &req).await?;
     #[cfg(test)]
@@ -681,7 +684,9 @@ async fn node_view(state: &AppState) -> Result<NodeView> {
     let (allowlist, allowlist_source) = node_allowlist();
     let live_sessions = state.inner.live.lock().await.len();
     let origin = state.origin();
+    let capacity = docker_capacity(state.inner.mode).await;
     Ok(NodeView {
+        capacity,
         ok: docker.ok && guest_image.ok && home_writable,
         parked: state.inner.db.parked()?,
         bind: state.inner.bind.lock().expect("bind lock").to_string(),
@@ -719,6 +724,16 @@ struct NodeView {
     live_sessions: usize,
     shutting_down: bool,
     host_desktop_driven: bool,
+    /// What this node can actually hand out, so a caller can size a lease
+    /// before asking rather than finding out from Docker at container start.
+    capacity: CapacityView,
+}
+
+#[derive(Debug, Serialize, Clone, Copy, Default)]
+struct CapacityView {
+    /// None when Docker could not be asked; callers must not treat that as zero.
+    vcpu: Option<u32>,
+    mem_gib: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1008,6 +1023,53 @@ async fn inspect_guest_image(docker: &bollard::Docker, name: &str) -> (bool, Str
             ),
         ),
     }
+}
+
+/// Host resources Docker reports. `None` for a field means "could not ask",
+/// which must never be read as "zero available".
+async fn docker_capacity(mode: GuestMode) -> CapacityView {
+    match mode {
+        #[cfg(test)]
+        GuestMode::Stub => CapacityView {
+            vcpu: Some(8),
+            mem_gib: Some(16),
+        },
+        GuestMode::Docker => match bollard::Docker::connect_with_local_defaults() {
+            Err(_) => CapacityView::default(),
+            Ok(docker) => match docker.info().await {
+                Err(_) => CapacityView::default(),
+                Ok(info) => CapacityView {
+                    vcpu: info.ncpu.and_then(|n| u32::try_from(n).ok()),
+                    mem_gib: info
+                        .mem_total
+                        .and_then(|b| u32::try_from(b / (1024 * 1024 * 1024)).ok()),
+                },
+            },
+        },
+    }
+}
+
+/// Refuse a lease the node demonstrably cannot host. Silence when capacity is
+/// unknown: a probe failure is not evidence the request is too big.
+async fn check_capacity(mode: GuestMode, req: &LeaseRequest) -> Result<()> {
+    let cap = docker_capacity(mode).await;
+    if let Some(vcpu) = cap.vcpu
+        && req.resources.vcpu > vcpu
+    {
+        return Err(Error::BadRequest(format!(
+            "vcpu {} exceeds this node's {vcpu} available CPUs",
+            req.resources.vcpu
+        )));
+    }
+    if let Some(mem) = cap.mem_gib
+        && req.resources.mem_gib > mem
+    {
+        return Err(Error::BadRequest(format!(
+            "mem_gib {} exceeds this node's {mem} GiB of memory",
+            req.resources.mem_gib
+        )));
+    }
+    Ok(())
 }
 
 async fn probe_docker_and_image(mode: GuestMode) -> (DockerProbe, GuestImageProbe) {

@@ -76,6 +76,8 @@ export type NodeStatus = {
   active_bearers: number;
   live_sessions: number;
   shutting_down: boolean;
+  /** What the node can host. A null field means Docker could not be asked — never read it as zero. */
+  capacity: { vcpu: number | null; mem_gib: number | null };
   host_desktop_driven: boolean;
 };
 
