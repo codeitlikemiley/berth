@@ -1,0 +1,6 @@
+[package]
+name = "berth-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Computer-session protocol types"

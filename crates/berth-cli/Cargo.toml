@@ -1,0 +1,13 @@
+[package]
+name = "berth-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Berth command-line interface"
+
+[[bin]]
+name = "berth"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true

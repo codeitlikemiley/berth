@@ -1,0 +1,6 @@
+[package]
+name = "berth-adapter-anthropic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Anthropic computer_toolset adapter"

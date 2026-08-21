@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/berth-protocol",
+    "crates/berth-node",
+    "crates/berth-mcp",
+    "crates/berth-adapter-anthropic",
+    "crates/berth-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+clap = { version = "4.5", features = ["derive"] }
