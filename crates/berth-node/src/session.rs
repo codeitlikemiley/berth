@@ -5,21 +5,23 @@ use berth_protocol::{
 };
 use bollard::Docker;
 use bollard::exec::StartExecResults;
-use bollard::models::{ExecConfig, HostConfig};
+use bollard::models::ExecConfig;
 use bollard::query_parameters::{CreateContainerOptionsBuilder, RemoveContainerOptionsBuilder};
 use futures_util::StreamExt;
 use tokio::time::sleep;
 
-use crate::action::{
-    ACTION_BIN, FRAME_HEIGHT, FRAME_WIDTH, PNG_MAGIC, action_argv, key_repeats, png_dimensions,
-};
+use crate::action::{ACTION_BIN, PNG_MAGIC, action_argv, key_repeats, png_dimensions, skipped};
+#[cfg(debug_assertions)]
+use crate::docker::assert_host_isolated;
 use crate::docker::{
-    VIEWER_PORT, container_body, container_name, image_from_env, volume_create, volume_name,
+    VIEWER_PORT, container_body, container_name, image_from_env, network_name,
+    session_network_create, volume_create, volume_name,
 };
 use crate::error::{Error, Result};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const READY_POLL: Duration = Duration::from_millis(200);
+const EXEC_WAIT: Duration = Duration::from_secs(10);
 
 /// Talks to the local Docker engine and starts isolated guest sessions.
 #[derive(Clone, Debug)]
@@ -58,7 +60,9 @@ impl SessionManager {
             .map(str::to_string)
             .unwrap_or_else(|| new_id("ws"));
         let volume = volume_name(&workspace_id);
+        let network = network_name(&session_id);
         self.ensure_volume(&volume).await?;
+        self.create_session_network(&network, &session_id).await?;
 
         let name = container_name(&session_id);
         let body = container_body(
@@ -67,20 +71,32 @@ impl SessionManager {
             &workspace_id,
             &req.resources,
             &volume,
+            &network,
         )?;
-        debug_assert_isolated(body.host_config.as_ref());
+        #[cfg(debug_assertions)]
+        if let Some(host) = body.host_config.as_ref() {
+            assert_host_isolated(host);
+        }
 
-        let created = self
+        let created = match self
             .docker
             .create_container(
                 Some(CreateContainerOptionsBuilder::default().name(&name).build()),
                 body,
             )
-            .await?;
+            .await
+        {
+            Ok(created) => created,
+            Err(err) => {
+                let _ = self.docker.remove_network(&network).await;
+                return Err(err.into());
+            }
+        };
         let container_id = created.id;
 
         if let Err(err) = self.boot(&container_id).await {
             let _ = self.remove_container(&container_id).await;
+            let _ = self.docker.remove_network(&network).await;
             return Err(err);
         }
 
@@ -92,7 +108,10 @@ impl SessionManager {
             session_id,
             workspace_id,
             volume,
+            network,
             viewer_port,
+            last_frame: None,
+            stopped: false,
         })
     }
 
@@ -110,6 +129,13 @@ impl SessionManager {
                 }
             }
         }
+    }
+
+    async fn create_session_network(&self, name: &str, session_id: &str) -> Result<()> {
+        self.docker
+            .create_network(session_network_create(name, session_id))
+            .await?;
+        Ok(())
     }
 
     async fn boot(&self, container_id: &str) -> Result<()> {
@@ -167,7 +193,17 @@ impl SessionManager {
     }
 }
 
-/// One running guest desktop. Stop removes the container and keeps the volume.
+/// Ack plus any screenshot frames produced by the batch, in item order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecOutput {
+    pub ack: Ack,
+    pub frames: Vec<Frame>,
+}
+
+/// One running guest desktop.
+///
+/// Callers must [`Session::stop`] the session. Drop best-effort removes the
+/// container (keeps the volume) if a Tokio runtime is still available.
 #[derive(Debug)]
 pub struct Session {
     docker: Docker,
@@ -176,7 +212,10 @@ pub struct Session {
     session_id: String,
     workspace_id: String,
     volume: String,
+    network: String,
     viewer_port: Option<u16>,
+    last_frame: Option<Frame>,
+    stopped: bool,
 }
 
 impl Session {
@@ -204,14 +243,34 @@ impl Session {
         &self.volume
     }
 
+    pub fn network_name(&self) -> &str {
+        &self.network
+    }
+
     pub fn viewer_port(&self) -> Option<u16> {
         self.viewer_port
     }
 
+    pub fn last_frame(&self) -> Option<&Frame> {
+        self.last_frame.as_ref()
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.stopped
+    }
+
     /// Run `items` in order via `/usr/local/bin/action.sh`. First failure skips the rest.
-    pub async fn exec(&self, batch: ActionBatch) -> Result<Ack> {
+    ///
+    /// Docker/exec infrastructure errors fail that item (and skip the rest)
+    /// rather than dropping a partial Ack. Screenshot items append a `Frame`
+    /// whose width/height come from PNG IHDR — missing IHDR fails the item.
+    pub async fn exec(&mut self, batch: ActionBatch) -> Result<ExecOutput> {
+        if self.stopped {
+            return Err(Error::Stopped);
+        }
         let n = batch.items.len();
         let mut results = Vec::with_capacity(n);
+        let mut frames = Vec::new();
         let mut skip = false;
         for (i, item) in batch.items.iter().enumerate() {
             let i = i as u32;
@@ -219,9 +278,21 @@ impl Session {
                 results.push(skipped(i));
                 continue;
             }
-            match run_item(&self.docker, &self.container_id, item).await {
-                Ok(ok) => results.push(ok_result(i, item, ok)),
-                Err(ItemError::Action(error)) => {
+            match run_item(&self.docker, &self.container_id, &self.session_id, item).await {
+                Ok(frame) => {
+                    let has_frame = frame.is_some();
+                    if let Some(frame) = frame {
+                        self.last_frame = Some(frame.clone());
+                        frames.push(frame);
+                    }
+                    results.push(AckResult {
+                        i,
+                        ok: true,
+                        frame: has_frame,
+                        error: None,
+                    });
+                }
+                Err(ItemError::Failed(error)) => {
                     results.push(AckResult {
                         i,
                         ok: false,
@@ -230,17 +301,22 @@ impl Session {
                     });
                     skip = true;
                 }
-                Err(ItemError::Docker(err)) => return Err(err),
             }
         }
-        Ok(Ack {
-            kind: AckKind::Ack,
-            id: batch.id,
-            results,
+        Ok(ExecOutput {
+            ack: Ack {
+                kind: AckKind::Ack,
+                id: batch.id,
+                results,
+            },
+            frames,
         })
     }
 
-    pub async fn screenshot(&self) -> Result<Frame> {
+    pub async fn screenshot(&mut self) -> Result<Frame> {
+        if self.stopped {
+            return Err(Error::Stopped);
+        }
         let out = exec_cmd(
             &self.docker,
             &self.container_id,
@@ -254,11 +330,18 @@ impl Session {
                 out.stderr_lossy()
             )));
         }
-        frame_from_png(&self.session_id, out.stdout)
+        let frame = frame_from_png(&self.session_id, out.stdout)?;
+        self.last_frame = Some(frame.clone());
+        Ok(frame)
     }
 
-    /// Remove the container. The workspace volume is kept.
-    pub async fn stop(self) -> Result<()> {
+    /// Remove the container (and its private network). The workspace volume is kept.
+    ///
+    /// On failure the session stays usable so `stop` can be retried.
+    pub async fn stop(&mut self) -> Result<()> {
+        if self.stopped {
+            return Ok(());
+        }
         self.docker
             .remove_container(
                 &self.container_id,
@@ -270,13 +353,42 @@ impl Session {
                 ),
             )
             .await?;
+        let _ = self.docker.remove_network(&self.network).await;
+        self.stopped = true;
         Ok(())
     }
 }
 
+impl Drop for Session {
+    fn drop(&mut self) {
+        if self.stopped {
+            return;
+        }
+        self.stopped = true;
+        let docker = self.docker.clone();
+        let container_id = self.container_id.clone();
+        let network = self.network.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = docker
+                    .remove_container(
+                        &container_id,
+                        Some(
+                            RemoveContainerOptionsBuilder::default()
+                                .force(true)
+                                .v(false)
+                                .build(),
+                        ),
+                    )
+                    .await;
+                let _ = docker.remove_network(&network).await;
+            });
+        }
+    }
+}
+
 enum ItemError {
-    Action(String),
-    Docker(Error),
+    Failed(String),
 }
 
 struct ExecOut {
@@ -294,27 +406,33 @@ impl ExecOut {
 async fn run_item(
     docker: &Docker,
     container_id: &str,
+    session_id: &str,
     item: &Action,
-) -> std::result::Result<bool, ItemError> {
-    let argv = action_argv(item).map_err(ItemError::Action)?;
+) -> std::result::Result<Option<Frame>, ItemError> {
+    let argv = action_argv(item).map_err(ItemError::Failed)?;
     let repeats = key_repeats(item);
-    if repeats == 0 {
-        return Ok(false);
-    }
+    let mut last_stdout = Vec::new();
     for _ in 0..repeats {
         let out = exec_cmd(docker, container_id, &argv)
             .await
-            .map_err(ItemError::Docker)?;
+            .map_err(|err| ItemError::Failed(err.to_string()))?;
         if out.exit_code != 0 {
             let msg = if out.stderr_lossy().is_empty() {
                 format!("action.sh exited {}", out.exit_code)
             } else {
                 format!("action.sh exited {}: {}", out.exit_code, out.stderr_lossy())
             };
-            return Err(ItemError::Action(msg));
+            return Err(ItemError::Failed(msg));
         }
+        last_stdout = out.stdout;
     }
-    Ok(matches!(item, Action::Screenshot {}))
+    if matches!(item, Action::Screenshot {}) {
+        let frame = frame_from_png(session_id, last_stdout)
+            .map_err(|err| ItemError::Failed(err.to_string()))?;
+        Ok(Some(frame))
+    } else {
+        Ok(None)
+    }
 }
 
 async fn exec_cmd(docker: &Docker, container_id: &str, cmd: &[String]) -> Result<ExecOut> {
@@ -351,19 +469,34 @@ async fn exec_cmd(docker: &Docker, container_id: &str, cmd: &[String]) -> Result
         }
         StartExecResults::Detached => {}
     }
-    let inspect = docker.inspect_exec(&created.id).await?;
+    let exit_code = wait_exec_exit(docker, &created.id).await?;
     Ok(ExecOut {
-        exit_code: inspect.exit_code.unwrap_or(-1),
+        exit_code,
         stdout,
         stderr,
     })
+}
+
+async fn wait_exec_exit(docker: &Docker, exec_id: &str) -> Result<i64> {
+    let deadline = tokio::time::Instant::now() + EXEC_WAIT;
+    loop {
+        let inspect = docker.inspect_exec(exec_id).await?;
+        let running = inspect.running.unwrap_or(false);
+        if !running {
+            return Ok(inspect.exit_code.unwrap_or(-1));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(inspect.exit_code.unwrap_or(-1));
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
 }
 
 fn frame_from_png(session_id: &str, data: Vec<u8>) -> Result<Frame> {
     if data.len() < PNG_MAGIC.len() || !data.starts_with(PNG_MAGIC) {
         return Err(Error::InvalidPng);
     }
-    let (width, height) = png_dimensions(&data).unwrap_or((FRAME_WIDTH, FRAME_HEIGHT));
+    let (width, height) = png_dimensions(&data).ok_or(Error::InvalidPng)?;
     Ok(Frame {
         kind: FrameKind::Frame,
         session_id: session_id.to_string(),
@@ -374,24 +507,6 @@ fn frame_from_png(session_id: &str, data: Vec<u8>) -> Result<Frame> {
         data,
         cursor: None,
     })
-}
-
-fn ok_result(i: u32, item: &Action, has_frame: bool) -> AckResult {
-    AckResult {
-        i,
-        ok: true,
-        frame: has_frame || matches!(item, Action::Screenshot {}),
-        error: None,
-    }
-}
-
-fn skipped(i: u32) -> AckResult {
-    AckResult {
-        i,
-        ok: false,
-        frame: false,
-        error: Some("skipped".into()),
-    }
 }
 
 fn now_ts() -> u64 {
@@ -409,34 +524,27 @@ fn new_id(prefix: &str) -> String {
     format!("{prefix}_{ns:x}")
 }
 
-fn debug_assert_isolated(host: Option<&HostConfig>) {
-    let Some(host) = host else {
-        return;
-    };
-    debug_assert_ne!(host.network_mode.as_deref(), Some("host"));
-    debug_assert_eq!(host.privileged, Some(false));
-    debug_assert!(host.binds.as_ref().is_none_or(Vec::is_empty));
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::action::argv_batch;
     use berth_protocol::{Class, Density, License, Os, Resources, Term};
 
     #[test]
-    fn skip_rest_shape() {
-        let results = [
-            AckResult {
-                i: 0,
-                ok: false,
-                frame: false,
-                error: Some("click mods are not supported by action.sh".into()),
-            },
-            skipped(1),
-            skipped(2),
-        ];
-        assert_eq!(results[1].error.as_deref(), Some("skipped"));
-        assert!(!results[1].ok);
+    fn skip_rest_from_argv_errors() {
+        let ack = argv_batch(
+            "a_skip",
+            &[
+                Action::Wait { ms: 1 },
+                Action::Shell {
+                    cmd: "uname".into(),
+                },
+                Action::Wait { ms: 2 },
+            ],
+        );
+        assert!(ack.results[0].ok);
+        assert!(!ack.results[1].ok);
+        assert_eq!(ack.results[2].error.as_deref(), Some("skipped"));
     }
 
     #[test]
@@ -471,5 +579,15 @@ mod tests {
         req.validate_mvp().unwrap();
         req.os = Os::Windows;
         assert!(req.validate_mvp().is_err());
+    }
+
+    #[test]
+    fn missing_ihdr_is_invalid_png() {
+        let mut data = vec![0_u8; 16];
+        data[..8].copy_from_slice(PNG_MAGIC);
+        assert!(matches!(
+            frame_from_png("s_1", data),
+            Err(Error::InvalidPng)
+        ));
     }
 }

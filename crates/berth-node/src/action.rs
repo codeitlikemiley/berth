@@ -1,4 +1,6 @@
-use berth_protocol::{Action, Button};
+#[cfg(test)]
+use berth_protocol::{Ack, AckKind};
+use berth_protocol::{AckResult, Action, Button};
 
 pub const ACTION_BIN: &str = "/usr/local/bin/action.sh";
 pub const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
@@ -23,13 +25,18 @@ pub fn action_argv(action: &Action) -> std::result::Result<Vec<String>, String> 
                 button_arg(*button).into(),
             ])
         }
-        Action::DoubleClick { xy, .. } => Ok(vec![
-            ACTION_BIN.to_string(),
-            "click".into(),
-            xy[0].to_string(),
-            xy[1].to_string(),
-            "double".into(),
-        ]),
+        Action::DoubleClick { xy, button } => {
+            if *button != Button::Left {
+                return Err("double_click button is not supported by action.sh".into());
+            }
+            Ok(vec![
+                ACTION_BIN.to_string(),
+                "click".into(),
+                xy[0].to_string(),
+                xy[1].to_string(),
+                "double".into(),
+            ])
+        }
         Action::Move { xy } => Ok(vec![
             ACTION_BIN.to_string(),
             "move".into(),
@@ -45,9 +52,12 @@ pub fn action_argv(action: &Action) -> std::result::Result<Vec<String>, String> 
             dy.to_string(),
         ]),
         Action::Type { text } => Ok(vec![ACTION_BIN.to_string(), "type".into(), text.clone()]),
-        Action::Key { keys, .. } => {
+        Action::Key { keys, repeat } => {
             if keys.is_empty() {
                 return Err("key requires KEY".into());
+            }
+            if *repeat == 0 {
+                return Err("key repeat must be > 0".into());
             }
             let mut argv = vec![ACTION_BIN.to_string(), "key".into()];
             argv.extend(keys.iter().cloned());
@@ -66,6 +76,52 @@ pub fn key_repeats(action: &Action) -> u32 {
     match action {
         Action::Key { repeat, .. } => *repeat,
         _ => 1,
+    }
+}
+
+/// Plan a batch using only argv mapping: first mapping error skips the rest.
+/// Used by unit tests; `Session::exec` applies the same skip rule around docker exec.
+#[cfg(test)]
+pub(crate) fn argv_batch(id: &str, items: &[Action]) -> Ack {
+    let mut results = Vec::with_capacity(items.len());
+    let mut skip = false;
+    for (i, item) in items.iter().enumerate() {
+        let i = i as u32;
+        if skip {
+            results.push(skipped(i));
+            continue;
+        }
+        match action_argv(item) {
+            Ok(_) => results.push(AckResult {
+                i,
+                ok: true,
+                frame: matches!(item, Action::Screenshot {}),
+                error: None,
+            }),
+            Err(error) => {
+                results.push(AckResult {
+                    i,
+                    ok: false,
+                    frame: false,
+                    error: Some(error),
+                });
+                skip = true;
+            }
+        }
+    }
+    Ack {
+        kind: AckKind::Ack,
+        id: id.to_string(),
+        results,
+    }
+}
+
+pub(crate) fn skipped(i: u32) -> AckResult {
+    AckResult {
+        i,
+        ok: false,
+        frame: false,
+        error: Some("skipped".into()),
     }
 }
 
@@ -203,6 +259,49 @@ mod tests {
             })
             .is_err()
         );
+        assert!(
+            action_argv(&Action::Key {
+                keys: vec!["a".into()],
+                repeat: 0,
+            })
+            .unwrap_err()
+            .contains("repeat")
+        );
+        assert!(
+            action_argv(&Action::DoubleClick {
+                xy: [1, 2],
+                button: Button::Right,
+            })
+            .unwrap_err()
+            .contains("double_click button")
+        );
+        assert!(
+            action_argv(&Action::DoubleClick {
+                xy: [1, 2],
+                button: Button::Middle,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn first_argv_error_skips_rest() {
+        let ack = argv_batch(
+            "a_skip",
+            &[
+                Action::Wait { ms: 1 },
+                Action::Shell {
+                    cmd: "uname -a".into(),
+                },
+                Action::Wait { ms: 2 },
+                Action::Screenshot {},
+            ],
+        );
+        assert!(ack.results[0].ok);
+        assert!(!ack.results[1].ok);
+        assert_eq!(ack.results[2].error.as_deref(), Some("skipped"));
+        assert_eq!(ack.results[3].error.as_deref(), Some("skipped"));
+        assert!(!ack.results[2].ok);
     }
 
     #[test]
@@ -214,5 +313,8 @@ mod tests {
         data[20..24].copy_from_slice(&800_u32.to_be_bytes());
         assert_eq!(png_dimensions(&data), Some((1280, 800)));
         assert_eq!(png_dimensions(b"not png"), None);
+        let mut no_ihdr = vec![0_u8; 24];
+        no_ihdr[..8].copy_from_slice(PNG_MAGIC);
+        assert_eq!(png_dimensions(&no_ihdr), None);
     }
 }

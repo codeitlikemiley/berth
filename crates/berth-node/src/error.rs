@@ -9,6 +9,8 @@ pub enum Error {
     ReadyTimeout { last_stderr: String },
     Guest(String),
     InvalidPng,
+    InvalidResources,
+    Stopped,
     ResourceOverflow(&'static str),
 }
 
@@ -27,7 +29,11 @@ impl fmt::Display for Error {
                 }
             }
             Self::Guest(msg) => write!(f, "{msg}"),
-            Self::InvalidPng => write!(f, "screenshot was not a PNG"),
+            Self::InvalidPng => write!(f, "screenshot was not a PNG with a valid IHDR"),
+            Self::InvalidResources => {
+                write!(f, "vcpu and mem_gib must be greater than zero")
+            }
+            Self::Stopped => write!(f, "session is stopped"),
             Self::ResourceOverflow(what) => {
                 write!(f, "resource {what} is too large for a container cap")
             }
@@ -43,6 +49,8 @@ impl std::error::Error for Error {
             Self::ReadyTimeout { .. }
             | Self::Guest(_)
             | Self::InvalidPng
+            | Self::InvalidResources
+            | Self::Stopped
             | Self::ResourceOverflow(_) => None,
         }
     }

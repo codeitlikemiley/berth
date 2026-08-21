@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use berth_node::{FRAME_HEIGHT, FRAME_WIDTH, SessionManager};
 use berth_protocol::{
-    Action, ActionBatch, ActionBatchKind, Class, Density, Isolation, LeaseRequest, License, Os,
-    Resources, Term, Workspace,
+    Action, ActionBatch, ActionBatchKind, Button, Class, Density, Isolation, LeaseRequest, License,
+    Os, Resources, Term, Workspace,
 };
 
 fn e2e_enabled() -> bool {
@@ -67,6 +67,20 @@ fn docker_exec(container: &str, shell: &str) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+fn inspect_host_config(container: &str) -> serde_json::Value {
+    let out = Command::new("docker")
+        .args(["inspect", container])
+        .output()
+        .expect("docker inspect");
+    assert!(
+        out.status.success(),
+        "docker inspect failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("inspect json");
+    v[0]["HostConfig"].clone()
+}
+
 #[tokio::test]
 #[ignore = "requires Docker; BERTH_E2E=1 cargo test -p berth-node -- --ignored"]
 async fn session_screenshot_and_workspace_persists() {
@@ -79,13 +93,38 @@ async fn session_screenshot_and_workspace_persists() {
     let ws = unique_ws();
     let req = lease(&ws);
 
-    let session = manager.start(&req).await.expect("start session");
+    let mut session = manager.start(&req).await.expect("start session");
     assert_ne!(
         session
             .volume_name()
             .strip_prefix("berth-ws-")
             .unwrap_or(""),
         ""
+    );
+
+    let hc = inspect_host_config(session.container_id());
+    assert_ne!(hc["NetworkMode"], "host");
+    assert_ne!(hc["NetworkMode"], "bridge");
+    assert_eq!(hc["Privileged"], false);
+    let cap_drop = hc["CapDrop"]
+        .as_array()
+        .expect("CapDrop")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect::<Vec<_>>();
+    assert!(cap_drop.iter().any(|c| c.eq_ignore_ascii_case("ALL")));
+    assert!(hc["Binds"].is_null() || hc["Binds"].as_array().is_some_and(|b| b.is_empty()));
+    assert_eq!(hc["PortBindings"]["6080/tcp"][0]["HostIp"], "127.0.0.1");
+    let sec = hc["SecurityOpt"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect::<Vec<_>>();
+    assert!(
+        sec.iter().any(|s| s.contains("no-new-privileges")),
+        "{sec:?}"
     );
 
     let frame = session.screenshot().await.expect("screenshot");
@@ -98,6 +137,34 @@ async fn session_screenshot_and_workspace_persists() {
     assert_eq!(frame.height, FRAME_HEIGHT);
     assert_eq!(frame.mime, "image/png");
 
+    let typed = session
+        .exec(ActionBatch {
+            kind: ActionBatchKind::Actions,
+            id: "a_type".into(),
+            session_id: session.session_id().to_string(),
+            items: vec![
+                Action::Click {
+                    button: Button::Left,
+                    xy: [200, 120],
+                    mods: vec![],
+                },
+                Action::Type {
+                    text: "echo typed-ok > /workspace/typed.txt".into(),
+                },
+                Action::Key {
+                    keys: vec!["Return".into()],
+                    repeat: 1,
+                },
+                Action::Wait { ms: 800 },
+            ],
+        })
+        .await
+        .expect("type into xterm");
+    assert!(typed.ack.results.iter().all(|r| r.ok), "{:?}", typed.ack);
+
+    let typed_body = docker_exec(session.container_id(), "cat /workspace/typed.txt");
+    assert_eq!(typed_body, "typed-ok");
+
     let marker = "berth-persist-ok";
     docker_exec(
         session.container_id(),
@@ -108,7 +175,7 @@ async fn session_screenshot_and_workspace_persists() {
         marker
     );
 
-    let ack = session
+    let shot = session
         .exec(ActionBatch {
             kind: ActionBatchKind::Actions,
             id: "a_e2e".into(),
@@ -123,11 +190,13 @@ async fn session_screenshot_and_workspace_persists() {
         })
         .await
         .expect("exec batch");
-    assert!(ack.results[0].ok);
-    assert!(ack.results[1].ok && ack.results[1].frame);
-    assert!(!ack.results[2].ok);
+    assert!(shot.ack.results[0].ok);
+    assert!(shot.ack.results[1].ok && shot.ack.results[1].frame);
+    assert_eq!(shot.frames.len(), 1);
+    assert_eq!(shot.frames[0].width, FRAME_WIDTH);
+    assert!(!shot.ack.results[2].ok);
 
-    let fail_ack = session
+    let fail = session
         .exec(ActionBatch {
             kind: ActionBatchKind::Actions,
             id: "a_skip".into(),
@@ -141,12 +210,12 @@ async fn session_screenshot_and_workspace_persists() {
         })
         .await
         .expect("skip batch");
-    assert!(!fail_ack.results[0].ok);
-    assert_eq!(fail_ack.results[1].error.as_deref(), Some("skipped"));
+    assert!(!fail.ack.results[0].ok);
+    assert_eq!(fail.ack.results[1].error.as_deref(), Some("skipped"));
 
     session.stop().await.expect("stop keeps volume");
 
-    let session2 = manager.start(&req).await.expect("start again");
+    let mut session2 = manager.start(&req).await.expect("start again");
     let body = docker_exec(session2.container_id(), "cat /workspace/persist.txt");
     assert_eq!(body, marker, "workspace volume must survive stop");
     let volume = session2.volume_name().to_string();
