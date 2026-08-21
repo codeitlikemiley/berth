@@ -1,0 +1,17 @@
+{
+  "vcpu": 2,
+  "mem_gib": 4,
+  "disk_gib": 40,
+  "os": "linux",
+  "os_mult": 1.0,
+  "density": "shared",
+  "density_mult": 0.30,
+  "term": "on_demand",
+  "min_seconds": 60,
+  "pooled": false,
+  "cpu_overcommit": 2.0,
+  "gas_per_second": "0.000333",
+  "currency": "gas",
+  "usd_per_gas": "0.01",
+  "preemptible": true
+}

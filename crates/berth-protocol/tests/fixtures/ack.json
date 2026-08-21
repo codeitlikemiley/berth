@@ -1,0 +1,9 @@
+{
+  "type": "ack",
+  "id": "a_...",
+  "results": [
+    { "i": 0, "ok": true, "frame": true },
+    { "i": 1, "ok": false, "error": "policy:key:Return requires human" },
+    { "i": 2, "ok": false, "error": "skipped" }
+  ]
+}

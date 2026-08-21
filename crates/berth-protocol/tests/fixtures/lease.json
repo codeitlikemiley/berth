@@ -1,0 +1,26 @@
+{
+  "lease_id": "l_...",
+  "session_id": "s_...",
+  "expires_at": "2026-08-22T12:00:00Z",
+  "endpoint": "wss://tun.example/s/s_...",
+  "mcp_stdio": ["berth", "mcp", "--session", "s_..."],
+  "viewer": "https://tun.example/view/s_...",
+  "driver": "cua-driver",
+  "quote": {
+    "vcpu": 2,
+    "mem_gib": 4,
+    "disk_gib": 40,
+    "os": "linux",
+    "os_mult": 1.0,
+    "density": "shared",
+    "density_mult": 0.30,
+    "term": "on_demand",
+    "min_seconds": 60,
+    "pooled": false,
+    "cpu_overcommit": 2.0,
+    "gas_per_second": "0.000333",
+    "currency": "gas",
+    "usd_per_gas": "0.01",
+    "preemptible": true
+  }
+}

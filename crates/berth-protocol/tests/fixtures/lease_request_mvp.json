@@ -1,0 +1,14 @@
+{
+  "os": "linux",
+  "class": "private",
+  "license": "linux",
+  "density": "isolated",
+  "pooled": false,
+  "term": "on_demand",
+  "resources": { "vcpu": 2, "mem_gib": 4, "disk_gib": 40 },
+  "min_seconds": 60,
+  "max_seconds": 86400,
+  "image": "berth/linux-xfce:2026-08",
+  "isolation": "vm",
+  "network": { "egress": "allowlist", "domains": ["github.com", "pypi.org"] }
+}

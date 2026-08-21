@@ -1,0 +1,20 @@
+{
+  "type": "actions",
+  "id": "a_...",
+  "session_id": "s_...",
+  "items": [
+    { "op": "screenshot" },
+    { "op": "click", "button": "left", "xy": [100, 200], "mods": [] },
+    { "op": "double_click", "xy": [100, 200] },
+    { "op": "move", "xy": [100, 200] },
+    { "op": "drag", "path": [[100, 200], [300, 200]] },
+    { "op": "scroll", "xy": [100, 200], "dx": 0, "dy": 3 },
+    { "op": "type", "text": "hello" },
+    { "op": "key", "keys": ["META", "s"], "repeat": 1 },
+    { "op": "hold_key", "keys": ["SHIFT"], "ms": 500 },
+    { "op": "wait", "ms": 400 },
+    { "op": "zoom", "region": [0, 0, 200, 200] },
+    { "op": "cursor_position" },
+    { "op": "shell", "cmd": "uname -a" }
+  ]
+}
