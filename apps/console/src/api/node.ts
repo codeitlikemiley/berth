@@ -1,4 +1,10 @@
-import type { BerthApi, ConsoleMode } from "./types";
+import type {
+  BerthApi,
+  ConsoleMode,
+  LeaseList,
+  LeaseView,
+  NodeView,
+} from "./types";
 
 export type { BerthApi, ConsoleMode } from "./types";
 
@@ -13,6 +19,19 @@ export function api(): BerthApi {
     throw new Error("api not initialized");
   }
   return instance;
+}
+
+async function readJson<T>(res: Response): Promise<T> {
+  const payload = (await res.json().catch(() => null)) as
+    | (T & { error?: string })
+    | null;
+  if (!res.ok) {
+    throw new Error(payload?.error ?? `request failed (${res.status})`);
+  }
+  if (payload === null) {
+    throw new Error("empty response");
+  }
+  return payload;
 }
 
 export function createApi(
@@ -42,6 +61,10 @@ export function createApi(
     return res;
   }
 
+  function leasePath(id: string): string {
+    return `/v1/leases/${encodeURIComponent(id)}`;
+  }
+
   return {
     async pair(code: string) {
       const res = await request("/v1/pair", {
@@ -61,6 +84,35 @@ export function createApi(
       const data = (await res.json()) as { token: string };
       opts.setToken(data.token);
       return data;
+    },
+    async listLeases() {
+      return readJson<LeaseList>(await request("/v1/leases"));
+    },
+    async getLease(id: string) {
+      return readJson<LeaseView>(await request(leasePath(id)));
+    },
+    async endLease(id: string) {
+      return readJson<LeaseView>(
+        await request(leasePath(id), { method: "DELETE" }),
+      );
+    },
+    async forceEnd(id: string) {
+      return readJson<LeaseView>(
+        await request(`${leasePath(id)}/force`, { method: "POST" }),
+      );
+    },
+    async node() {
+      return readJson<NodeView>(await request("/v1/node"));
+    },
+    async park() {
+      return readJson<NodeView>(
+        await request("/v1/node/park", { method: "POST" }),
+      );
+    },
+    async unpark() {
+      return readJson<NodeView>(
+        await request("/v1/node/unpark", { method: "POST" }),
+      );
     },
   };
 }
