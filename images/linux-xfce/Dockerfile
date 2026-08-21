@@ -20,6 +20,7 @@ RUN apt-get update \
         fonts-liberation \
         git \
         imagemagick \
+        iptables \
         jq \
         novnc \
         openbox \
@@ -88,10 +89,10 @@ RUN chmod 755 /usr/local/bin/entrypoint.sh /usr/local/bin/action.sh \
     && chown berth:berth /home/berth/.config/openbox/menu.xml
 
 # Viewer is noVNC on 6080; raw VNC is localhost-only inside the guest.
+# Entrypoint starts as root to apply the egress filter, then drops to berth.
 EXPOSE 6080
 HEALTHCHECK --interval=10s --timeout=3s --start-period=12s --retries=5 \
     CMD ["/usr/local/bin/berth-health"]
 
-USER berth
 WORKDIR /workspace
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]

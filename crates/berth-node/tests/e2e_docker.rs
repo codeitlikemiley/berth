@@ -126,6 +126,35 @@ async fn session_screenshot_and_workspace_persists() {
         sec.iter().any(|s| s.contains("no-new-privileges")),
         "{sec:?}"
     );
+    let cap_add = hc["CapAdd"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect::<Vec<_>>();
+    assert!(
+        cap_add.iter().any(|c| c.eq_ignore_ascii_case("NET_ADMIN")),
+        "{cap_add:?}"
+    );
+
+    let inspect = Command::new("docker")
+        .args(["inspect", session.container_id()])
+        .output()
+        .expect("docker inspect");
+    let inspect_json: serde_json::Value =
+        serde_json::from_slice(&inspect.stdout).expect("inspect json");
+    let env = inspect_json[0]["Config"]["Env"]
+        .as_array()
+        .expect("Env")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect::<Vec<_>>();
+    assert!(env.iter().any(|e| e == &"DISPLAY=:99"), "{env:?}");
+    assert!(
+        env.iter().any(|e| e.starts_with("BERTH_ALLOWLIST=")),
+        "{env:?}"
+    );
 
     let frame = session.screenshot().await.expect("screenshot");
     assert!(

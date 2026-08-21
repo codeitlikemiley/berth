@@ -231,6 +231,9 @@ pub fn validate_mvp(req: &LeaseRequest) -> Result<(), MvpError> {
         Term::OnDemand => {}
         Term::Monthly | Term::Annual => return Err(MvpError::UnsupportedTerm(req.term)),
     }
+    if req.resources.vcpu == 0 || req.resources.mem_gib == 0 {
+        return Err(MvpError::InvalidResources);
+    }
     Ok(())
 }
 
@@ -240,6 +243,7 @@ pub enum MvpError {
     UnsupportedClass(Class),
     UnsupportedDensity(Density),
     UnsupportedTerm(Term),
+    InvalidResources,
 }
 
 impl std::fmt::Display for MvpError {
@@ -248,33 +252,43 @@ impl std::fmt::Display for MvpError {
             Self::UnsupportedOs(Os::Windows) => {
                 write!(
                     f,
-                    "Windows is not supported in the MVP; only os=linux is available"
+                    "Windows is not supported in v0.1; only os=linux is available (Windows guests are not implemented)"
                 )
             }
             Self::UnsupportedOs(Os::Macos) => {
                 write!(
                     f,
-                    "macOS is not supported in the MVP; only os=linux is available"
+                    "macOS is not supported in v0.1; only os=linux is available (macOS guests are not implemented)"
                 )
             }
             Self::UnsupportedOs(Os::Linux) => {
-                write!(f, "unsupported os for MVP")
+                write!(f, "unsupported os for v0.1")
             }
+            Self::UnsupportedClass(Class::Mesh) => write!(
+                f,
+                "class=mesh is not supported in v0.1; only class=private is available (mesh is not implemented)"
+            ),
             Self::UnsupportedClass(class) => write!(
                 f,
-                "class={} is not supported in the MVP; only class=private is available",
+                "class={} is not supported in v0.1; only class=private is available",
                 class.as_str()
             ),
             Self::UnsupportedDensity(density) => write!(
                 f,
-                "density={} is not supported in the MVP; only density=isolated or density=shared is available",
+                "density={} is not supported in v0.1; only density=isolated or density=shared is available",
                 density.as_str()
             ),
             Self::UnsupportedTerm(term) => write!(
                 f,
-                "term={} is not supported in the MVP; only term=on_demand is available",
+                "term={} is not supported in v0.1; only term=on_demand is available",
                 term.as_str()
             ),
+            Self::InvalidResources => {
+                write!(
+                    f,
+                    "vcpu and mem_gib must be greater than zero (0 is not unlimited)"
+                )
+            }
         }
     }
 }

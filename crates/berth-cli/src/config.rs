@@ -25,6 +25,9 @@ pub fn berth_home() -> Result<PathBuf> {
 pub struct Config {
     #[serde(default)]
     pub nodes: BTreeMap<String, NodeConfig>,
+    /// Comma-separated egress hosts. Missing = default. Empty = deny-all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowlist: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -308,6 +311,29 @@ token = "brt_test"
         let dir = tempfile::tempdir().unwrap();
         let cfg = Config::load(dir.path()).unwrap();
         assert!(cfg.nodes.is_empty());
+        assert!(cfg.allowlist.is_none());
+    }
+
+    #[test]
+    fn empty_allowlist_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config {
+            allowlist: Some(String::new()),
+            ..Config::default()
+        };
+        cfg.nodes.insert(
+            "default".into(),
+            NodeConfig {
+                url: "http://127.0.0.1:7432".into(),
+                token: "brt_secret".into(),
+            },
+        );
+        cfg.save(dir.path()).unwrap();
+        let loaded = Config::load(dir.path()).unwrap();
+        assert_eq!(loaded.allowlist.as_deref(), Some(""));
+        let raw = fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(raw.contains("allowlist"));
+        assert!(raw.contains("brt_secret"));
     }
 
     #[test]

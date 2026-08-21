@@ -351,6 +351,26 @@ fn validate_mvp_table() {
             snippet: Some("term=annual"),
             err: Some(MvpError::UnsupportedTerm(Term::Annual)),
         },
+        Case {
+            patch: json!({"resources": {"vcpu": 0, "mem_gib": 4, "disk_gib": 40}}),
+            os: Os::Linux,
+            class: Class::Private,
+            density: Density::Isolated,
+            term: Term::OnDemand,
+            ok: false,
+            snippet: Some("greater than zero"),
+            err: Some(MvpError::InvalidResources),
+        },
+        Case {
+            patch: json!({"resources": {"vcpu": 2, "mem_gib": 0, "disk_gib": 40}}),
+            os: Os::Linux,
+            class: Class::Private,
+            density: Density::Isolated,
+            term: Term::OnDemand,
+            ok: false,
+            snippet: Some("greater than zero"),
+            err: Some(MvpError::InvalidResources),
+        },
     ];
 
     for case in cases {

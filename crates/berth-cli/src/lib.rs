@@ -1,5 +1,6 @@
 mod client;
 mod config;
+mod doctor;
 mod error;
 
 use std::net::SocketAddr;
@@ -129,7 +130,7 @@ pub fn execute(cli: Cli, home: &Path) -> Result<String> {
             berth_mcp::serve_blocking(home)?;
             Ok(String::new())
         }
-        Command::Doctor => Err(Error::NotImplemented("doctor")),
+        Command::Doctor => crate::doctor::run_doctor(home),
     }
 }
 
@@ -154,14 +155,15 @@ fn cmd_pair(home: &Path, url: &str, code: &str, node: &str) -> Result<String> {
 
 fn cmd_up(home: &Path, os: &str, node: &str) -> Result<String> {
     validate_node_name(node)?;
-    let req = mvp_lease_request(parse_os(os)?)?;
+    let os = parse_os(os)?;
+    let cfg = Config::load(home)?;
+    let req = mvp_lease_request(os, cfg.allowlist.as_deref())?;
     if let Some(cur) = load_session(home)? {
         return Err(Error::Usage(format!(
             "lease {} is current; run berth end first",
             cur.lease_id
         )));
     }
-    let cfg = Config::load(home)?;
     let node_cfg = cfg.node(node)?;
     let lease = NodeClient::new(&node_cfg.url, Some(&node_cfg.token))?.create_lease(&req)?;
     let ws_url = resolve_ws_url(Some(&lease.ws_url), &node_cfg.url, &lease.session_id);
@@ -222,14 +224,16 @@ fn parse_os(s: &str) -> Result<Os> {
     }
 }
 
-fn mvp_lease_request(os: Os) -> Result<LeaseRequest> {
+fn mvp_lease_request(os: Os, allowlist: Option<&str>) -> Result<LeaseRequest> {
+    let domains = berth_node::parse_allowlist(allowlist);
     let req: LeaseRequest = serde_json::from_value(serde_json::json!({
         "os": os,
         "class": "private",
         "license": "linux",
         "density": "isolated",
         "term": "on_demand",
-        "resources": { "vcpu": 2, "mem_gib": 4, "disk_gib": 40 }
+        "resources": { "vcpu": 2, "mem_gib": 4, "disk_gib": 40 },
+        "network": { "egress": "allowlist", "domains": domains }
     }))?;
     req.validate_mvp()?;
     Ok(req)
@@ -397,7 +401,10 @@ mod tests {
     fn up_windows_rejected_before_pair() {
         let dir = tempfile::tempdir().unwrap();
         let err = run(dir.path(), &["up", "--os", "windows"]).unwrap_err();
-        assert!(err.to_string().contains("Windows"));
+        let msg = err.to_string();
+        assert!(msg.contains("Windows"), "{msg}");
+        assert!(msg.contains("v0.1"), "{msg}");
+        assert!(msg.contains("not implemented"), "{msg}");
     }
 
     #[test]
@@ -407,7 +414,10 @@ mod tests {
         let url = format!("http://{}", server.addr());
         seed_pair(dir.path(), &url, "brt_secret");
         let err = run(dir.path(), &["up", "--os", "macos"]).unwrap_err();
-        assert!(err.to_string().contains("macOS"));
+        let msg = err.to_string();
+        assert!(msg.contains("macOS"), "{msg}");
+        assert!(msg.contains("v0.1"), "{msg}");
+        assert!(msg.contains("not implemented"), "{msg}");
     }
 
     #[test]
@@ -508,6 +518,56 @@ mod tests {
     fn parse_mcp() {
         let cli = Cli::try_parse_from(["berth", "mcp"]).unwrap();
         assert!(matches!(cli.command, Command::Mcp));
+    }
+
+    #[test]
+    fn parse_doctor() {
+        let cli = Cli::try_parse_from(["berth", "doctor"]).unwrap();
+        assert!(matches!(cli.command, Command::Doctor));
+    }
+
+    #[test]
+    fn up_default_allowlist() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(all_of![
+                request::method_path("POST", "/v1/leases"),
+                request::body(json_decoded(|v: &serde_json::Value| {
+                    v["network"]["egress"] == "allowlist"
+                        && v["network"]["domains"]
+                            == json!(["github.com", "pypi.org", "registry.npmjs.org"])
+                })),
+            ])
+            .respond_with(json_encoded(sample_lease("active", None))),
+        );
+        let url = format!("http://{}", server.addr());
+        seed_pair(dir.path(), &url, "brt_secret");
+        run(dir.path(), &["up", "--os", "linux"]).unwrap();
+    }
+
+    #[test]
+    fn up_empty_allowlist_is_deny_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(all_of![
+                request::method_path("POST", "/v1/leases"),
+                request::body(json_decoded(|v: &serde_json::Value| {
+                    v["network"]["egress"] == "allowlist"
+                        && v["network"]["domains"]
+                            .as_array()
+                            .is_some_and(|d| d.is_empty())
+                })),
+            ])
+            .respond_with(json_encoded(sample_lease("active", None))),
+        );
+        let url = format!("http://{}", server.addr());
+        seed_pair(dir.path(), &url, "brt_secret");
+        let mut cfg = Config::load(dir.path()).unwrap();
+        cfg.allowlist = Some(String::new());
+        cfg.save(dir.path()).unwrap();
+        run(dir.path(), &["up", "--os", "linux"]).unwrap();
     }
 
     #[test]

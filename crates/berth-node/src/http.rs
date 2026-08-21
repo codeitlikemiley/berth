@@ -764,7 +764,36 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         let json = body_json(res).await;
-        assert!(json["error"].as_str().unwrap().contains("Windows"));
+        let windows_err = json["error"].as_str().unwrap();
+        assert!(windows_err.contains("Windows"), "{windows_err}");
+        assert!(windows_err.contains("v0.1"), "{windows_err}");
+
+        let macos = serde_json::json!({
+            "os": "macos",
+            "class": "private",
+            "license": "apple-private",
+            "density": "isolated",
+            "term": "on_demand",
+            "resources": { "vcpu": 2, "mem_gib": 4, "disk_gib": 40 }
+        });
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/leases")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(macos.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(res).await;
+        let macos_err = json["error"].as_str().unwrap();
+        assert!(macos_err.contains("macOS"), "{macos_err}");
+        assert!(macos_err.contains("v0.1"), "{macos_err}");
 
         let mesh = serde_json::json!({
             "os": "linux",
@@ -775,6 +804,7 @@ mod tests {
             "resources": { "vcpu": 2, "mem_gib": 4, "disk_gib": 40 }
         });
         let res = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -788,7 +818,35 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         let json = body_json(res).await;
-        assert!(json["error"].as_str().unwrap().contains("mesh"));
+        let mesh_err = json["error"].as_str().unwrap();
+        assert!(mesh_err.contains("class=mesh"), "{mesh_err}");
+        assert!(mesh_err.contains("not implemented"), "{mesh_err}");
+
+        let zero = serde_json::json!({
+            "os": "linux",
+            "class": "private",
+            "license": "linux",
+            "density": "isolated",
+            "term": "on_demand",
+            "resources": { "vcpu": 0, "mem_gib": 4, "disk_gib": 40 }
+        });
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/leases")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(zero.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(res).await;
+        let zero_err = json["error"].as_str().unwrap();
+        assert!(zero_err.contains("greater than zero"), "{zero_err}");
+        assert!(zero_err.contains("not unlimited"), "{zero_err}");
     }
 
     #[tokio::test]

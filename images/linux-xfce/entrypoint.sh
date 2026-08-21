@@ -13,12 +13,117 @@ export LC_ALL="${LC_ALL:-C.UTF-8}"
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/runtime-${USER}}"
 export XDG_CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP:-openbox}"
 
+log() { echo "[berth] $*" >&2; }
+
+# Unset → default hosts. Empty string → deny-all outbound (including DNS).
+if [ -z "${BERTH_ALLOWLIST+x}" ]; then
+  BERTH_ALLOWLIST="github.com,pypi.org,registry.npmjs.org"
+  export BERTH_ALLOWLIST
+fi
+
+resolve_hosts() {
+  local host="$1"
+  if command -v getent >/dev/null 2>&1; then
+    getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | sort -u || true
+    return
+  fi
+  python3 -c 'import socket,sys
+h=sys.argv[1]
+s=set()
+try:
+  for a in socket.getaddrinfo(h, None, socket.AF_INET):
+    s.add(a[4][0])
+except OSError:
+  pass
+print("\n".join(sorted(s)))
+' "$host" 2>/dev/null || true
+}
+
+apply_egress() {
+  command -v iptables >/dev/null 2>&1 || {
+    log "iptables is not installed; refusing to start without an egress filter"
+    return 1
+  }
+
+  iptables -F OUTPUT
+  iptables -P OUTPUT DROP
+  iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT \
+    || iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+  if [ -z "${BERTH_ALLOWLIST}" ]; then
+    iptables -A OUTPUT -p udp --dport 53 -j DROP
+    iptables -A OUTPUT -p tcp --dport 53 -j DROP
+  fi
+  iptables -A OUTPUT -o lo -j ACCEPT
+
+  if [ -n "${BERTH_ALLOWLIST}" ]; then
+    local ns d ip
+    while read -r ns; do
+      [ -n "$ns" ] || continue
+      iptables -A OUTPUT -p udp -d "$ns" --dport 53 -j ACCEPT
+      iptables -A OUTPUT -p tcp -d "$ns" --dport 53 -j ACCEPT
+    done <<EOF
+$(awk '/^nameserver[ \t]+/ { print $2 }' /etc/resolv.conf 2>/dev/null || true)
+EOF
+    local IFS=,
+    for d in ${BERTH_ALLOWLIST}; do
+      d="${d#"${d%%[![:space:]]*}"}"
+      d="${d%"${d##*[![:space:]]}"}"
+      d="$(printf '%s' "$d" | tr '[:upper:]' '[:lower:]')"
+      [ -n "$d" ] || continue
+      case "$d" in
+        *[!a-z0-9.-]*) log "skipping invalid allowlist host"; continue ;;
+      esac
+      if printf '%s' "$d" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+        iptables -A OUTPUT -p tcp -d "$d" --dport 443 -j ACCEPT
+        iptables -A OUTPUT -p tcp -d "$d" --dport 80 -j ACCEPT
+        continue
+      fi
+      while read -r ip; do
+        [ -n "$ip" ] || continue
+        case "$ip" in
+          *[!0-9.]*) continue ;;
+        esac
+        iptables -A OUTPUT -p tcp -d "$ip" --dport 443 -j ACCEPT
+        iptables -A OUTPUT -p tcp -d "$ip" --dport 80 -j ACCEPT
+      done <<EOF
+$(resolve_hosts "$d" || true)
+EOF
+    done
+  fi
+
+  if command -v ip6tables >/dev/null 2>&1 && [ -d /proc/sys/net/ipv6 ]; then
+    ip6tables -F OUTPUT
+    ip6tables -P OUTPUT DROP
+    ip6tables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null \
+      || ip6tables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+    if [ -z "${BERTH_ALLOWLIST}" ]; then
+      ip6tables -A OUTPUT -p udp --dport 53 -j DROP
+      ip6tables -A OUTPUT -p tcp --dport 53 -j DROP
+    fi
+    ip6tables -A OUTPUT -o lo -j ACCEPT
+  fi
+
+  if [ -z "${BERTH_ALLOWLIST}" ]; then
+    log "egress deny-all (empty allowlist)"
+  else
+    log "egress allowlist: ${BERTH_ALLOWLIST}"
+  fi
+}
+
+if [ "$(id -u)" -eq 0 ]; then
+  apply_egress
+  command -v setpriv >/dev/null 2>&1 || {
+    log "setpriv is missing; cannot drop to berth"
+    exit 1
+  }
+  exec setpriv --reuid=berth --regid=berth --init-groups --inh-caps=-all -- "$0" "$@"
+fi
+
 mkdir -p "$XDG_RUNTIME_DIR" "$HOME" /workspace /tmp/.X11-unix
 chmod 700 "$XDG_RUNTIME_DIR"
 chmod 1777 /tmp/.X11-unix || true
 cd /workspace
-
-log() { echo "[berth] $*" >&2; }
 
 alive() { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
 

@@ -14,6 +14,7 @@ pub enum Error {
     Mvp(MvpError),
     Node(String),
     Mcp(String),
+    Doctor(String),
     NotImplemented(&'static str),
 }
 
@@ -34,6 +35,7 @@ impl fmt::Display for Error {
             Self::Usage(msg) | Self::Config(msg) | Self::Node(msg) | Self::Mcp(msg) => {
                 write!(f, "{msg}")
             }
+            Self::Doctor(report) => write!(f, "{report}"),
             Self::Io(err) => write!(f, "{err}"),
             Self::Json(err) => write!(f, "json: {err}"),
             Self::Http(err) => {
@@ -68,6 +70,7 @@ impl std::error::Error for Error {
             | Self::Api { .. }
             | Self::Node(_)
             | Self::Mcp(_)
+            | Self::Doctor(_)
             | Self::NotImplemented(_) => None,
         }
     }

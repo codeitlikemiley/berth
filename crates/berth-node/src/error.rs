@@ -41,7 +41,10 @@ impl fmt::Display for Error {
             Self::Guest(msg) => write!(f, "{msg}"),
             Self::InvalidPng => write!(f, "screenshot was not a PNG with a valid IHDR"),
             Self::InvalidResources => {
-                write!(f, "vcpu and mem_gib must be greater than zero")
+                write!(
+                    f,
+                    "vcpu and mem_gib must be greater than zero (0 is not unlimited)"
+                )
             }
             Self::Stopped => write!(f, "session is stopped"),
             Self::ResourceOverflow(what) => {

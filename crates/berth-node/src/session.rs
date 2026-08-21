@@ -11,6 +11,7 @@ use futures_util::StreamExt;
 use tokio::time::sleep;
 
 use crate::action::{ACTION_BIN, PNG_MAGIC, action_argv, key_repeats, png_dimensions, skipped};
+use crate::allowlist::csv_for_lease;
 #[cfg(debug_assertions)]
 use crate::docker::assert_host_isolated;
 use crate::docker::{
@@ -68,6 +69,7 @@ impl SessionManager {
             &req.resources,
             &volume,
             &network,
+            &csv_for_lease(req),
         )?;
         #[cfg(debug_assertions)]
         if let Some(host) = body.host_config.as_ref() {
@@ -502,6 +504,7 @@ async fn exec_cmd(docker: &Docker, container_id: &str, cmd: &[String]) -> Result
                 attach_stderr: Some(true),
                 cmd: Some(cmd.to_vec()),
                 privileged: Some(false),
+                user: Some("berth".into()),
                 working_dir: Some("/workspace".into()),
                 env: Some(vec!["DISPLAY=:99".into()]),
                 ..Default::default()

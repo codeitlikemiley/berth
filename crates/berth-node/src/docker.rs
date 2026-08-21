@@ -17,6 +17,15 @@ pub const VIEWER_PORT: &str = "6080/tcp";
 const GIB: i64 = 1 << 30;
 const NANO: i64 = 1_000_000_000;
 const NAME_MAX: usize = 200;
+/// Caps needed to install the OUTPUT allowlist and then drop to `berth`.
+const GUEST_CAPS: [&str; 6] = [
+    "NET_ADMIN",
+    "NET_RAW",
+    "SETUID",
+    "SETGID",
+    "DAC_OVERRIDE",
+    "KILL",
+];
 
 pub fn resolve_image(env_val: Option<&str>) -> String {
     env_val
@@ -121,6 +130,7 @@ pub fn host_config(resources: &Resources, volume: &str, network: &str) -> Result
         network_mode: Some(network.to_string()),
         privileged: Some(false),
         cap_drop: Some(vec!["ALL".into()]),
+        cap_add: Some(GUEST_CAPS.iter().map(|c| (*c).to_string()).collect()),
         security_opt: Some(vec!["no-new-privileges:true".into()]),
         auto_remove: Some(false),
         // Named volume only. Never bind /tmp/.X11-unix or a host display.
@@ -150,6 +160,7 @@ pub fn container_body(
     resources: &Resources,
     volume: &str,
     network: &str,
+    allowlist: &str,
 ) -> Result<ContainerCreateBody> {
     let host_config = host_config(resources, volume, network)?;
     let mut labels = HashMap::new();
@@ -159,11 +170,15 @@ pub fn container_body(
         image: Some(image.to_string()),
         hostname: Some("berth".into()),
         working_dir: Some(WORKSPACE_MOUNT.into()),
+        // Root applies iptables then drops to berth. Exec uses user berth.
+        user: Some("0:0".into()),
         // Pin guest DISPLAY. Do not inherit a host XQuartz/X11 value.
+        // Empty BERTH_ALLOWLIST is deny-all (distinct from unset → default).
         env: Some(vec![
             "DISPLAY=:99".into(),
             "WIDTH=1280".into(),
             "HEIGHT=800".into(),
+            format!("BERTH_ALLOWLIST={allowlist}"),
         ]),
         exposed_ports: Some(vec![VIEWER_PORT.into()]),
         labels: Some(labels),
@@ -201,6 +216,19 @@ pub fn assert_host_isolated(host: &HostConfig) {
         host.cap_drop.as_deref(),
         Some(["ALL".to_string()].as_slice())
     );
+    let add = host.cap_add.as_deref().expect("cap_add");
+    assert!(
+        add.iter().any(|c| c.eq_ignore_ascii_case("NET_ADMIN")),
+        "{add:?}"
+    );
+    for c in add {
+        let upper = c.to_ascii_uppercase();
+        assert!(
+            GUEST_CAPS.iter().any(|ok| ok.eq_ignore_ascii_case(&upper)),
+            "unexpected cap {c}"
+        );
+        assert!(!upper.contains("SYS_ADMIN"));
+    }
     let sec = host.security_opt.as_ref().expect("security_opt");
     assert!(
         sec.iter().any(|s| s.contains("no-new-privileges")),
@@ -325,13 +353,40 @@ mod tests {
             },
             "berth-ws-ws_1",
             "berth-net-s_1",
+            crate::allowlist::DEFAULT_ALLOWLIST,
         )
         .unwrap();
         let env = body.env.expect("env");
         assert!(env.iter().any(|e| e == "DISPLAY=:99"));
         assert!(!env.iter().any(|e| e.contains("/tmp/.X11-unix")));
+        assert!(
+            env.iter()
+                .any(|e| e == "BERTH_ALLOWLIST=github.com,pypi.org,registry.npmjs.org")
+        );
+        assert_eq!(body.user.as_deref(), Some("0:0"));
         let host = body.host_config.as_ref().expect("host");
         assert_host_isolated(host);
         assert_eq!(host.network_mode.as_deref(), Some("berth-net-s_1"));
+    }
+
+    #[test]
+    fn empty_allowlist_env_is_set_not_omitted() {
+        let body = container_body(
+            DEFAULT_IMAGE,
+            "s_1",
+            "ws_1",
+            &Resources {
+                vcpu: 1,
+                mem_gib: 1,
+                disk_gib: 1,
+            },
+            "berth-ws-ws_1",
+            "berth-net-s_1",
+            "",
+        )
+        .unwrap();
+        let env = body.env.expect("env");
+        assert!(env.iter().any(|e| e == "BERTH_ALLOWLIST="));
+        assert!(!env.iter().any(|e| e == "BERTH_ALLOWLIST"));
     }
 }

@@ -6,6 +6,7 @@
 //! container and keeps the workspace volume.
 
 mod action;
+mod allowlist;
 mod db;
 mod docker;
 mod error;
@@ -16,7 +17,8 @@ mod session;
 mod tunnel;
 
 pub use action::{ACTION_BIN, FRAME_HEIGHT, FRAME_WIDTH};
-pub use docker::{DEFAULT_IMAGE, WORKSPACE_MOUNT, volume_name};
+pub use allowlist::{DEFAULT_ALLOWLIST, output_ruleset, parse_allowlist};
+pub use docker::{DEFAULT_IMAGE, WORKSPACE_MOUNT, image_from_env, volume_name};
 pub use error::{Error, Result};
 pub use http::{serve, serve_blocking};
 pub use session::{ExecOutput, Session, SessionManager};

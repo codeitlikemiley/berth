@@ -296,15 +296,15 @@ Record a 30-second screencast. That is the launch artifact.
 
 ### PR8 — harden + docs (1 day)
 
-- Default egress allowlist: `github.com`, `pypi.org`, `registry.npmjs.org`, empty = no outbound (config).
-- Resource caps enforced.
-- `berth --doctor` (docker, image present, token, tunnel).
-- README rewritten around the two-machine path (keep research links).
-- Copy this plan to `docs/MVP.md`.
-- `CONTRIBUTING.md` only if needed for build.
+- Default egress allowlist: `github.com`, `pypi.org`, `registry.npmjs.org`. **Empty allowlist = no outbound** (not "allow all"). Config `allowlist = ""` or `BERTH_ALLOWLIST=`.
+- Resource caps enforced (`vcpu`/`mem_gib` of `0` is rejected, not unlimited).
+- `berth doctor` (Docker daemon, guest image, `BERTH_HOME` writable, paired token warn, optional cloudflared warn). Exit 0 only if required checks pass.
+- README rewritten around the two-machine / macOS+Docker path (keep research links). Security note: host desktop is never driven.
+- `os=windows|macos` and `class=mesh` return clear errors. Do not implement those guests.
+- Tag-ready v0.1.0 checklist in README.
 
-**Accept:** `berth --doctor` green on **macOS + Docker Desktop** (and
-Linux+Docker if present). Security note in README: host desktop is never driven.
+**Accept:** `berth doctor` green on **macOS + Docker Desktop** (and
+Linux+Docker if present).
 
 ---
 
@@ -348,13 +348,15 @@ Two engineers: split PR2 (image) // PR1+3 (protocol+executor), then join at PR4.
 
 ## 8. v0.1.0 tag checklist
 
-- [ ] `berth node up` + `berth up` on one Linux host
+- [ ] `berth doctor` green on macOS + Docker Desktop (and Linux+Docker if present)
+- [ ] `berth node up` + `berth up --os linux` on one machine
 - [ ] Same path across two machines via tunnel
-- [ ] Claude Code screenshot + click
+- [ ] Claude Code screenshot + click (e2e screenshot)
 - [ ] `/workspace` persists
 - [ ] Host X session / cursor untouched
 - [ ] Quote printed (USD), not collected
 - [ ] `os=windows|macos` and `class=mesh` return a clear error
+- [ ] Empty egress allowlist denies outbound
 - [ ] README can be followed without reading MATH.md
 
 ---
