@@ -4,9 +4,9 @@ import { Navigate, Route, Routes } from "react-router-dom";
 import { getToken } from "@/lib/auth";
 import { DoctorPage } from "@/pages/doctor";
 import { HomePage } from "@/pages/home";
-import { LeasePage } from "@/pages/lease";
 import { LeaseWizardPage } from "@/pages/lease-wizard";
 import { PairPage } from "@/pages/pair";
+import { SessionPage } from "@/pages/session";
 
 function RequireAuth({ children }: { children: ReactNode }) {
   if (!getToken()) {
@@ -39,7 +39,7 @@ export function App() {
         path="/leases/:id"
         element={
           <RequireAuth>
-            <LeasePage />
+            <SessionPage />
           </RequireAuth>
         }
       />

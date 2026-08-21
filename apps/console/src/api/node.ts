@@ -102,6 +102,10 @@ export function createApi(
     return (await res.json()) as NodeStatus;
   }
 
+  function previewPath(sessionId: string): string {
+    return `/v1/sessions/${encodeURIComponent(sessionId)}/preview`;
+  }
+
   return {
     async pair(code: string, pairOpts?: { revokeOthers?: boolean }) {
       const res = await request("/v1/pair", {
@@ -185,6 +189,20 @@ export function createApi(
         await request("/v1/node/unpark", { method: "POST" }),
         "unpark failed",
       );
+    },
+    async preview(sessionId: string) {
+      // Bearer stays on Authorization so iframe/img src never carry the token.
+      const res = await request(previewPath(sessionId));
+      if (res.status === 204) {
+        return null;
+      }
+      if (!res.ok) {
+        const payload = (await res.json().catch(() => null)) as {
+          error?: string;
+        } | null;
+        throw new Error(payload?.error ?? `request failed (${res.status})`);
+      }
+      return res.blob();
     },
   };
 }

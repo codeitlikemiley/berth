@@ -100,4 +100,5 @@ export type BerthApi = {
   node: () => Promise<NodeStatus>;
   park: () => Promise<NodeStatus>;
   unpark: () => Promise<NodeStatus>;
+  preview: (sessionId: string) => Promise<Blob | null>;
 };
