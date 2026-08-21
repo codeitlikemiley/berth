@@ -81,7 +81,10 @@ Post-MVP (do not start until the Done-when above is true):
 2. OpenAI `computer` adapter  
 3. rclone `/mnt/s3`  
 4. Lume private macOS  
-5. W365 for Agents provider  
+5. **W365 for Agents provider** (`crates/berth-provider-w365`) — wrap
+   [microsoft/windows-365-for-agents](https://github.com/microsoft/windows-365-for-agents)
+   MCP (acquire → Ready → tools → release). Not in v0.1: needs an Agent 365
+   tenant. See [WINDOWS365.md](WINDOWS365.md).  
 6. Hosted control plane + credits  
 7. Linux mesh (wired mini PCs)  
 8. Mac §3 fleet  

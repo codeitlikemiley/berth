@@ -17,7 +17,7 @@ Tunnel: Cloudflare Tunnel or Tailscale. Driver: Cua Driver inside the guest.
 | Need | Provider | GUI | Gotcha |
 | --- | --- | --- | --- |
 | Linux, cheap, fast | Hetzner, Fly, Cua Cloud Linux, GCE | Install XFCE or use Cua image | Easiest SKU. |
-| Windows for agents | **Windows 365 for Agents** | Yes, that's the product | Check-out/check-in Cloud PCs — this is `density=isolated` + `pooled=true`, not shared-overcommit. US **$0.40/VM/hr** + $5/VM/month always-on. 50 free hours. Intune + Entra. ([Learn](https://learn.microsoft.com/en-us/windows-365/agents/introduction-windows-365-for-agents), [pricing](https://www.microsoft.com/en-us/windows-365/agents)) |
+| Windows for agents | **Windows 365 for Agents** | Yes — 65 MCP tools, check-out/check-in | `density=isolated` + `pooled=true`. US **$0.40/VM/hr** + $5/VM/month always-on. Needs Agent 365 + Entra blueprint + Intune pool. **v0.2 provider, not v0.1.** Dev docs: [microsoft/windows-365-for-agents](https://github.com/microsoft/windows-365-for-agents). Mapping: [WINDOWS365.md](WINDOWS365.md). |
 | Windows for external humans/ISV apps | **Azure Virtual Desktop** per-user access | Yes | You are the ISV; meter is per user/month who connected, plus VM. ([docs](https://learn.microsoft.com/en-us/azure/virtual-desktop/licensing)) |
 | Windows, bursty, already licensed | AWS/Azure Windows Server + GPU optional | Add RDP/noVNC + driver | RDS CAL/SPLA if multi-session. |
 | macOS, on-demand | **AWS EC2 Mac** Dedicated Host | VNC / Apple Screen Sharing / [Amazon DCV](https://aws.amazon.com/blogs/desktop-and-application-streaming/enabling-remote-macos-development-with-amazon-ec2-mac-and-amazon-dcv/) | **24h minimum**, billed while allocated. ~$1.08–$1.23/hr class. |
