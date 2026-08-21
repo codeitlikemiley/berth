@@ -745,15 +745,25 @@ exit 7
         let pid: u32 = raw.trim().parse().expect("pid");
         assert!(pid_alive(pid), "fake cloudflared should be running");
         child.shutdown().await;
+        // shutdown() awaits the child, so this is normally true on the first
+        // pass. The budget is generous because the alternative -- a one-second
+        // window around process teardown -- turns a loaded CI runner into a
+        // red build, and a slow teardown is not the bug this test is about.
         let mut gone = false;
-        for _ in 0..50 {
+        for _ in 0..500 {
             if !pid_alive(pid) {
                 gone = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(gone, "cloudflared child {pid} still alive after shutdown");
+        assert!(
+            gone,
+            "cloudflared child {pid} still alive 10s after shutdown (ps state {:?}); \
+             a Z state means it was signalled but never reaped, which is a different \
+             bug from it never dying",
+            pid_state(pid)
+        );
     }
 
     fn pid_alive(pid: u32) -> bool {
@@ -762,14 +772,30 @@ exit 7
     }
 
     async fn wait_file(path: &Path) -> String {
-        for _ in 0..100 {
+        // Spawning /bin/sh, exec-ing, and writing one line can take well over a
+        // second when the machine is busy; this waits on process startup, not
+        // on anything the test is asserting.
+        for _ in 0..500 {
             if let Ok(raw) = fs::read_to_string(path)
                 && !raw.trim().is_empty()
             {
                 return raw;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        panic!("timed out waiting for {}", path.display());
+        panic!("timed out after 10s waiting for {}", path.display());
+    }
+
+    /// Only read when an assertion has already failed: `kill(pid, 0)` cannot
+    /// tell a running process from an unreaped zombie, so report the state and
+    /// let the next reader see which one it hit.
+    fn pid_state(pid: u32) -> String {
+        std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .ok()
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "<not in ps>".into())
     }
 }
