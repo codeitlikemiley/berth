@@ -45,6 +45,11 @@ apply_egress() {
     return 1
   }
 
+  # Read the real resolvers now: in allowlist mode resolv.conf is later pointed
+  # at our own filter, and dnsmasq still needs somewhere to forward to.
+  local upstreams
+  upstreams="$(awk '/^nameserver[ \t]+/ { print $2 }' /etc/resolv.conf 2>/dev/null || true)"
+
   iptables -F OUTPUT
   iptables -P OUTPUT DROP
   iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT \
@@ -64,7 +69,7 @@ apply_egress() {
       esac
       iptables -A OUTPUT -d "$dns_ns" -j DROP
     done <<EOF
-$(awk '/^nameserver[ \t]+/ { print $2 }' /etc/resolv.conf 2>/dev/null || true)
+$upstreams
 EOF
     # Fixed address of Docker's embedded resolver, even if resolv.conf was
     # edited. -C first so the usual case (it is already the nameserver above)
@@ -73,18 +78,36 @@ EOF
       || iptables -A OUTPUT -d 127.0.0.11 -j DROP
     iptables -A OUTPUT -p udp --dport 53 -j DROP
     iptables -A OUTPUT -p tcp --dport 53 -j DROP
+  else
+    # Address filtering alone still let a guest resolve any name, which is a
+    # working exfiltration channel even when no TCP destination is reachable.
+    # Only the resolver user may reach upstream now; everything else asks
+    # dnsmasq on 127.0.0.1, which forwards allowlisted names and answers
+    # NXDOMAIN for the rest. root is allowed because apply_egress has to
+    # resolve the allowlist itself, and no guest process can become root: the
+    # entrypoint drops to berth with no capabilities and there is no sudo.
+    local dns_up
+    while read -r dns_up; do
+      [ -n "$dns_up" ] || continue
+      case "$dns_up" in
+        *[!0-9.]*) continue ;;
+      esac
+      iptables -A OUTPUT -d "$dns_up" -m owner --uid-owner 0 -j ACCEPT
+      iptables -A OUTPUT -d "$dns_up" -m owner --uid-owner berthdns -j ACCEPT
+      iptables -A OUTPUT -d "$dns_up" -j DROP
+    done <<EOF
+$upstreams
+EOF
+    iptables -C OUTPUT -d 127.0.0.11 -j DROP 2>/dev/null || {
+      iptables -A OUTPUT -d 127.0.0.11 -m owner --uid-owner 0 -j ACCEPT
+      iptables -A OUTPUT -d 127.0.0.11 -m owner --uid-owner berthdns -j ACCEPT
+      iptables -A OUTPUT -d 127.0.0.11 -j DROP
+    }
   fi
   iptables -A OUTPUT -o lo -j ACCEPT
 
   if [ -n "${BERTH_ALLOWLIST}" ]; then
-    local ns d ip
-    while read -r ns; do
-      [ -n "$ns" ] || continue
-      iptables -A OUTPUT -p udp -d "$ns" --dport 53 -j ACCEPT
-      iptables -A OUTPUT -p tcp -d "$ns" --dport 53 -j ACCEPT
-    done <<EOF
-$(awk '/^nameserver[ \t]+/ { print $2 }' /etc/resolv.conf 2>/dev/null || true)
-EOF
+    local d ip
     local IFS=,
     for d in ${BERTH_ALLOWLIST}; do
       d="${d#"${d%%[![:space:]]*}"}"
@@ -128,11 +151,65 @@ EOF
     ip6tables -A OUTPUT -o lo -j ACCEPT
   fi
 
+  # Last, because it repoints resolv.conf: resolving the allowlist above still
+  # needs the real resolver.
+  if [ -n "${BERTH_ALLOWLIST}" ]; then
+    start_name_filter "$upstreams" || return 1
+  fi
+
   if [ -z "${BERTH_ALLOWLIST}" ]; then
     log "egress deny-all (empty allowlist)"
   else
     log "egress allowlist: ${BERTH_ALLOWLIST}"
   fi
+}
+
+# Forward only allowlisted names and answer NXDOMAIN for the rest, so a query
+# for a name nobody allowlisted never leaves the guest. Address rules alone did
+# not stop this: an agent could encode data in a subdomain of a domain the
+# attacker controls and read it off their authoritative nameserver.
+start_name_filter() {
+  local upstreams="$1"
+  command -v dnsmasq >/dev/null 2>&1 || {
+    log "dnsmasq is not installed; refusing to start without a name filter"
+    return 1
+  }
+
+  local up
+  up="$(printf '%s\n' "$upstreams" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)"
+  [ -n "$up" ] || up="127.0.0.11"
+
+  local conf=/run/berth-dnsmasq.conf
+  {
+    printf '%s\n' "no-resolv" "listen-address=127.0.0.1" "bind-interfaces"
+    printf '%s\n' "user=berthdns" "group=berthdns" "cache-size=256"
+    # `#` is dnsmasq's catch-all and `local=` means answer here, never forward.
+    printf '%s\n' "local=/#/"
+  } > "$conf"
+
+  local IFS=, d
+  for d in ${BERTH_ALLOWLIST}; do
+    d="${d#"${d%%[![:space:]]*}"}"
+    d="${d%"${d##*[![:space:]]}"}"
+    d="$(printf '%s' "$d" | tr '[:upper:]' '[:lower:]')"
+    [ -n "$d" ] || continue
+    case "$d" in
+      *[!a-z0-9.-]*) continue ;;
+    esac
+    # A bare IP in the allowlist has no name to forward.
+    if printf '%s' "$d" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+      continue
+    fi
+    printf 'server=/%s/%s\n' "$d" "$up" >> "$conf"
+  done
+
+  dnsmasq --conf-file="$conf" --pid-file=/run/berth-dnsmasq.pid || {
+    log "dnsmasq failed to start; refusing to start without a name filter"
+    return 1
+  }
+
+  printf 'nameserver 127.0.0.1\noptions ndots:0\n' > /etc/resolv.conf
+  log "dns filter: forwarding only allowlisted names to ${up}"
 }
 
 output_policy_is_drop() {

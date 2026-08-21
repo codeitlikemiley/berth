@@ -53,7 +53,7 @@ start_guest() { # $1 name, $2 BERTH_ALLOWLIST value
 
 echo "image: $IMAGE"
 label=$(docker image inspect -f '{{index .Config.Labels "berth.egress.version"}}' "$IMAGE" 2>/dev/null || echo "")
-[ "$label" = "1" ] && pass "berth.egress.version=1" || fail "berth.egress.version: expected 1, got '${label:-<missing>}'"
+[ "$label" = "2" ] && pass "berth.egress.version=2" || fail "berth.egress.version: expected 2, got '${label:-<missing>}'"
 
 docker network create "$NET" >/dev/null
 
@@ -66,6 +66,8 @@ if start_guest "berth-egress-deny-$$" ""; then
   docker logs "$g" 2>&1 | grep -q "egress deny-all" && pass "logged deny-all"                || fail "did not log deny-all"
   as_agent "$g" 'getent hosts github.com'           && fail "DNS resolved under deny-all"    || pass "DNS blocked"
   as_agent "$g" 'curl -sS --max-time 8 https://github.com' && fail "TCP reached github.com"  || pass "TCP blocked"
+  docker exec -u root "$g" sh -c 'ps ax | grep -q "[d]nsmasq"' >/dev/null 2>&1 \
+    && fail "name filter running in deny-all" || pass "no name filter needed"
   # Ordering is the whole bug: the resolver DROP has to precede the loopback
   # ACCEPT, or the ACCEPT lets every DNAT-ed lookup straight back out.
   # pipefail would abort the run when grep finds nothing -- that is a FAIL to
@@ -89,6 +91,21 @@ if start_guest "berth-egress-allow-$$" "github.com"; then
   as_agent "$g" 'getent hosts github.com'                        && pass "DNS resolves"      || fail "DNS blocked, but allowlisted hosts need it"
   as_agent "$g" 'curl -sS --max-time 15 -o /dev/null https://github.com' && pass "allowed host reachable" || fail "allowlisted host unreachable"
   as_agent "$g" 'curl -sS --max-time 8 -o /dev/null https://example.com' && fail "non-listed host reachable" || pass "non-listed host blocked"
+
+  # Address rules alone left DNS wide open: a guest could resolve anything and
+  # exfiltrate through a domain the attacker runs the nameserver for. Only
+  # allowlisted names may be forwarded now.
+  # Both names below resolve publicly, so a guest that answers them is really
+  # forwarding -- a name that does not exist would NXDOMAIN either way and
+  # would prove nothing.
+  as_agent "$g" 'getent hosts example.com' && fail "non-listed NAME resolved" || pass "non-listed name refused"
+  as_agent "$g" 'getent hosts www.example.com' && fail "non-listed subdomain resolved" || pass "exfil-shaped subdomain refused"
+  # And the guest must not be able to skip the filter by asking Docker directly.
+  # Assert on the send, not on a reply: a DROPped destination fails sendto with
+  # EPERM immediately, whereas waiting for a reply passes against an open
+  # resolver too as long as the query is malformed.
+  as_agent "$g" "python3 -c \"import socket; socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b'x', ('127.0.0.11', 53))\"" \
+    && fail "guest reached the embedded resolver directly" || pass "embedded resolver unreachable by the agent"
 else
   fail "allowlist guest did not start"
 fi

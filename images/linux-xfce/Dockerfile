@@ -16,6 +16,7 @@ RUN apt-get update \
         ca-certificates \
         chromium \
         curl \
+        dnsmasq-base \
         dbus-x11 \
         fonts-liberation \
         git \
@@ -40,6 +41,8 @@ RUN apt-get update \
     && ln -sf /usr/share/novnc/vnc.html /usr/share/novnc/index.html \
     && groupadd -g 1000 berth \
     && useradd -m -u 1000 -g 1000 -s /bin/bash berth \
+    && groupadd -r berthdns \
+    && useradd -r -g berthdns -s /usr/sbin/nologin -d /nonexistent berthdns \
     && mkdir -p /workspace \
         /home/berth/.config/openbox \
         /home/berth/.config/chromium \
@@ -94,7 +97,9 @@ RUN chmod 755 /usr/local/bin/entrypoint.sh /usr/local/bin/action.sh \
 # Proof the image carries the egress-filtering entrypoint. The node refuses to
 # call an image healthy without it, so a guest built before the filter existed
 # cannot quietly report green. Bump when the egress contract changes.
-LABEL berth.egress.version="1"
+#   v1: address filtering only -- a guest could still resolve any name.
+#   v2: names are filtered too; only allowlisted domains are forwarded.
+LABEL berth.egress.version="2"
 
 # Viewer is noVNC on 6080; raw VNC is localhost-only inside the guest.
 # Entrypoint starts as root to apply the egress filter, then drops to berth.

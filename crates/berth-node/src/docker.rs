@@ -34,7 +34,10 @@ pub const EGRESS_LABEL: &str = "berth.egress.version";
 
 /// Egress contract the node understands. Bump alongside the Dockerfile when the
 /// filter's guarantees change so stale images stop reporting healthy.
-pub const EGRESS_VERSION: &str = "1";
+///
+/// v1 filtered addresses only, so a guest could still resolve any name and use
+/// DNS as an exfiltration channel. v2 filters names as well.
+pub const EGRESS_VERSION: &str = "2";
 
 pub fn image_from_env() -> String {
     resolve_image(env::var("BERTH_IMAGE").ok().as_deref())
