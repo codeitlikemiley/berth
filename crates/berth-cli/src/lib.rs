@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::process::ExitCode;
 
-use berth_protocol::{LeaseRequest, Os, Quote};
+use berth_protocol::{LeaseRequest, Os, Quote, network_from_allowlist_key};
 use clap::{Parser, Subcommand};
 
 use crate::client::{LeaseView, NodeClient};
@@ -225,16 +225,18 @@ fn parse_os(s: &str) -> Result<Os> {
 }
 
 fn mvp_lease_request(os: Os, allowlist: Option<&str>) -> Result<LeaseRequest> {
-    let domains = berth_node::parse_allowlist(allowlist);
-    let req: LeaseRequest = serde_json::from_value(serde_json::json!({
+    let mut value = serde_json::json!({
         "os": os,
         "class": "private",
         "license": "linux",
         "density": "isolated",
         "term": "on_demand",
-        "resources": { "vcpu": 2, "mem_gib": 4, "disk_gib": 40 },
-        "network": { "egress": "allowlist", "domains": domains }
-    }))?;
+        "resources": { "vcpu": 2, "mem_gib": 4, "disk_gib": 40 }
+    });
+    if let Some(net) = network_from_allowlist_key(allowlist) {
+        value["network"] = serde_json::to_value(net)?;
+    }
+    let req: LeaseRequest = serde_json::from_value(value)?;
     req.validate_mvp()?;
     Ok(req)
 }
@@ -527,16 +529,14 @@ mod tests {
     }
 
     #[test]
-    fn up_default_allowlist() {
+    fn up_omits_network_when_allowlist_unset() {
         let dir = tempfile::tempdir().unwrap();
         let server = Server::run();
         server.expect(
             Expectation::matching(all_of![
                 request::method_path("POST", "/v1/leases"),
                 request::body(json_decoded(|v: &serde_json::Value| {
-                    v["network"]["egress"] == "allowlist"
-                        && v["network"]["domains"]
-                            == json!(["github.com", "pypi.org", "registry.npmjs.org"])
+                    v.get("network").is_none()
                 })),
             ])
             .respond_with(json_encoded(sample_lease("active", None))),

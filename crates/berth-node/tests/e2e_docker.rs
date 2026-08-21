@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use berth_node::{FRAME_HEIGHT, FRAME_WIDTH, SessionManager};
 use berth_protocol::{
-    Action, ActionBatch, ActionBatchKind, Button, Class, Density, Isolation, LeaseRequest, License,
-    Os, Resources, Term, Workspace,
+    Action, ActionBatch, ActionBatchKind, Button, Class, Density, Egress, Isolation, LeaseRequest,
+    License, Network, Os, Resources, Term, Workspace,
 };
 
 fn e2e_enabled() -> bool {
@@ -252,4 +252,89 @@ async fn session_screenshot_and_workspace_persists() {
     let _ = Command::new("docker")
         .args(["volume", "rm", "-f", &volume])
         .status();
+}
+
+fn inspect_env(container: &str) -> Vec<String> {
+    let out = Command::new("docker")
+        .args(["inspect", container])
+        .output()
+        .expect("docker inspect");
+    assert!(
+        out.status.success(),
+        "docker inspect failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("inspect json");
+    v[0]["Config"]["Env"]
+        .as_array()
+        .expect("Env")
+        .iter()
+        .filter_map(|e| e.as_str().map(str::to_string))
+        .collect()
+}
+
+#[tokio::test]
+#[ignore = "requires Docker; BERTH_E2E=1 cargo test -p berth-node -- --ignored"]
+async fn empty_allowlist_denies_outbound() {
+    if !e2e_enabled() {
+        eprintln!("skipping: set BERTH_E2E=1 to run docker e2e");
+        return;
+    }
+
+    let manager = SessionManager::connect().expect("docker connect");
+    let ws = unique_ws();
+    let mut req = lease(&ws);
+    req.network = Some(Network {
+        egress: Egress::Allowlist,
+        domains: vec![],
+    });
+
+    let mut session = manager.start(&req).await.expect("start session");
+    let id = session.container_id().to_string();
+    let env = inspect_env(&id);
+    assert!(
+        env.iter().any(|e| e == "BERTH_ALLOWLIST="),
+        "expected empty BERTH_ALLOWLIST, got {env:?}"
+    );
+
+    let curl = Command::new("docker")
+        .args([
+            "exec",
+            "-u",
+            "berth",
+            &id,
+            "curl",
+            "-4",
+            "-sS",
+            "-m",
+            "5",
+            "--connect-timeout",
+            "3",
+            "-o",
+            "/dev/null",
+            "https://1.1.1.1",
+        ])
+        .output()
+        .expect("docker exec curl");
+    assert!(
+        !curl.status.success(),
+        "berth curl to 1.1.1.1:443 should fail under deny-all: stdout={} stderr={}",
+        String::from_utf8_lossy(&curl.stdout),
+        String::from_utf8_lossy(&curl.stderr)
+    );
+
+    let ipt = Command::new("docker")
+        .args([
+            "exec", "-u", "berth", &id, "iptables", "-P", "OUTPUT", "ACCEPT",
+        ])
+        .output()
+        .expect("docker exec iptables");
+    assert!(
+        !ipt.status.success(),
+        "berth must not be able to change OUTPUT policy: stdout={} stderr={}",
+        String::from_utf8_lossy(&ipt.stdout),
+        String::from_utf8_lossy(&ipt.stderr)
+    );
+
+    session.stop().await.expect("stop");
 }

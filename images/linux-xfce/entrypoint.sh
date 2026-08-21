@@ -92,7 +92,11 @@ EOF
     done
   fi
 
-  if command -v ip6tables >/dev/null 2>&1 && [ -d /proc/sys/net/ipv6 ]; then
+  if [ -d /proc/sys/net/ipv6 ]; then
+    command -v ip6tables >/dev/null 2>&1 || {
+      log "ipv6 is present but ip6tables is missing; refusing to start"
+      return 1
+    }
     ip6tables -F OUTPUT
     ip6tables -P OUTPUT DROP
     ip6tables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null \
@@ -111,13 +115,24 @@ EOF
   fi
 }
 
+output_policy_is_drop() {
+  iptables -S OUTPUT 2>/dev/null | grep -q -- '-P OUTPUT DROP'
+}
+
 if [ "$(id -u)" -eq 0 ]; then
   apply_egress
   command -v setpriv >/dev/null 2>&1 || {
     log "setpriv is missing; cannot drop to berth"
     exit 1
   }
-  exec setpriv --reuid=berth --regid=berth --init-groups --inh-caps=-all -- "$0" "$@"
+  export BERTH_EGRESS_OK=1
+  exec setpriv --reuid=berth --regid=berth --init-groups \
+    --inh-caps=-all --bounding-set=-all --ambient-caps=-all -- "$0" "$@"
+fi
+
+if [ "${BERTH_EGRESS_OK:-}" != 1 ] && ! output_policy_is_drop; then
+  log "not root and OUTPUT policy is not DROP; refusing to start without an egress filter"
+  exit 1
 fi
 
 mkdir -p "$XDG_RUNTIME_DIR" "$HOME" /workspace /tmp/.X11-unix

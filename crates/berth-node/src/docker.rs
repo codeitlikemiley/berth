@@ -17,15 +17,8 @@ pub const VIEWER_PORT: &str = "6080/tcp";
 const GIB: i64 = 1 << 30;
 const NANO: i64 = 1_000_000_000;
 const NAME_MAX: usize = 200;
-/// Caps needed to install the OUTPUT allowlist and then drop to `berth`.
-const GUEST_CAPS: [&str; 6] = [
-    "NET_ADMIN",
-    "NET_RAW",
-    "SETUID",
-    "SETGID",
-    "DAC_OVERRIDE",
-    "KILL",
-];
+/// Caps to install the OUTPUT allowlist, drop to `berth`, and clear the bounding set.
+const GUEST_CAPS: [&str; 4] = ["NET_ADMIN", "SETUID", "SETGID", "SETPCAP"];
 
 pub fn resolve_image(env_val: Option<&str>) -> String {
     env_val
@@ -221,6 +214,10 @@ pub fn assert_host_isolated(host: &HostConfig) {
         add.iter().any(|c| c.eq_ignore_ascii_case("NET_ADMIN")),
         "{add:?}"
     );
+    assert!(
+        add.iter().any(|c| c.eq_ignore_ascii_case("SETPCAP")),
+        "{add:?}"
+    );
     for c in add {
         let upper = c.to_ascii_uppercase();
         assert!(
@@ -353,7 +350,7 @@ mod tests {
             },
             "berth-ws-ws_1",
             "berth-net-s_1",
-            crate::allowlist::DEFAULT_ALLOWLIST,
+            berth_protocol::DEFAULT_ALLOWLIST,
         )
         .unwrap();
         let env = body.env.expect("env");

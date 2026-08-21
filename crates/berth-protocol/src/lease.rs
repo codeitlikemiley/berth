@@ -138,6 +138,62 @@ pub struct Network {
     pub domains: Vec<String>,
 }
 
+/// Default guest egress hosts. Unset `BERTH_ALLOWLIST` / omitted config key uses this.
+pub const DEFAULT_ALLOWLIST: &str = "github.com,pypi.org,registry.npmjs.org";
+
+/// Parse a comma-separated allowlist.
+///
+/// * `None` → default hosts
+/// * `Some("")` / whitespace → deny-all (no hosts)
+/// * anything else → sanitized hosts (invalid tokens dropped)
+pub fn parse_allowlist(raw: Option<&str>) -> Vec<String> {
+    match raw {
+        None => parse_allowlist_csv(DEFAULT_ALLOWLIST),
+        Some(s) => parse_allowlist_csv(s),
+    }
+}
+
+/// Config/CLI key: missing (`None`) means the node applies env/default.
+/// Present, including `""`, is sent as lease `network.domains`.
+pub fn network_from_allowlist_key(raw: Option<&str>) -> Option<Network> {
+    raw.map(|s| Network {
+        egress: Egress::Allowlist,
+        domains: parse_allowlist(Some(s)),
+    })
+}
+
+fn parse_allowlist_csv(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| valid_host(s))
+        .collect()
+}
+
+fn valid_host(s: &str) -> bool {
+    if s.is_empty() || s.len() > 253 {
+        return false;
+    }
+    if s.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        let mut n = 0;
+        for octet in s.split('.') {
+            n += 1;
+            if n > 4 || octet.parse::<u8>().is_err() {
+                return false;
+            }
+        }
+        return n == 4;
+    }
+    s.split('.').all(valid_dns_label)
+}
+
+fn valid_dns_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 63
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+        && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
 /// `POST /v1/leases` body. Extra spec fields are optional so MVP callers can
 /// send the subset; unknown keys are ignored so later adapters can grow.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -288,6 +288,7 @@ async fn lease_post_body_isolated_2_4_40() {
                     && v["resources"]["vcpu"] == 2
                     && v["resources"]["mem_gib"] == 4
                     && v["resources"]["disk_gib"] == 40
+                    && v.get("network").is_none()
                     && v.get("min_seconds").map(|m| m == 120).unwrap_or(false)
             })),
         ])
@@ -337,6 +338,34 @@ async fn seconds_below_60_ignored() {
     let result = mcp
         .call_tool("berth_lease", json!({ "os": "linux", "seconds": 30 }))
         .await;
+    assert!(!result.is_error, "{}", text_of(&result));
+}
+
+#[tokio::test]
+async fn lease_empty_allowlist_sends_deny_all_network() {
+    let (dir, _env) = home();
+    let server = Server::run();
+    server.expect(
+        Expectation::matching(all_of![
+            request::method_path("POST", "/v1/leases"),
+            request::body(json_decoded(|v: &Value| {
+                v["network"]["egress"] == "allowlist"
+                    && v["network"]["domains"]
+                        .as_array()
+                        .is_some_and(|d| d.is_empty())
+            })),
+        ])
+        .respond_with(json_encoded(sample_lease())),
+    );
+    let url = format!("http://{}", server.addr());
+    fs::create_dir_all(dir.path()).unwrap();
+    fs::write(
+        dir.path().join("config.toml"),
+        format!("allowlist = \"\"\n[nodes.default]\nurl = \"{url}\"\ntoken = \"{TOKEN}\"\n"),
+    )
+    .unwrap();
+    let mcp = Mcp::new(dir.path());
+    let result = mcp.call_tool("berth_lease", json!({ "os": "linux" })).await;
     assert!(!result.is_error, "{}", text_of(&result));
 }
 

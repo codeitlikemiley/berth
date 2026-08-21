@@ -13,8 +13,9 @@ pub use action::{
 };
 pub use coord::{Point, Region, scale_coordinates, scale_region};
 pub use lease::{
-    Class, Density, Egress, Isolation, Lease, LeaseRequest, License, MvpError, Network,
-    ObjectStore, Os, Resources, Term, Workspace, default_min_seconds, validate_mvp,
+    Class, DEFAULT_ALLOWLIST, Density, Egress, Isolation, Lease, LeaseRequest, License, MvpError,
+    Network, ObjectStore, Os, Resources, Term, Workspace, default_min_seconds,
+    network_from_allowlist_key, parse_allowlist, validate_mvp,
 };
 pub use quote::{
     DENSITY_MULT_ISOLATED, DENSITY_MULT_SHARED, OS_MULT_LINUX, P_CPU, P_DISK, P_MEM, Quote,

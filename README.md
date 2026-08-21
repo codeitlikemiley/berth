@@ -50,7 +50,8 @@ berth node up --tunnel cloudflare
 # laptop (or this Mac via the public URL — a phone hotspot is a valid test)
 berth pair --url https://<name>.trycloudflare.com --code ABCD-EFGH
 berth up --os linux
-berth view          # prints the noVNC URL; does not open a browser
+# berth view is only useful on the parked node (127.0.0.1); the tunnel does not
+# publish noVNC. Agents use berth mcp / the tunneled session WS.
 claude mcp add --transport stdio berth -- berth mcp
 berth end
 ```
@@ -96,7 +97,9 @@ to the guest, not the host desktop).
   # allowlist = ""   # deny all outbound
   ```
 
-  Or `BERTH_ALLOWLIST` on the node process (unset = default, empty = deny-all).
+  If the key is omitted, the node uses `BERTH_ALLOWLIST` (unset = default,
+  empty = deny-all). A present key (including `""`) is sent on the lease and
+  wins over the node env.
 - `vcpu` / `mem_gib` of `0` is rejected (not unlimited).
 
 `os=windows`, `os=macos`, and `class=mesh` return a clear error. They are not

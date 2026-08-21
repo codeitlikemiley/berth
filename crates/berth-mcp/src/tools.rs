@@ -1,4 +1,6 @@
-use berth_protocol::{Action, ActionBatch, ActionBatchKind, Button, LeaseRequest, Os};
+use berth_protocol::{
+    Action, ActionBatch, ActionBatchKind, Button, LeaseRequest, Os, network_from_allowlist_key,
+};
 
 use crate::client::NodeClient;
 use crate::config::{
@@ -45,7 +47,8 @@ impl Mcp {
                 .ok_or_else(|| Error::Usage("os is required".into()))?,
         )?;
         let seconds = optional_seconds(args);
-        let mut req = mvp_lease_request(os)?;
+        let cfg = Config::load(&self.home)?;
+        let mut req = mvp_lease_request(os, cfg.allowlist.as_deref())?;
         if let Some(seconds) = seconds
             && seconds >= 60
         {
@@ -53,7 +56,6 @@ impl Mcp {
         }
         req.validate_mvp()?;
 
-        let cfg = Config::load(&self.home)?;
         let node = cfg.node(DEFAULT_NODE)?;
         let client = NodeClient::new(&node.url, Some(&node.token))?;
         let lease = client.create_lease(&req).await?;
@@ -194,15 +196,19 @@ impl Mcp {
     }
 }
 
-fn mvp_lease_request(os: Os) -> Result<LeaseRequest> {
-    let req: LeaseRequest = serde_json::from_value(serde_json::json!({
+fn mvp_lease_request(os: Os, allowlist: Option<&str>) -> Result<LeaseRequest> {
+    let mut value = serde_json::json!({
         "os": os,
         "class": "private",
         "license": "linux",
         "density": "isolated",
         "term": "on_demand",
         "resources": { "vcpu": 2, "mem_gib": 4, "disk_gib": 40 }
-    }))?;
+    });
+    if let Some(net) = network_from_allowlist_key(allowlist) {
+        value["network"] = serde_json::to_value(net)?;
+    }
+    let req: LeaseRequest = serde_json::from_value(value)?;
     req.validate_mvp()?;
     Ok(req)
 }

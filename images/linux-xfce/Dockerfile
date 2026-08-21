@@ -80,6 +80,9 @@ RUN chmod 755 /usr/local/bin/entrypoint.sh /usr/local/bin/action.sh \
     && printf '%s\n' \
         '#!/bin/bash' \
         'set -euo pipefail' \
+        'if [ "$(id -u)" -eq 0 ]; then' \
+        '  exec setpriv --reuid=berth --regid=berth --init-groups --inh-caps=-all --bounding-set=-all --ambient-caps=-all -- "$0" "$@"' \
+        'fi' \
         'test -f /tmp/berth-ready' \
         'xdpyinfo -display :99 >/dev/null' \
         "bash -c 'echo >/dev/tcp/127.0.0.1/6080'" \

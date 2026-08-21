@@ -14,6 +14,9 @@ pub const DEFAULT_NODE: &str = "default";
 pub struct Config {
     #[serde(default)]
     pub nodes: BTreeMap<String, NodeConfig>,
+    /// Comma-separated egress hosts. Missing = node env/default. Empty = deny-all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowlist: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
