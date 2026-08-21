@@ -29,8 +29,10 @@ RUN apt-get update \
         tint2 \
         websockify \
         x11-utils \
+        x11-xserver-utils \
         x11vnc \
         xdotool \
+        xfonts-base \
         xterm \
         xvfb \
     && rm -rf /var/lib/apt/lists/* \
@@ -44,10 +46,14 @@ RUN apt-get update \
     && touch "/home/berth/.config/chromium/First Run" \
     && chown -R berth:berth /home/berth /workspace
 
-# Debian chromium dies in Docker without these flags.
+# Sourced by /usr/bin/chromium so desktop files and PATH both get Docker flags.
+# --no-sandbox is a Chromium argv, not a container privilege.
 RUN printf '%s\n' \
-    '#!/bin/sh' \
-    'exec /usr/bin/chromium --no-sandbox --disable-dev-shm-usage --disable-gpu --disable-software-rasterizer --no-first-run --disable-sync --password-store=basic --disable-features=TranslateUI "$@"' \
+    '# Guest Chromium has no user namespace / setuid sandbox.' \
+    'if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -f /tmp/berth-dbus.env ]; then . /tmp/berth-dbus.env; fi' \
+    'export CHROMIUM_FLAGS="$CHROMIUM_FLAGS --no-sandbox --no-first-run --disable-sync --password-store=basic --disable-gpu"' \
+    > /etc/chromium.d/berth-docker \
+    && printf '%s\n' '#!/bin/sh' 'exec /usr/bin/chromium "$@"' \
     > /usr/local/bin/chromium \
     && chmod +x /usr/local/bin/chromium \
     && ln -sf chromium /usr/local/bin/berth-chromium
@@ -60,21 +66,31 @@ RUN cat > /etc/xdg/openbox/menu.xml <<'EOF'
       <action name="Execute"><command>xterm</command></action>
     </item>
     <item label="Chromium">
-      <action name="Execute"><command>/usr/local/bin/chromium</command></action>
+      <action name="Execute"><command>/usr/bin/chromium</command></action>
     </item>
   </menu>
 </openbox_menu>
 EOF
+
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY scripts/action.sh /usr/local/bin/action.sh
 RUN chmod 755 /usr/local/bin/entrypoint.sh /usr/local/bin/action.sh \
     && ln -sf action.sh /usr/local/bin/driver \
+    && printf '%s\n' \
+        '#!/bin/bash' \
+        'set -euo pipefail' \
+        'test -f /tmp/berth-ready' \
+        'xdpyinfo -display :99 >/dev/null' \
+        "bash -c 'echo >/dev/tcp/127.0.0.1/6080'" \
+        > /usr/local/bin/berth-health \
+    && chmod 755 /usr/local/bin/berth-health \
     && cp /etc/xdg/openbox/menu.xml /home/berth/.config/openbox/menu.xml \
     && chown berth:berth /home/berth/.config/openbox/menu.xml
 
-EXPOSE 5900 6080
+# Viewer is noVNC on 6080; raw VNC is localhost-only inside the guest.
+EXPOSE 6080
 HEALTHCHECK --interval=10s --timeout=3s --start-period=12s --retries=5 \
-    CMD ["test", "-f", "/tmp/berth-ready"]
+    CMD ["/usr/local/bin/berth-health"]
 
 USER berth
 WORKDIR /workspace

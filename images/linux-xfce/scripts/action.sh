@@ -4,12 +4,14 @@ set -euo pipefail
 
 export DISPLAY="${DISPLAY:-:99}"
 
+SCROLL_MAX=40
+
 usage() {
   cat <<'EOF' >&2
 Usage: action.sh <command> [args]
   screenshot              write a PNG of DISPLAY to stdout
   click X Y [BUTTON]      BUTTON: left|right|middle|double (default left)
-  type [TEXT]             type TEXT, or stdin if TEXT is omitted
+  type TEXT               type TEXT (non-empty stdin if TEXT is omitted)
   key KEY [KEY...]        key chord (key ctrl s  |  key Return)
   scroll X Y DY           vertical ticks at X,Y (positive is down)
   scroll X Y DX DY        both axes
@@ -51,6 +53,30 @@ map_key() {
     DELETE|Delete|delete|DEL|Del)
       echo Delete
       ;;
+    ARROW_UP|ArrowUp|ARROWUP|Up)
+      echo Up
+      ;;
+    ARROW_DOWN|ArrowDown|ARROWDOWN|Down)
+      echo Down
+      ;;
+    ARROW_LEFT|ArrowLeft|ARROWLEFT|Left)
+      echo Left
+      ;;
+    ARROW_RIGHT|ArrowRight|ARROWRIGHT|Right)
+      echo Right
+      ;;
+    PAGE_UP|PageUp|PAGEUP|Page_Up)
+      echo Prior
+      ;;
+    PAGE_DOWN|PageDown|PAGEDOWN|Page_Down)
+      echo Next
+      ;;
+    HOME|Home)
+      echo Home
+      ;;
+    END|End)
+      echo End
+      ;;
     *)
       echo "$k"
       ;;
@@ -61,6 +87,17 @@ is_int() {
   [[ "${1:-}" =~ ^-?[0-9]+$ ]]
 }
 
+clamp_ticks() {
+  local n="$1"
+  if [ "$n" -gt "$SCROLL_MAX" ]; then
+    echo "$SCROLL_MAX"
+  elif [ "$n" -lt "$((-SCROLL_MAX))" ]; then
+    echo "$((-SCROLL_MAX))"
+  else
+    echo "$n"
+  fi
+}
+
 require_display() {
   if ! xdpyinfo >/dev/null 2>&1; then
     echo "action.sh: DISPLAY=${DISPLAY} is not available" >&2
@@ -69,16 +106,15 @@ require_display() {
 }
 
 cmd_screenshot() {
-  local tmp
-  tmp="$(mktemp /tmp/berth-shot.XXXXXX.png)"
-  # temp file so ImageMagick chatter cannot corrupt stdout PNG
-  if ! import -display "$DISPLAY" -silent -window root "png:$tmp"; then
-    rm -f "$tmp"
+  # Global so EXIT/PIPE traps can still see the path after this function returns.
+  _berth_shot="$(mktemp /tmp/berth-shot.XXXXXX.png)"
+  trap 'rm -f -- "${_berth_shot:-}"' EXIT
+  trap 'rm -f -- "${_berth_shot:-}"; exit 141' PIPE
+  if ! import -display "$DISPLAY" -silent -window root "png:${_berth_shot}"; then
     echo "action.sh: screenshot failed" >&2
     exit 1
   fi
-  cat "$tmp"
-  rm -f "$tmp"
+  cat "$_berth_shot"
 }
 
 cmd_click() {
@@ -92,7 +128,7 @@ cmd_click() {
     middle|2) b=2 ;;
     right|3) b=3 ;;
     double)
-      xdotool mousemove --sync "$x" "$y" click --repeat 2 --delay 50 1
+      xdotool mousemove --sync "$x" "$y" click --clearmodifiers --repeat 2 --delay 50 1
       return
       ;;
     *)
@@ -100,7 +136,7 @@ cmd_click() {
       exit 1
       ;;
   esac
-  xdotool mousemove --sync "$x" "$y" click "$b"
+  xdotool mousemove --sync "$x" "$y" click --clearmodifiers "$b"
 }
 
 cmd_type() {
@@ -111,6 +147,10 @@ cmd_type() {
       exit 1
     fi
     text="$(cat)"
+    if [ -z "$text" ]; then
+      echo "action.sh: type requires TEXT" >&2
+      exit 1
+    fi
   else
     text="$*"
   fi
@@ -121,7 +161,7 @@ cmd_type() {
   while [ -n "$text" ]; do
     chunk="${text:0:64}"
     text="${text:64}"
-    xdotool type --delay 12 -- "$chunk"
+    xdotool type --clearmodifiers --delay 12 -- "$chunk"
   done
 }
 
@@ -145,7 +185,7 @@ cmd_key() {
   fi
   local chord
   chord="$(IFS=+; echo "${mapped[*]}")"
-  xdotool key -- "$chord"
+  xdotool key --clearmodifiers -- "$chord"
 }
 
 cmd_scroll() {
@@ -168,16 +208,18 @@ cmd_scroll() {
     echo "action.sh: scroll ticks must be integers" >&2
     exit 1
   fi
+  dx="$(clamp_ticks "$dx")"
+  dy="$(clamp_ticks "$dy")"
   xdotool mousemove --sync "$x" "$y"
   if [ "$dy" -gt 0 ]; then
-    xdotool click --repeat "$dy" 5
+    xdotool click --clearmodifiers --repeat "$dy" --delay 20 5
   elif [ "$dy" -lt 0 ]; then
-    xdotool click --repeat "$((-dy))" 4
+    xdotool click --clearmodifiers --repeat "$((-dy))" --delay 20 4
   fi
   if [ "$dx" -gt 0 ]; then
-    xdotool click --repeat "$dx" 7
+    xdotool click --clearmodifiers --repeat "$dx" --delay 20 7
   elif [ "$dx" -lt 0 ]; then
-    xdotool click --repeat "$((-dx))" 6
+    xdotool click --clearmodifiers --repeat "$((-dx))" --delay 20 6
   fi
 }
 
