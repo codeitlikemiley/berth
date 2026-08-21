@@ -78,7 +78,7 @@ start_x11vnc() {
 }
 
 start_novnc() {
-  websockify --web=/usr/share/novnc 0.0.0.0:6080 localhost:5900 \
+  websockify --web=/usr/share/novnc 0.0.0.0:6080 127.0.0.1:5900 \
     >/tmp/novnc.log 2>&1 &
   novnc_pid=$!
 }
@@ -158,7 +158,6 @@ fi
 while alive "$xvfb_pid"; do
   alive "$openbox_pid" || { log "openbox died, restarting"; start_openbox; }
   alive "$tint2_pid" || { log "tint2 died, restarting"; start_tint2; }
-  alive "$xterm_pid" || { log "xterm died, restarting"; start_xterm; }
   alive "$x11vnc_pid" || { log "x11vnc died, restarting"; start_x11vnc; }
   alive "$novnc_pid" || { log "novnc died, restarting"; start_novnc; }
   sleep 2

@@ -2,7 +2,8 @@
 # Guest-side driver shim (xdotool + ImageMagick). Swap for Cua later.
 set -euo pipefail
 
-export DISPLAY="${DISPLAY:-:99}"
+# Always the guest Xvfb. Ignore inbound DISPLAY (docker exec Config.Env).
+export DISPLAY=:99
 
 SCROLL_MAX=40
 
