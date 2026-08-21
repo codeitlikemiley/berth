@@ -1,21 +1,25 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use axum::Json;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as UrlPath, Request, State};
-use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
+use axum::http::header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, HOST};
+use axum::http::{HeaderMap, HeaderName, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Router, middleware};
-use berth_protocol::{ActionBatch, LeaseRequest, Quote};
+use berth_protocol::{ActionBatch, LeaseRequest, Quote, parse_allowlist};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
 use crate::db::{Db, LeaseRow, NewLease};
+use crate::docker::image_from_env;
 use crate::error::{Error, Result};
 use crate::guest::{Guest, GuestMode};
 use crate::id::{new_id, u64_from_i64};
@@ -24,6 +28,7 @@ use crate::tunnel::{self, TunnelKind};
 
 /// Container sessions boot in seconds; MATH.md isolated-VM 300s floor does not apply.
 const CONTAINER_MIN_SECONDS: u64 = 60;
+const LIST_LEASES_MAX: usize = 500;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -32,12 +37,16 @@ pub struct AppState {
 
 struct Inner {
     db: Db,
+    data_dir: PathBuf,
     bind: Mutex<SocketAddr>,
     origin: Mutex<Option<String>>,
     live: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<Guest>>>>,
     docker: tokio::sync::Mutex<Option<SessionManager>>,
     mode: GuestMode,
     shutting_down: watch::Sender<bool>,
+    tunnel_cf: AtomicBool,
+    tunnel_named: AtomicBool,
+    tunnel_alive: AtomicBool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,10 +61,21 @@ pub struct LeaseView {
     pub billable_seconds: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub elapsed_seconds: Option<u64>,
+    pub started_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stopped_at: Option<i64>,
+    pub workspace_id: String,
+    pub live: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct LeaseList {
+    leases: Vec<LeaseView>,
+    truncated: bool,
 }
 
 impl LeaseView {
-    fn from_row(row: &LeaseRow, origin: Option<&str>) -> Result<Self> {
+    fn from_row(row: &LeaseRow, origin: Option<&str>, live: bool) -> Result<Self> {
         let quote: Quote = serde_json::from_str(&row.quote_json)?;
         Ok(Self {
             lease_id: row.id.clone(),
@@ -66,6 +86,10 @@ impl LeaseView {
             status: row.status.clone(),
             billable_seconds: row.billable_seconds.map(u64_from_i64),
             elapsed_seconds: row.elapsed_seconds.map(u64_from_i64),
+            started_at: row.started_at,
+            stopped_at: row.stopped_at,
+            workspace_id: row.workspace_id.clone(),
+            live,
         })
     }
 }
@@ -83,16 +107,25 @@ impl AppState {
     fn open_mode(db_path: &Path, bind: SocketAddr, mode: GuestMode) -> Result<Self> {
         let db = Db::open(db_path)?;
         db.ensure_pairing_code()?;
+        let data_dir = db_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .to_path_buf();
         let (shutting_down, _) = watch::channel(false);
         Ok(Self {
             inner: Arc::new(Inner {
                 db,
+                data_dir,
                 bind: Mutex::new(bind),
                 origin: Mutex::new(None),
                 live: tokio::sync::Mutex::new(HashMap::new()),
                 docker: tokio::sync::Mutex::new(None),
                 mode,
                 shutting_down,
+                tunnel_cf: AtomicBool::new(false),
+                tunnel_named: AtomicBool::new(false),
+                tunnel_alive: AtomicBool::new(false),
             }),
         })
     }
@@ -183,9 +216,11 @@ pub fn default_db_path() -> Result<PathBuf> {
 
 pub fn router(state: AppState) -> Router {
     let authed = Router::new()
-        .route("/v1/leases", post(create_lease))
+        .route("/v1/leases", get(list_leases).post(create_lease))
         .route("/v1/leases/{id}", get(get_lease).delete(delete_lease))
+        .route("/v1/node", get(get_node))
         .route("/v1/sessions/{id}", get(session_ws))
+        .route("/v1/sessions/{id}/preview", get(session_preview))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -194,7 +229,9 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/pair", post(pair))
+        .route("/v1/pairing", get(get_pairing))
         .merge(authed)
+        .layer(middleware::from_fn(access_log))
         .with_state(state)
 }
 
@@ -217,10 +254,16 @@ pub async fn serve(bind: SocketAddr, tunnel: Option<TunnelKind>) -> Result<()> {
     eprintln!("listening on {actual}");
     let tunnel_child = match tunnel {
         Some(TunnelKind::Cloudflare) => {
+            let named = std::env::var("TUNNEL_TOKEN")
+                .ok()
+                .is_some_and(|s| !s.trim().is_empty());
             let (child, origin) = tunnel::start_cloudflare(actual).await?;
             if let Some(origin) = origin {
                 state.set_origin(origin);
             }
+            state.inner.tunnel_named.store(named, Ordering::Relaxed);
+            state.inner.tunnel_cf.store(true, Ordering::Relaxed);
+            state.inner.tunnel_alive.store(true, Ordering::Relaxed);
             Some(child)
         }
         None => None,
@@ -252,6 +295,10 @@ async fn shutdown_on_signal_or_tunnel(
                     Ok(st) => eprintln!("cloudflared exited ({st}); shutting down"),
                     Err(err) => eprintln!("cloudflared wait failed: {err}; shutting down"),
                 }
+                shutdown_state
+                    .inner
+                    .tunnel_alive
+                    .store(false, Ordering::Relaxed);
                 shutdown_state.begin_shutdown();
                 return;
             }
@@ -301,7 +348,7 @@ impl IntoResponse for Error {
             Error::Mvp(_) | Error::InvalidResources | Error::BadRequest(_) => {
                 StatusCode::BAD_REQUEST
             }
-            Error::Stopped => StatusCode::CONFLICT,
+            Error::Stopped | Error::TooManyBearers => StatusCode::CONFLICT,
             Error::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -339,6 +386,8 @@ async fn healthz() -> Json<serde_json::Value> {
 #[derive(Debug, Deserialize)]
 struct PairRequest {
     code: String,
+    #[serde(default)]
+    revoke_others: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -353,8 +402,26 @@ async fn pair(
     if !state.inner.db.check_pair_code(&body.code)? {
         return Err(Error::Unauthorized);
     }
-    let token = state.inner.db.issue_bearer()?;
+    let token = state.inner.db.issue_bearer(body.revoke_others)?;
     Ok(Json(PairResponse { token }))
+}
+
+async fn get_pairing(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<PairingView>> {
+    let origin = state.origin();
+    if !loopback_operator(&headers, origin.as_deref()) {
+        return Err(Error::NotFound);
+    }
+    Ok(Json(PairingView {
+        code: state.pairing_code()?,
+    }))
+}
+
+#[derive(Debug, Serialize)]
+struct PairingView {
+    code: String,
 }
 
 async fn create_lease(
@@ -387,8 +454,8 @@ async fn create_lease(
         workspace_id,
         request_json: serde_json::to_string(&req)?,
         quote_json: serde_json::to_string(&quote)?,
-        ws_url: ws_url.clone(),
-        viewer_url: viewer_url.clone(),
+        ws_url,
+        viewer_url,
         min_seconds: quote.min_seconds,
         viewer_port,
         container_id,
@@ -397,26 +464,29 @@ async fn create_lease(
         let _ = guest.stop().await;
         return Err(err);
     }
-    print_quote(&lease_id, &quote);
     state
         .inner
         .live
         .lock()
         .await
-        .insert(session_id.clone(), Arc::new(tokio::sync::Mutex::new(guest)));
-    Ok((
-        StatusCode::CREATED,
-        Json(LeaseView {
-            lease_id,
-            session_id,
-            ws_url,
-            viewer_url,
-            quote,
-            status: "active".into(),
-            billable_seconds: None,
-            elapsed_seconds: None,
-        }),
-    ))
+        .insert(session_id, Arc::new(tokio::sync::Mutex::new(guest)));
+    let row = state.inner.db.get_lease(&lease_id)?;
+    let view = LeaseView::from_row(&row, origin.as_deref(), true)?;
+    print_quote(&lease_id, &quote);
+    Ok((StatusCode::CREATED, Json(view)))
+}
+
+async fn list_leases(State(state): State<AppState>) -> Result<Json<LeaseList>> {
+    let rows = state.inner.db.list_leases()?;
+    let truncated = rows.len() > LIST_LEASES_MAX;
+    let origin = state.origin();
+    let live = state.inner.live.lock().await;
+    let leases = rows
+        .iter()
+        .take(LIST_LEASES_MAX)
+        .map(|row| LeaseView::from_row(row, origin.as_deref(), live.contains_key(&row.session_id)))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Json(LeaseList { leases, truncated }))
 }
 
 async fn get_lease(
@@ -424,7 +494,15 @@ async fn get_lease(
     UrlPath(id): UrlPath<String>,
 ) -> Result<Json<LeaseView>> {
     let row = state.inner.db.get_lease(&id)?;
-    Ok(Json(LeaseView::from_row(&row, state.origin().as_deref())?))
+    let live = {
+        let live = state.inner.live.lock().await;
+        live.contains_key(&row.session_id)
+    };
+    Ok(Json(LeaseView::from_row(
+        &row,
+        state.origin().as_deref(),
+        live,
+    )?))
 }
 
 async fn delete_lease(
@@ -447,7 +525,15 @@ async fn delete_lease(
         state.inner.live.lock().await.remove(&row.session_id);
     }
     let row = state.inner.db.stop_lease(&id)?;
-    Ok(Json(LeaseView::from_row(&row, state.origin().as_deref())?))
+    let live = {
+        let live = state.inner.live.lock().await;
+        live.contains_key(&row.session_id)
+    };
+    Ok(Json(LeaseView::from_row(
+        &row,
+        state.origin().as_deref(),
+        live,
+    )?))
 }
 
 async fn session_ws(
@@ -462,6 +548,100 @@ async fn session_ws(
         }
     }
     Ok(ws.on_upgrade(move |socket| ws_loop(socket, id, state)))
+}
+
+async fn session_preview(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+) -> Result<Response> {
+    let handle = {
+        let live = state.inner.live.lock().await;
+        live.get(&id).cloned()
+    };
+    let Some(handle) = handle else {
+        return Err(Error::NotFound);
+    };
+    let png = {
+        let guest = handle.lock().await;
+        guest.last_frame().map(|frame| frame.data.clone())
+    };
+    match png {
+        None => Ok(StatusCode::NO_CONTENT.into_response()),
+        Some(data) => Ok((
+            [
+                (CONTENT_TYPE, "image/png"),
+                (CACHE_CONTROL, "private, no-store"),
+                (HeaderName::from_static("x-content-type-options"), "nosniff"),
+            ],
+            data,
+        )
+            .into_response()),
+    }
+}
+
+async fn get_node(State(state): State<AppState>) -> Result<Json<NodeView>> {
+    let (docker, guest_image) = probe_docker_and_image(state.inner.mode).await;
+    let home_writable = home_writable(&state.inner.data_dir);
+    let (allowlist, allowlist_source) = node_allowlist();
+    let live_sessions = state.inner.live.lock().await.len();
+    let origin = state.origin();
+    Ok(Json(NodeView {
+        ok: docker.ok && guest_image.ok && home_writable,
+        bind: state.inner.bind.lock().expect("bind lock").to_string(),
+        origin,
+        class: "private",
+        image: image_from_env(),
+        allowlist,
+        allowlist_source,
+        docker,
+        guest_image,
+        home_writable,
+        tunnel: tunnel_view(&state),
+        active_bearers: state.inner.db.active_bearers()?,
+        live_sessions,
+        shutting_down: state.is_shutting_down(),
+        host_desktop_driven: false,
+    }))
+}
+
+#[derive(Debug, Serialize)]
+struct NodeView {
+    ok: bool,
+    bind: String,
+    origin: Option<String>,
+    class: &'static str,
+    image: String,
+    allowlist: Vec<String>,
+    allowlist_source: &'static str,
+    docker: DockerProbe,
+    guest_image: GuestImageProbe,
+    home_writable: bool,
+    tunnel: TunnelView,
+    active_bearers: u64,
+    live_sessions: usize,
+    shutting_down: bool,
+    host_desktop_driven: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct DockerProbe {
+    ok: bool,
+    detail: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GuestImageProbe {
+    ok: bool,
+    name: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind")]
+enum TunnelView {
+    #[serde(rename = "none")]
+    None,
+    #[serde(rename = "cloudflare")]
+    Cloudflare { named: bool, child_alive: bool },
 }
 
 async fn ws_loop(mut socket: WebSocket, session_id: String, state: AppState) {
@@ -586,6 +766,147 @@ fn session_ws_url_origin(origin: &str, session_id: &str) -> String {
     format!("{ws}/v1/sessions/{session_id}")
 }
 
+fn format_access_log(method: &str, path: &str, status: u16, ms: u64) -> String {
+    format!("{method} {path} {status} {ms}ms")
+}
+
+async fn access_log(req: Request, next: Next) -> Response {
+    let method = req.method().as_str().to_owned();
+    let path = req.uri().path().to_owned();
+    let started = Instant::now();
+    let res = next.run(req).await;
+    let ms = started.elapsed().as_millis() as u64;
+    eprintln!(
+        "{}",
+        format_access_log(&method, &path, res.status().as_u16(), ms)
+    );
+    res
+}
+
+fn hostname_from_host(host: &str) -> &str {
+    let host = host.trim();
+    if let Some(rest) = host.strip_prefix('[')
+        && let Some(end) = rest.find(']')
+    {
+        return &rest[..end];
+    }
+    if host.parse::<IpAddr>().is_ok() {
+        return host;
+    }
+    match host.rsplit_once(':') {
+        Some((name, port)) if !name.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => name,
+        _ => host,
+    }
+}
+
+fn host_is_loopback(host: &str) -> bool {
+    let host = hostname_from_host(host);
+    host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost") || host == "::1"
+}
+
+fn has_cdn_header(headers: &HeaderMap) -> bool {
+    headers.keys().any(|name| {
+        let n = name.as_str();
+        n.eq_ignore_ascii_case("cf-ray")
+            || n.eq_ignore_ascii_case("cf-connecting-ip")
+            || n.eq_ignore_ascii_case("cdn-loop")
+    })
+}
+
+fn origin_hostname(origin: &str) -> &str {
+    let rest = origin
+        .strip_prefix("https://")
+        .or_else(|| origin.strip_prefix("http://"))
+        .unwrap_or(origin);
+    hostname_from_host(rest.split('/').next().unwrap_or(rest))
+}
+
+fn loopback_operator(headers: &HeaderMap, origin: Option<&str>) -> bool {
+    let Some(host) = headers.get(HOST).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    if !host_is_loopback(host) {
+        return false;
+    }
+    if has_cdn_header(headers) {
+        return false;
+    }
+    if let Some(origin) = origin
+        && hostname_from_host(host).eq_ignore_ascii_case(origin_hostname(origin))
+    {
+        return false;
+    }
+    true
+}
+
+fn node_allowlist() -> (Vec<String>, &'static str) {
+    match std::env::var("BERTH_ALLOWLIST") {
+        Err(_) => (parse_allowlist(None), "default"),
+        Ok(raw) => {
+            let list = parse_allowlist(Some(&raw));
+            if list.is_empty() {
+                (list, "deny-all")
+            } else {
+                (list, "env")
+            }
+        }
+    }
+}
+
+fn home_writable(dir: &Path) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(format!(".node-write.{}", std::process::id()));
+    let ok = std::fs::write(&probe, b"ok\n").is_ok();
+    let _ = std::fs::remove_file(&probe);
+    ok
+}
+
+fn tunnel_view(state: &AppState) -> TunnelView {
+    if !state.inner.tunnel_cf.load(Ordering::Relaxed) {
+        return TunnelView::None;
+    }
+    TunnelView::Cloudflare {
+        named: state.inner.tunnel_named.load(Ordering::Relaxed),
+        child_alive: state.inner.tunnel_alive.load(Ordering::Relaxed),
+    }
+}
+
+async fn probe_docker_and_image(mode: GuestMode) -> (DockerProbe, GuestImageProbe) {
+    let name = image_from_env();
+    match mode {
+        #[cfg(test)]
+        GuestMode::Stub => (
+            DockerProbe {
+                ok: true,
+                detail: "bollard ping ok".into(),
+            },
+            GuestImageProbe { ok: true, name },
+        ),
+        GuestMode::Docker => match bollard::Docker::connect_with_local_defaults() {
+            Ok(docker) => {
+                let (ok, detail) = match docker.ping().await {
+                    Ok(_) => (true, "bollard ping ok".into()),
+                    Err(err) => (false, format!("bollard ping failed: {err}")),
+                };
+                let image_ok = docker.inspect_image(&name).await.is_ok();
+                (
+                    DockerProbe { ok, detail },
+                    GuestImageProbe { ok: image_ok, name },
+                )
+            }
+            Err(err) => (
+                DockerProbe {
+                    ok: false,
+                    detail: format!("docker not reachable: {err}"),
+                },
+                GuestImageProbe { ok: false, name },
+            ),
+        },
+    }
+}
+
 fn print_quote(lease_id: &str, quote: &Quote) {
     let usd = quote
         .usd_per_second()
@@ -667,7 +988,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pair_issues_bearer_and_rotates() {
+    async fn pair_issues_bearer_and_keeps_previous() {
         let (_dir, state) = test_state();
         let code = state.pairing_code().unwrap();
         let app = router(state);
@@ -689,6 +1010,61 @@ mod tests {
         let t1 = pair_token(&app, &code).await;
         assert!(t1.starts_with("brt_"));
         let t2 = pair_token(&app, &code).await;
+        assert_ne!(t1, t2);
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/leases/l_missing")
+                    .header("authorization", format!("Bearer {t1}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::NOT_FOUND);
+
+        let second = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/leases/l_missing")
+                    .header("authorization", format!("Bearer {t2}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::NOT_FOUND);
+    }
+
+    async fn pair_token_revoke(app: &Router, code: &str) -> String {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/pair")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"code":"{code}","revoke_others":true}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json = body_json(res).await;
+        json["token"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn pair_revoke_others_invalidates_previous() {
+        let (_dir, state) = test_state();
+        let code = state.pairing_code().unwrap();
+        let app = router(state);
+        let t1 = pair_token(&app, &code).await;
+        let t2 = pair_token_revoke(&app, &code).await;
         assert_ne!(t1, t2);
 
         let stale = app
@@ -715,6 +1091,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn pair_ninth_without_revoke_is_conflict() {
+        let (_dir, state) = test_state();
+        let code = state.pairing_code().unwrap();
+        let app = router(state);
+        for _ in 0..8 {
+            let _ = pair_token(&app, &code).await;
+        }
+        let ninth = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/pair")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(r#"{{"code":"{code}"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ninth.status(), StatusCode::CONFLICT);
+        let json = body_json(ninth).await;
+        let err = json["error"].as_str().unwrap();
+        assert!(err.contains("too many paired clients"), "{err}");
+        assert!(err.contains("revoke_others"), "{err}");
+
+        let rotated = pair_token_revoke(&app, &code).await;
+        assert!(rotated.starts_with("brt_"));
     }
 
     #[tokio::test]
@@ -882,6 +1288,14 @@ mod tests {
         assert_eq!(lease["quote"]["min_seconds"], 60);
         assert_eq!(lease["quote"]["density_mult"], 1.0);
         assert_eq!(lease["status"], "active");
+        assert_eq!(lease["live"], true);
+        assert!(lease["started_at"].as_i64().unwrap() > 0);
+        assert!(
+            lease["workspace_id"].as_str().unwrap().starts_with("ws_"),
+            "{}",
+            lease["workspace_id"]
+        );
+        assert!(lease.get("stopped_at").is_none() || lease["stopped_at"].is_null());
         assert!(lease.get("billable_seconds").is_none() || lease["billable_seconds"].is_null());
 
         let batch = ActionBatch {
@@ -912,6 +1326,8 @@ mod tests {
         let stopped = body_json(deleted).await;
         assert_eq!(stopped["status"], "stopped");
         assert_eq!(stopped["billable_seconds"], 60);
+        assert_eq!(stopped["live"], false);
+        assert!(stopped["stopped_at"].as_i64().unwrap() > 0);
 
         let got = app
             .oneshot(
@@ -926,6 +1342,7 @@ mod tests {
         assert_eq!(got.status(), StatusCode::OK);
         let json = body_json(got).await;
         assert_eq!(json["billable_seconds"], 60);
+        assert_eq!(json["live"], false);
     }
 
     #[tokio::test]
@@ -1212,5 +1629,392 @@ mod tests {
             .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("loopback"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn get_leases_require_bearer() {
+        let (_dir, state) = test_state();
+        let app = router(state);
+        let list = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/leases")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list.status(), StatusCode::UNAUTHORIZED);
+        let one = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/leases/l_missing")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(one.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    async fn create_sample_lease(app: &Router, token: &str) -> serde_json::Value {
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/leases")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(sample_lease().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        body_json(created).await
+    }
+
+    #[tokio::test]
+    async fn list_leases_empty_one_stopped() {
+        let (_dir, state) = test_state();
+        let code = state.pairing_code().unwrap();
+        let app = router(state);
+        let token = pair_token(&app, &code).await;
+
+        let empty = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/leases")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(empty.status(), StatusCode::OK);
+        let json = body_json(empty).await;
+        assert_eq!(json["leases"].as_array().unwrap().len(), 0);
+        assert_eq!(json["truncated"], false);
+
+        let lease = create_sample_lease(&app, &token).await;
+        let lease_id = lease["lease_id"].as_str().unwrap();
+        assert_eq!(lease["live"], true);
+        assert!(lease["started_at"].as_i64().unwrap() > 0);
+
+        let one = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/leases")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_json(one).await;
+        assert_eq!(json["leases"].as_array().unwrap().len(), 1);
+        assert_eq!(json["truncated"], false);
+        assert_eq!(json["leases"][0]["lease_id"], lease_id);
+        assert_eq!(json["leases"][0]["live"], true);
+        assert!(
+            json["leases"][0].get("stopped_at").is_none()
+                || json["leases"][0]["stopped_at"].is_null()
+        );
+
+        let deleted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/v1/leases/{lease_id}"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::OK);
+
+        let stopped = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/leases")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_json(stopped).await;
+        assert_eq!(json["leases"].as_array().unwrap().len(), 1);
+        assert_eq!(json["leases"][0]["status"], "stopped");
+        assert_eq!(json["leases"][0]["live"], false);
+        assert!(json["leases"][0]["stopped_at"].as_i64().unwrap() > 0);
+        assert_eq!(json["truncated"], false);
+    }
+
+    #[test]
+    fn access_log_format_has_no_secrets() {
+        let line = format_access_log("GET", "/v1/pairing", 200, 3);
+        assert_eq!(line, "GET /v1/pairing 200 3ms");
+        assert!(!line.contains("ABCD"));
+        assert!(!line.contains("brt_"));
+    }
+
+    #[test]
+    fn host_is_loopback_strips_port() {
+        assert!(host_is_loopback("127.0.0.1:7432"));
+        assert!(host_is_loopback("localhost:7432"));
+        assert!(host_is_loopback("[::1]:7432"));
+        assert!(host_is_loopback("::1"));
+        assert!(!host_is_loopback("random-words-here.trycloudflare.com"));
+    }
+
+    #[tokio::test]
+    async fn pairing_loopback_operator_table() {
+        struct Case {
+            name: &'static str,
+            host: &'static str,
+            extra: &'static [(&'static str, &'static str)],
+            origin: Option<&'static str>,
+            ok: bool,
+        }
+        let cases = [
+            Case {
+                name: "loopback ipv4",
+                host: "127.0.0.1:7432",
+                extra: &[],
+                origin: None,
+                ok: true,
+            },
+            Case {
+                name: "localhost",
+                host: "localhost:7432",
+                extra: &[],
+                origin: None,
+                ok: true,
+            },
+            Case {
+                name: "ipv6 loopback",
+                host: "[::1]:7432",
+                extra: &[],
+                origin: None,
+                ok: true,
+            },
+            Case {
+                name: "cf-ray",
+                host: "127.0.0.1:7432",
+                extra: &[("Cf-Ray", "1")],
+                origin: None,
+                ok: false,
+            },
+            Case {
+                name: "cf-connecting-ip",
+                host: "127.0.0.1:7432",
+                extra: &[("CF-Connecting-IP", "1.2.3.4")],
+                origin: None,
+                ok: false,
+            },
+            Case {
+                name: "cdn-loop",
+                host: "127.0.0.1:7432",
+                extra: &[("CDN-Loop", "cloudflare")],
+                origin: None,
+                ok: false,
+            },
+            Case {
+                name: "tunnel host with origin",
+                host: "random-words-here.trycloudflare.com",
+                extra: &[],
+                origin: Some("https://random-words-here.trycloudflare.com"),
+                ok: false,
+            },
+            Case {
+                name: "loopback with tunnel origin",
+                host: "127.0.0.1:7432",
+                extra: &[],
+                origin: Some("https://random-words-here.trycloudflare.com"),
+                ok: true,
+            },
+            Case {
+                name: "tunnel host without origin",
+                host: "random-words-here.trycloudflare.com",
+                extra: &[],
+                origin: None,
+                ok: false,
+            },
+        ];
+        for case in cases {
+            let (_dir, state) = test_state();
+            if let Some(origin) = case.origin {
+                state.set_origin(origin.to_string());
+            }
+            let code = state.pairing_code().unwrap();
+            let app = router(state);
+            let mut builder = Request::builder()
+                .uri("/v1/pairing")
+                .header("host", case.host);
+            for (k, v) in case.extra {
+                builder = builder.header(*k, *v);
+            }
+            let res = app
+                .oneshot(builder.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            if case.ok {
+                assert_eq!(res.status(), StatusCode::OK, "{}", case.name);
+                let json = body_json(res).await;
+                assert_eq!(json["code"], code, "{}", case.name);
+            } else {
+                assert_eq!(res.status(), StatusCode::NOT_FOUND, "{}", case.name);
+                let json = body_json(res).await;
+                assert_eq!(json["error"], "not found", "{}", case.name);
+                assert!(!json.to_string().contains(&code), "{}", case.name);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn node_requires_bearer_and_healthy_stub_has_ok() {
+        let (_dir, state) = test_state();
+        let code = state.pairing_code().unwrap();
+        let app = router(state);
+        let unauth = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/node")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+        let token = pair_token(&app, &code).await;
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/node")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(!body.contains("brt_"), "{body}");
+        assert!(!body.contains(&code), "{body}");
+        assert!(!body.contains("TUNNEL_TOKEN"), "{body}");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["bind"], "127.0.0.1:7432");
+        assert!(json["origin"].is_null());
+        assert_eq!(json["class"], "private");
+        assert_eq!(json["image"], image_from_env());
+        assert_eq!(json["docker"]["ok"], true);
+        assert_eq!(json["docker"]["detail"], "bollard ping ok");
+        assert_eq!(json["guest_image"]["ok"], true);
+        assert_eq!(json["guest_image"]["name"], image_from_env());
+        assert_eq!(json["home_writable"], true);
+        assert_eq!(json["tunnel"]["kind"], "none");
+        assert_eq!(json["active_bearers"], 1);
+        assert_eq!(json["live_sessions"], 0);
+        assert_eq!(json["shutting_down"], false);
+        assert_eq!(json["host_desktop_driven"], false);
+        assert!(json.get("parked").is_none());
+        let src = json["allowlist_source"].as_str().unwrap();
+        assert!(matches!(src, "default" | "env" | "deny-all"), "{src}");
+        assert!(json["allowlist"].is_array());
+    }
+
+    #[tokio::test]
+    async fn session_preview_png_204_and_404() {
+        let (_dir, state) = test_state();
+        let code = state.pairing_code().unwrap();
+        let app = router(state.clone());
+        let token = pair_token(&app, &code).await;
+        let lease = create_sample_lease(&app, &token).await;
+        let session_id = lease["session_id"].as_str().unwrap().to_string();
+        let lease_id = lease["lease_id"].as_str().unwrap().to_string();
+
+        let empty = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/sessions/{session_id}/preview"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(empty.status(), StatusCode::NO_CONTENT);
+
+        let batch = ActionBatch {
+            kind: ActionBatchKind::Actions,
+            id: "a_preview".into(),
+            session_id: session_id.clone(),
+            items: vec![Action::Screenshot {}],
+        };
+        run_session_batch(&state, &session_id, batch).await.unwrap();
+
+        let png = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/sessions/{session_id}/preview"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(png.status(), StatusCode::OK);
+        assert_eq!(png.headers().get(CONTENT_TYPE).unwrap(), "image/png");
+        assert_eq!(
+            png.headers().get(CACHE_CONTROL).unwrap(),
+            "private, no-store"
+        );
+        assert_eq!(
+            png.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+        let bytes = png.into_body().collect().await.unwrap().to_bytes();
+        assert!(bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]));
+
+        let deleted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/v1/leases/{lease_id}"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::OK);
+
+        let gone = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/sessions/{session_id}/preview"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(gone.status(), StatusCode::NOT_FOUND);
+        let json = body_json(gone).await;
+        assert_eq!(json["error"], "not found");
     }
 }

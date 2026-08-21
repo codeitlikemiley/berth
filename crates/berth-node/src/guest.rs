@@ -1,4 +1,4 @@
-use berth_protocol::{ActionBatch, LeaseRequest};
+use berth_protocol::{ActionBatch, Frame, LeaseRequest};
 
 use crate::error::Result;
 use crate::session::{ExecOutput, Session, SessionManager};
@@ -22,6 +22,7 @@ pub(crate) struct StubSession {
     workspace_id: String,
     viewer_port: Option<u16>,
     stopped: bool,
+    last_frame: Option<Frame>,
 }
 
 impl Guest {
@@ -78,6 +79,14 @@ impl Guest {
         }
     }
 
+    pub(crate) fn last_frame(&self) -> Option<&Frame> {
+        match self {
+            Self::Docker(s) => s.last_frame(),
+            #[cfg(test)]
+            Self::Stub(s) => s.last_frame.as_ref(),
+        }
+    }
+
     pub(crate) async fn exec(&mut self, batch: ActionBatch) -> Result<ExecOutput> {
         match self {
             Self::Docker(s) => s.exec(batch).await,
@@ -125,6 +134,7 @@ mod stub {
                 workspace_id: workspace_id_from_req(req),
                 viewer_port: Some(6080),
                 stopped: false,
+                last_frame: None,
             })
         }
 
@@ -155,6 +165,7 @@ mod stub {
                                 data: TINY_PNG.to_vec(),
                                 cursor: None,
                             };
+                            self.last_frame = Some(frame.clone());
                             frames.push(frame);
                             true
                         } else {

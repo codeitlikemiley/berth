@@ -55,9 +55,12 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 "#;
 
+const MAX_BEARERS: i64 = 8;
+
 const LEASE_SELECT: &str = "SELECT leases.id, leases.session_id, leases.status, leases.quote_json,
         leases.ws_url, leases.viewer_url, leases.started_at, leases.min_seconds,
-        leases.elapsed_seconds, leases.billable_seconds, sessions.container_id
+        leases.elapsed_seconds, leases.billable_seconds, sessions.container_id,
+        leases.stopped_at, leases.workspace_id
  FROM leases
  LEFT JOIN sessions ON sessions.id = leases.session_id";
 
@@ -83,6 +86,8 @@ pub(crate) struct LeaseRow {
     pub elapsed_seconds: Option<i64>,
     pub billable_seconds: Option<i64>,
     pub container_id: Option<String>,
+    pub stopped_at: Option<i64>,
+    pub workspace_id: String,
 }
 
 pub(crate) struct NewLease {
@@ -227,18 +232,29 @@ impl Db {
         Ok(found.is_some())
     }
 
-    /// Rotate: revoke existing bearer tokens, issue a new one. Returns plaintext once.
-    pub(crate) fn issue_bearer(&self) -> Result<String> {
+    pub(crate) fn issue_bearer(&self, revoke_others: bool) -> Result<String> {
         let token = random_bearer()?;
         let hash = sha256_hex(&token);
         let now = unix_now();
         let mut conn = self.lock();
         let tx = conn.transaction()?;
-        tx.execute(
-            "UPDATE pair_tokens SET revoked_at = ?1
-             WHERE kind = 'bearer' AND revoked_at IS NULL",
-            params![now],
-        )?;
+        if revoke_others {
+            tx.execute(
+                "UPDATE pair_tokens SET revoked_at = ?1
+                 WHERE kind = 'bearer' AND revoked_at IS NULL",
+                params![now],
+            )?;
+        } else {
+            let n: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM pair_tokens
+                 WHERE kind = 'bearer' AND revoked_at IS NULL",
+                [],
+                |row| row.get(0),
+            )?;
+            if n >= MAX_BEARERS {
+                return Err(Error::TooManyBearers);
+            }
+        }
         tx.execute(
             "INSERT INTO pair_tokens (kind, secret, secret_hash, created_at)
              VALUES ('bearer', '', ?1, ?2)",
@@ -246,6 +262,16 @@ impl Db {
         )?;
         tx.commit()?;
         Ok(token)
+    }
+
+    pub(crate) fn active_bearers(&self) -> Result<u64> {
+        let n: i64 = self.lock().query_row(
+            "SELECT COUNT(*) FROM pair_tokens
+             WHERE kind = 'bearer' AND revoked_at IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(u64_from_i64(n))
     }
 
     pub(crate) fn bearer_valid(&self, token: &str) -> Result<bool> {
@@ -314,6 +340,17 @@ impl Db {
         get_lease_conn(&self.lock(), lease_id)
     }
 
+    pub(crate) fn list_leases(&self) -> Result<Vec<LeaseRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!("{LEASE_SELECT} ORDER BY leases.started_at DESC"))?;
+        let rows = stmt.query_map([], lease_from_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     pub(crate) fn active_leases(&self) -> Result<Vec<LeaseRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(&format!("{LEASE_SELECT} WHERE leases.status = 'active'"))?;
@@ -376,6 +413,8 @@ fn lease_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LeaseRow> {
         elapsed_seconds: row.get(8)?,
         billable_seconds: row.get(9)?,
         container_id: row.get(10)?,
+        stopped_at: row.get(11)?,
+        workspace_id: row.get(12)?,
     })
 }
 
@@ -439,7 +478,7 @@ mod tests {
     }
 
     #[test]
-    fn pairing_code_stable_and_bearer_rotates() {
+    fn pairing_code_stable_and_multi_bearer() {
         let (dir, db) = tmp_db();
         let a = db.ensure_pairing_code().unwrap();
         let b = db.ensure_pairing_code().unwrap();
@@ -460,13 +499,38 @@ mod tests {
         assert!(db.check_pair_code(&a.to_lowercase()).unwrap());
         assert!(!db.check_pair_code("nope-nope").unwrap());
 
-        let t1 = db.issue_bearer().unwrap();
+        let t1 = db.issue_bearer(false).unwrap();
         assert!(db.bearer_valid(&t1).unwrap());
-        let t2 = db.issue_bearer().unwrap();
+        let t2 = db.issue_bearer(false).unwrap();
         assert_ne!(t1, t2);
-        assert!(!db.bearer_valid(&t1).unwrap());
+        assert!(db.bearer_valid(&t1).unwrap());
         assert!(db.bearer_valid(&t2).unwrap());
+        assert_eq!(db.active_bearers().unwrap(), 2);
         assert!(!db.bearer_valid(&a).unwrap());
+
+        let t3 = db.issue_bearer(true).unwrap();
+        assert!(!db.bearer_valid(&t1).unwrap());
+        assert!(!db.bearer_valid(&t2).unwrap());
+        assert!(db.bearer_valid(&t3).unwrap());
+        assert_eq!(db.active_bearers().unwrap(), 1);
+    }
+
+    #[test]
+    fn ninth_bearer_without_revoke_is_too_many() {
+        let (_dir, db) = tmp_db();
+        let mut tokens = Vec::new();
+        for _ in 0..MAX_BEARERS {
+            tokens.push(db.issue_bearer(false).unwrap());
+        }
+        for t in &tokens {
+            assert!(db.bearer_valid(t).unwrap());
+        }
+        assert!(matches!(db.issue_bearer(false), Err(Error::TooManyBearers)));
+        let rotated = db.issue_bearer(true).unwrap();
+        for t in &tokens {
+            assert!(!db.bearer_valid(t).unwrap());
+        }
+        assert!(db.bearer_valid(&rotated).unwrap());
     }
 
     #[cfg(unix)]
@@ -519,10 +583,17 @@ mod tests {
         let row = db.get_lease("l_1").unwrap();
         assert_eq!(row.status, "active");
         assert_eq!(row.container_id.as_deref(), Some("abc123"));
+        assert_eq!(row.workspace_id, "ws_1");
         assert!(row.billable_seconds.is_none());
+        assert!(row.stopped_at.is_none());
         let stopped = db.stop_lease("l_1").unwrap();
         assert_eq!(stopped.status, "stopped");
         assert_eq!(stopped.billable_seconds, Some(60));
+        assert!(stopped.stopped_at.is_some());
+        let listed = db.list_leases().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "l_1");
+        assert_eq!(listed[0].status, "stopped");
         let again = db.stop_lease("l_1").unwrap();
         assert_eq!(again.billable_seconds, Some(60));
         assert!(matches!(db.get_lease("missing"), Err(Error::NotFound)));

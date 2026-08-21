@@ -30,6 +30,18 @@ pub struct LeaseView {
     pub billable_seconds: Option<u64>,
     #[serde(default)]
     pub elapsed_seconds: Option<u64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub started_at: i64,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub stopped_at: Option<i64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub workspace_id: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub live: bool,
 }
 
 impl NodeClient {
@@ -42,12 +54,12 @@ impl NodeClient {
         })
     }
 
-    pub fn pair(&self, code: &str) -> Result<String> {
+    pub fn pair(&self, code: &str, revoke_others: bool) -> Result<String> {
         let url = format!("{}/v1/pair", self.base);
         let res = self
             .http
             .post(url)
-            .json(&serde_json::json!({ "code": code }))
+            .json(&serde_json::json!({ "code": code, "revoke_others": revoke_others }))
             .send()?;
         let body: serde_json::Value = decode(res)?;
         let token = body

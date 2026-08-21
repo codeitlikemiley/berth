@@ -20,6 +20,7 @@ pub enum Error {
     NotFound,
     BadRequest(String),
     ShuttingDown,
+    TooManyBearers,
     Tunnel(String),
     Internal(String),
 }
@@ -57,6 +58,12 @@ impl fmt::Display for Error {
             Self::NotFound => write!(f, "not found"),
             Self::BadRequest(msg) => write!(f, "{msg}"),
             Self::ShuttingDown => write!(f, "node is shutting down"),
+            Self::TooManyBearers => {
+                write!(
+                    f,
+                    "too many paired clients (max 8); re-pair with revoke_others"
+                )
+            }
             Self::Tunnel(msg) | Self::Internal(msg) => write!(f, "{msg}"),
         }
     }
@@ -80,6 +87,7 @@ impl std::error::Error for Error {
             | Self::NotFound
             | Self::BadRequest(_)
             | Self::ShuttingDown
+            | Self::TooManyBearers
             | Self::Tunnel(_)
             | Self::Internal(_) => None,
         }

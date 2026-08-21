@@ -56,6 +56,9 @@ enum Command {
         /// Name stored under [nodes.<name>] in config.toml
         #[arg(long, default_value = DEFAULT_NODE)]
         node: String,
+        /// Revoke previously issued bearer tokens
+        #[arg(long)]
+        revoke_others: bool,
     },
     /// End a session
     End,
@@ -121,7 +124,12 @@ pub fn execute(cli: Cli, home: &Path) -> Result<String> {
             berth_node::serve_blocking(bind, tunnel)?;
             Ok(String::new())
         }
-        Command::Pair { url, code, node } => cmd_pair(home, &url, &code, &node),
+        Command::Pair {
+            url,
+            code,
+            node,
+            revoke_others,
+        } => cmd_pair(home, &url, &code, &node, revoke_others),
         Command::Up { os, node } => cmd_up(home, &os, &node),
         Command::View => cmd_view(home),
         Command::End => cmd_end(home),
@@ -134,13 +142,13 @@ pub fn execute(cli: Cli, home: &Path) -> Result<String> {
     }
 }
 
-fn cmd_pair(home: &Path, url: &str, code: &str, node: &str) -> Result<String> {
+fn cmd_pair(home: &Path, url: &str, code: &str, node: &str, revoke_others: bool) -> Result<String> {
     validate_node_name(node)?;
     let url = normalize_url(url)?;
     if code.trim().is_empty() {
         return Err(Error::Usage("code is empty".into()));
     }
-    let token = NodeClient::new(&url, None)?.pair(code.trim())?;
+    let token = NodeClient::new(&url, None)?.pair(code.trim(), revoke_others)?;
     let mut cfg = Config::load(home)?;
     cfg.nodes.insert(
         node.to_string(),
@@ -356,8 +364,25 @@ mod tests {
         .unwrap();
         assert!(matches!(
             pair.command,
-            Command::Pair { ref url, ref code, ref node }
-                if url == DEFAULT_URL && code == "ABCD-EFGH" && node == DEFAULT_NODE
+            Command::Pair { ref url, ref code, ref node, revoke_others }
+                if url == DEFAULT_URL && code == "ABCD-EFGH" && node == DEFAULT_NODE && !revoke_others
+        ));
+        let revoke = Cli::try_parse_from([
+            "berth",
+            "pair",
+            "--url",
+            "http://127.0.0.1:7432",
+            "--code",
+            "ABCD-EFGH",
+            "--revoke-others",
+        ])
+        .unwrap();
+        assert!(matches!(
+            revoke.command,
+            Command::Pair {
+                revoke_others: true,
+                ..
+            }
         ));
         let up =
             Cli::try_parse_from(["berth", "up", "--os", "linux", "--node", "home-nuc"]).unwrap();
@@ -685,9 +710,9 @@ mod tests {
         server.expect(
             Expectation::matching(all_of![
                 request::method_path("POST", "/v1/pair"),
-                request::body(json_decoded(
-                    |v: &serde_json::Value| v["code"] == "ABCD-EFGH"
-                )),
+                request::body(json_decoded(|v: &serde_json::Value| {
+                    v["code"] == "ABCD-EFGH" && v["revoke_others"] == false
+                })),
             ])
             .respond_with(json_encoded(json!({ "token": "brt_secret" }))),
         );
@@ -698,6 +723,34 @@ mod tests {
         let node = cfg.node("default").unwrap();
         assert_eq!(node.url, url);
         assert_eq!(node.token, "brt_secret");
+    }
+
+    #[test]
+    fn pair_revoke_others_sends_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(all_of![
+                request::method_path("POST", "/v1/pair"),
+                request::body(json_decoded(|v: &serde_json::Value| {
+                    v["code"] == "ABCD-EFGH" && v["revoke_others"] == true
+                })),
+            ])
+            .respond_with(json_encoded(json!({ "token": "brt_secret" }))),
+        );
+        let url = format!("http://{}", server.addr());
+        run(
+            dir.path(),
+            &[
+                "pair",
+                "--url",
+                &url,
+                "--code",
+                "ABCD-EFGH",
+                "--revoke-others",
+            ],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -723,9 +776,9 @@ mod tests {
         server.expect(
             Expectation::matching(all_of![
                 request::method_path("POST", "/v1/pair"),
-                request::body(json_decoded(
-                    |v: &serde_json::Value| v["code"] == "ABCD-EFGH"
-                )),
+                request::body(json_decoded(|v: &serde_json::Value| {
+                    v["code"] == "ABCD-EFGH" && v["revoke_others"] == false
+                })),
             ])
             .respond_with(json_encoded(json!({ "token": "brt_secret" }))),
         );
