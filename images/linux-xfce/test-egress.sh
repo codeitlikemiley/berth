@@ -36,12 +36,15 @@ start_guest() { # $1 name, $2 BERTH_ALLOWLIST value
   docker run -d --name "$name" --network "$NET" \
     --cap-add NET_ADMIN --cap-add SETUID --cap-add SETGID --cap-add SETPCAP \
     -e BERTH_ALLOWLIST="$allow" "$IMAGE" >/dev/null
+  # Wait on the egress log line, not on the DROP policy: apply_egress sets the
+  # policy first and logs last, so keying on the policy races the rest of the
+  # ruleset into existence and reads a half-built chain.
   for _ in $(seq 1 30); do
     if ! docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null | grep -q true; then
       echo "  container $name exited; logs:"; docker logs "$name" 2>&1 | sed 's/^/    /' | tail -20
       return 1
     fi
-    rules "$name" | grep -q -- '-P OUTPUT DROP' && return 0
+    docker logs "$name" 2>&1 | grep -qE 'egress (deny-all|allowlist:)' && return 0
     sleep 1
   done
   echo "  egress rules never appeared in $name; logs:"; docker logs "$name" 2>&1 | sed 's/^/    /' | tail -20
