@@ -108,7 +108,10 @@ pub fn execute(cli: Cli, home: &Path) -> Result<String> {
         Command::View => cmd_view(home),
         Command::End => cmd_end(home),
         Command::Status => cmd_status(home),
-        Command::Mcp => Err(Error::NotImplemented("mcp")),
+        Command::Mcp => {
+            berth_mcp::serve_blocking(home)?;
+            Ok(String::new())
+        }
         Command::Doctor => Err(Error::NotImplemented("doctor")),
     }
 }
@@ -480,11 +483,9 @@ mod tests {
     }
 
     #[test]
-    fn mcp_not_implemented() {
-        let dir = tempfile::tempdir().unwrap();
-        let err = run(dir.path(), &["mcp"]).unwrap_err();
-        assert_eq!(err.exit_code(), 2);
-        assert!(err.to_string().contains("mcp"));
+    fn parse_mcp() {
+        let cli = Cli::try_parse_from(["berth", "mcp"]).unwrap();
+        assert!(matches!(cli.command, Command::Mcp));
     }
 
     #[test]

@@ -12,26 +12,16 @@ pub enum Error {
     Http(reqwest::Error),
     Api { status: u16, message: String },
     Mvp(MvpError),
-    Node(String),
-    Mcp(String),
-    NotImplemented(&'static str),
+    Ws(String),
+    Protocol(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-impl Error {
-    pub fn exit_code(&self) -> u8 {
-        match self {
-            Self::NotImplemented(_) => 2,
-            _ => 1,
-        }
-    }
-}
-
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Usage(msg) | Self::Config(msg) | Self::Node(msg) | Self::Mcp(msg) => {
+            Self::Usage(msg) | Self::Config(msg) | Self::Ws(msg) | Self::Protocol(msg) => {
                 write!(f, "{msg}")
             }
             Self::Io(err) => write!(f, "{err}"),
@@ -51,7 +41,6 @@ impl fmt::Display for Error {
                 }
             }
             Self::Mvp(err) => write!(f, "{err}"),
-            Self::NotImplemented(cmd) => write!(f, "{cmd} is not implemented"),
         }
     }
 }
@@ -66,9 +55,8 @@ impl std::error::Error for Error {
             Self::Usage(_)
             | Self::Config(_)
             | Self::Api { .. }
-            | Self::Node(_)
-            | Self::Mcp(_)
-            | Self::NotImplemented(_) => None,
+            | Self::Ws(_)
+            | Self::Protocol(_) => None,
         }
     }
 }
@@ -109,14 +97,8 @@ impl From<MvpError> for Error {
     }
 }
 
-impl From<berth_node::Error> for Error {
-    fn from(err: berth_node::Error) -> Self {
-        Self::Node(err.to_string())
-    }
-}
-
-impl From<berth_mcp::Error> for Error {
-    fn from(err: berth_mcp::Error) -> Self {
-        Self::Mcp(err.to_string())
+impl From<tokio_tungstenite::tungstenite::Error> for Error {
+    fn from(err: tokio_tungstenite::tungstenite::Error) -> Self {
+        Self::Ws(err.to_string())
     }
 }

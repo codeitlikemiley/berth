@@ -1,0 +1,7 @@
+{
+  "type": "tool_use",
+  "id": "toolu_type",
+  "name": "type",
+  "toolset_name": "computer",
+  "input": { "text": "hello" }
+}

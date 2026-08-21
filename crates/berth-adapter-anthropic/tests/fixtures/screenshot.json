@@ -1,0 +1,7 @@
+{
+  "type": "tool_use",
+  "id": "toolu_shot",
+  "name": "screenshot",
+  "toolset_name": "computer",
+  "input": {}
+}

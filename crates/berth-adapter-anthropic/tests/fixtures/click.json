@@ -1,0 +1,7 @@
+{
+  "type": "tool_use",
+  "id": "toolu_click",
+  "name": "left_click",
+  "toolset_name": "computer",
+  "input": { "coordinate": [100, 200] }
+}

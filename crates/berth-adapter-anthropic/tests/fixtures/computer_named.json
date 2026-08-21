@@ -1,0 +1,9 @@
+{
+  "type": "tool_use",
+  "id": "toolu_legacy",
+  "name": "computer",
+  "input": {
+    "action": "left_click",
+    "coordinate": [50, 60]
+  }
+}

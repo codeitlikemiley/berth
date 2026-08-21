@@ -10,6 +10,7 @@ name = "berth"
 path = "src/main.rs"
 
 [dependencies]
+berth-mcp = { version = "0.1.0", path = "../berth-mcp" }
 berth-node = { version = "0.1.0", path = "../berth-node" }
 berth-protocol = { version = "0.1.0", path = "../berth-protocol" }
 clap.workspace = true

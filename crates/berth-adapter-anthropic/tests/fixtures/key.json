@@ -1,0 +1,7 @@
+{
+  "type": "tool_use",
+  "id": "toolu_key",
+  "name": "key",
+  "toolset_name": "computer",
+  "input": { "text": "ctrl+s", "repeat": 1 }
+}

@@ -1,0 +1,11 @@
+{
+  "type": "tool_use",
+  "id": "toolu_scroll",
+  "name": "scroll",
+  "toolset_name": "computer",
+  "input": {
+    "coordinate": [100, 200],
+    "scroll_direction": "down",
+    "scroll_amount": 3
+  }
+}

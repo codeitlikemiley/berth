@@ -84,7 +84,7 @@ Read the review: [docs/REVIEW.md](docs/REVIEW.md).
 
 ## Status
 
-Private Linux outpost on one machine (node + CLI). No tunnel, no MCP yet.
+Private Linux outpost on one machine (node + CLI + MCP). No tunnel.
 The guest is Linux in Docker (linux/arm64 on Apple Silicon). The host
 desktop is never driven.
 
@@ -97,11 +97,13 @@ berth node up
 berth pair --code ABCD-EFGH
 berth up --os linux
 berth view          # prints the noVNC URL; does not open a browser
+claude mcp add --transport stdio berth -- berth mcp
 berth end
 ```
 
 `berth pair --url` defaults to `http://127.0.0.1:7432`. Token and URL land
-in `~/.berth/config.toml`. MCP (`berth mcp`) is the next slice.
+in `~/.berth/config.toml`. `berth mcp` is stdio JSON-RPC (tools talk to the
+guest, not the host desktop).
 
 ## Name
 
