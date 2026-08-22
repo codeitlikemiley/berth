@@ -43,7 +43,8 @@ The guest image check is not "does this image exist" — an image built before
 the egress filter existed inspects fine and filters nothing. berth requires the
 `berth.egress.version` label the Dockerfile stamps, so
 `image ... predates the egress filter` means exactly one thing: rebuild it with
-the `docker build` line above. `images/linux-xfce/test-egress.sh` asserts what
+the `docker build` line above. The label is versioned (`v2` filters names as
+well as addresses), so an older image is refused rather than trusted. `images/linux-xfce/test-egress.sh` asserts what
 the image does to traffic and runs in CI.
 
 ### Workspaces
@@ -106,6 +107,35 @@ Then:
    `berth end --force`) forfeits host income for that row (`forfeited`; badge
    “No income — forced disconnect”). Not a cash fine. MCP cannot force.
    Quotes printed or shown are **not charged**.
+
+### What the quoted number means
+
+You will see a price in three places — the wizard's Review step, the console's
+lease table, and stderr from `berth up`:
+
+```
+lease l_18ce02d1… quote $0.000804 USD for 60s min (not charged)
+```
+
+It is **occupancy**: wall-clock time the guest is held for you, not clicks,
+CPU-seconds, or agent actions. An idle guest costs the same as a busy one,
+because holding the box is the thing being sold.
+
+- A rate comes from the shape you asked for (vCPU, memory, disk, OS, isolated
+  vs shared). For the v0.1 default — 2 vCPU / 4 GiB / 40 GiB, isolated, linux —
+  it is **$0.048/hr**.
+- Every lease bills a **60-second minimum**, so the smallest possible number is
+  that rate × 60s = **$0.000804**.
+- The console shows the rate first and the exact accrued figure underneath,
+  because a fraction of a cent is honest but unreadable.
+
+**Nothing is charged.** v0.1 has no wallet, no card, no payment path and no
+earnings — the quote is printed so the meter can be checked before money is
+ever wired up. Force disconnect sets that lease's host income to `$0` while
+still recording the occupancy; it is a forfeited credit, not a fine.
+
+That is the whole model. [docs/MATH.md](docs/MATH.md) derives the rates and
+explains the internal gas unit, but you do not need it to run berth.
 
 `berth view` is node-local noVNC on the mapped guest port. The tunnel does not
 publish it. The session pane iframes noVNC only when this browser is on the
@@ -180,9 +210,12 @@ Install `cloudflared` first (`brew install cloudflared` on macOS; on Linux,
   token, not a bind-all listener.
 - Pairing code on `GET /v1/pairing` is loopback-operator only. Ignore
   `X-Forwarded-*`. `httpHostHeader: 127.0.0.1` is unsupported (see above).
-- Guest egress is **default-deny**. Default allowlist: `github.com`,
-  `pypi.org`, `registry.npmjs.org`. **Empty allowlist = no outbound** (not
-  "allow all"). Set in `~/.berth/config.toml`:
+- Guest egress is **default-deny**, by address **and by name**. The guest
+  resolves through a filter that forwards only allowlisted domains and answers
+  NXDOMAIN for everything else, so a name nobody allowlisted cannot be looked
+  up — DNS is not left open as a side channel. Default allowlist: `github.com`,
+  `pypi.org`, `registry.npmjs.org`. **Empty allowlist = no outbound at all,
+  DNS included** (not "allow all"). Set in `~/.berth/config.toml`:
 
   ```toml
   allowlist = "github.com,pypi.org,registry.npmjs.org"
@@ -193,6 +226,9 @@ Install `cloudflared` first (`brew install cloudflared` on macOS; on Linux,
   empty = deny-all). A present key (including `""`) is sent on the lease and
   wins over the node env.
 - `vcpu` / `mem_gib` of `0` is rejected (not unlimited).
+- A lease larger than the node is rejected too, by the wizard as you type it and
+  by `POST /v1/leases` before any container is started. `GET /v1/node` reports
+  the node's `capacity`; the wizard shows it under the resource fields.
 
 `os=windows`, `os=macos`, and `class=mesh` return a clear error. They are not
 implemented in v0.1.
@@ -233,21 +269,24 @@ Read the MVP plan: [docs/MVP.md](docs/MVP.md).
 
 ## v0.1.0 tag checklist
 
-- [ ] `berth doctor` green on macOS + Docker Desktop (and Linux+Docker if present)
-- [ ] `berth node up` + open `http://127.0.0.1:7432/` + pair this browser
-- [ ] Wizard What → Where → Review shows quoted USD (not charged)
-- [ ] `berth pair` (CLI) still works after pairing the console (no `--revoke-others`)
-- [ ] Park / unpark; unpark while live is blocked (409)
-- [ ] Force disconnect = no income; `berth end` / `berth_end` graceful
-- [ ] `berth node up` + `berth up --os linux` on one machine
+Ticked items were exercised against a running node and a real Docker guest,
+not reasoned about. The unticked one needs `cloudflared` and a second machine.
+
+- [x] `berth doctor` green on macOS + Docker Desktop (and Linux+Docker if present)
+- [x] `berth node up` + open `http://127.0.0.1:7432/` + pair this browser
+- [x] Wizard What → Where → Review shows quoted USD (not charged)
+- [x] `berth pair` (CLI) still works after pairing the console (no `--revoke-others`)
+- [x] Park / unpark; unpark while live is blocked (409)
+- [x] Force disconnect = no income; `berth end` / `berth_end` graceful
+- [x] `berth node up` + `berth up --os linux` on one machine
 - [ ] Same path across two machines via `--tunnel cloudflare`
-- [ ] Claude Code screenshot + click (e2e screenshot)
-- [ ] `/workspace` persists across `berth end` + a second `berth up`
-- [ ] Host desktop / cursor untouched
-- [ ] Quote printed (USD), not collected
-- [ ] `os=windows|macos` and `class=mesh` return a clear error
-- [ ] Empty egress allowlist denies outbound
-- [ ] README can be followed without reading MATH.md
+- [x] Claude Code screenshot + click (e2e screenshot)
+- [x] `/workspace` persists across `berth end` + a second `berth up`
+- [x] Host desktop / cursor untouched
+- [x] Quote printed (USD), not collected
+- [x] `os=windows|macos` and `class=mesh` return a clear error
+- [x] Empty egress allowlist denies outbound
+- [x] README can be followed without reading MATH.md
 
 ## Name
 
