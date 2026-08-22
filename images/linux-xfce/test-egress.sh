@@ -30,6 +30,23 @@ fail() { echo "  FAIL $1"; FAILURES=$((FAILURES + 1)); }
 # assertion reported as a failure, intermittently, depending on how fast the
 # producer flushes. Capture first, match in the shell.
 logs_of() { docker logs "$1" 2>&1 || true; }
+
+# Reaching a real host over the public internet is the one assertion here that
+# can fail for reasons that have nothing to do with the egress filter. A single
+# TCP timeout from a CI runner is not evidence the allowlist is broken, so give
+# it a few attempts before calling it a failure. The negative assertions are
+# never retried: a host that stays blocked is the whole point, and retrying
+# would only make a leak harder to see.
+reachable() { # $1 container, $2 url
+  local i
+  for i in 1 2 3; do
+    if as_agent "$1" "curl -sS --max-time 20 -o /dev/null $2"; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
 has() { case "$2" in *"$1"*) return 0 ;; *) return 1 ;; esac; }
 
 # Root inside the guest; PATH is trimmed for the berth user so name it in full.
@@ -103,7 +120,9 @@ if start_guest "berth-egress-allow-$$" "github.com"; then
   g="berth-egress-allow-$$"
   has "egress allowlist: github.com" "$(logs_of "$g")" && pass "logged allowlist" || fail "did not log allowlist"
   as_agent "$g" 'getent hosts github.com'                        && pass "DNS resolves"      || fail "DNS blocked, but allowlisted hosts need it"
-  as_agent "$g" 'curl -sS --max-time 15 -o /dev/null https://github.com' && pass "allowed host reachable" || fail "allowlisted host unreachable"
+  reachable "$g" https://github.com \
+    && pass "allowed host reachable" \
+    || fail "allowlisted host unreachable after 3 attempts"
   as_agent "$g" 'curl -sS --max-time 8 -o /dev/null https://example.com' && fail "non-listed host reachable" || pass "non-listed host blocked"
 
   # Address rules alone left DNS wide open: a guest could resolve anything and
