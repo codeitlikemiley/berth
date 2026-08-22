@@ -122,6 +122,20 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Delete a workspace volume. Docker refuses while a container still uses
+    /// it, and that refusal is load-bearing: it is the last guard against
+    /// pulling the disk out from under a running guest.
+    pub async fn remove_volume(&self, name: &str) -> Result<()> {
+        self.docker
+            .remove_volume(name, None::<bollard::query_parameters::RemoveVolumeOptions>)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn volume_exists(&self, name: &str) -> bool {
+        self.docker.inspect_volume(name).await.is_ok()
+    }
+
     async fn ensure_volume(&self, name: &str) -> Result<()> {
         if self.docker.inspect_volume(name).await.is_ok() {
             return Ok(());

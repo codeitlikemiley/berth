@@ -46,6 +46,25 @@ the egress filter existed inspects fine and filters nothing. berth requires the
 the `docker build` line above. `images/linux-xfce/test-egress.sh` asserts what
 the image does to traffic and runs in CI.
 
+### Workspaces
+
+`/workspace` lives on a named Docker volume. Reuse one by naming it, or omit it
+and get a fresh disk:
+
+```sh
+berth up --workspace ws_myproject   # same /workspace as last time
+berth workspace ls                  # what exists, and which are reusable
+berth workspace rm ws_old           # refused while a lease is live
+```
+
+Agents can pass the same id as `workspace` to the `berth_lease` MCP tool.
+
+A workspace nobody has leased for **7 days** has its disk reclaimed
+automatically, because otherwise every `berth up` leaks one forever. Set
+`BERTH_WORKSPACE_TTL_DAYS` to change the window, or `0` to turn it off. The
+sweep only touches workspaces this node recorded, never one with a live lease,
+and Docker refuses to remove a volume that is still attached.
+
 ### Node 22 at compile time
 
 The dashboard is compiled into berth. **Node 22 is required at compile time**
