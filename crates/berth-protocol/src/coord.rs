@@ -1,7 +1,9 @@
 /// Screenshot-pixel coordinate, origin top-left.
 pub type Point = [i32; 2];
 
-/// Axis-aligned box in screenshot pixel space: `[x, y, x2, y2]` (or `[x, y, w, h]`).
+/// Axis-aligned box in screenshot pixel space: `[x, y, x2, y2]` -- top-left and
+/// bottom-right, not width/height. This was previously documented as either,
+/// which is not a thing two implementations can agree on.
 pub type Region = [i32; 4];
 
 /// Map a point from last-frame pixel space into guest/input pixel space.
@@ -26,7 +28,7 @@ pub fn scale_coordinates(
     ]
 }
 
-/// Scale a `[x, y, x2, y2]` (or `[x, y, w, h]`) box the same way as points.
+/// Scale an `[x, y, x2, y2]` box by scaling each corner as a point.
 #[must_use]
 pub fn scale_region(
     region: Region,

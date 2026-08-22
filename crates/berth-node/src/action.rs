@@ -2,41 +2,43 @@
 use berth_protocol::{Ack, AckKind};
 use berth_protocol::{AckResult, Action, Button};
 
-pub const ACTION_BIN: &str = "/usr/local/bin/action.sh";
+/// The image ships `driver -> action.sh`, and MVP.md calls that symlink the
+/// seam a different driver swaps in behind. Calling action.sh directly meant
+/// the seam did not actually exist; repointing the symlink changed nothing.
+pub const ACTION_BIN: &str = "/usr/local/bin/driver";
 pub const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
 pub const FRAME_WIDTH: u32 = 1280;
 pub const FRAME_HEIGHT: u32 = 800;
 
-/// Map a protocol action onto `action.sh` argv (including the binary).
+/// Map a protocol action onto guest driver argv (including the binary).
 ///
-/// Ops the guest shim does not implement fail here so the batch can skip the rest.
+/// Ops the guest driver does not implement fail here so the batch can skip the rest.
 pub fn action_argv(action: &Action) -> std::result::Result<Vec<String>, String> {
     match action {
         Action::Screenshot {} => Ok(vec![ACTION_BIN.to_string(), "screenshot".into()]),
         Action::Click { button, xy, mods } => {
-            if !mods.is_empty() {
-                return Err("click mods are not supported by action.sh".into());
-            }
-            Ok(vec![
+            let mut argv = vec![
                 ACTION_BIN.to_string(),
                 "click".into(),
                 xy[0].to_string(),
                 xy[1].to_string(),
                 button_arg(*button).into(),
-            ])
+            ];
+            argv.extend(mods.iter().cloned());
+            Ok(argv)
         }
-        Action::DoubleClick { xy, button } => {
-            if *button != Button::Left {
-                return Err("double_click button is not supported by action.sh".into());
+        Action::DoubleClick { xy, button } => Ok(vec![
+            ACTION_BIN.to_string(),
+            "click".into(),
+            xy[0].to_string(),
+            xy[1].to_string(),
+            match button {
+                Button::Left => "double_left",
+                Button::Middle => "double_middle",
+                Button::Right => "double_right",
             }
-            Ok(vec![
-                ACTION_BIN.to_string(),
-                "click".into(),
-                xy[0].to_string(),
-                xy[1].to_string(),
-                "double".into(),
-            ])
-        }
+            .into(),
+        ]),
         Action::Move { xy } => Ok(vec![
             ACTION_BIN.to_string(),
             "move".into(),
@@ -64,11 +66,44 @@ pub fn action_argv(action: &Action) -> std::result::Result<Vec<String>, String> 
             Ok(argv)
         }
         Action::Wait { ms } => Ok(vec![ACTION_BIN.to_string(), "wait".into(), ms.to_string()]),
-        Action::Drag { .. } => Err("drag is not supported by action.sh".into()),
-        Action::HoldKey { .. } => Err("hold_key is not supported by action.sh".into()),
-        Action::Zoom { .. } => Err("zoom is not supported by action.sh".into()),
-        Action::CursorPosition {} => Err("cursor_position is not supported by action.sh".into()),
-        Action::Shell { .. } => Err("shell is not supported by action.sh".into()),
+        Action::Drag { path } => {
+            if path.len() < 2 {
+                return Err("drag requires at least two points".into());
+            }
+            let mut argv = vec![ACTION_BIN.to_string(), "drag".into()];
+            for p in path {
+                argv.push(p[0].to_string());
+                argv.push(p[1].to_string());
+            }
+            Ok(argv)
+        }
+        Action::HoldKey { keys, ms } => {
+            if keys.is_empty() {
+                return Err("hold_key requires KEY".into());
+            }
+            let mut argv = vec![ACTION_BIN.to_string(), "hold_key".into(), ms.to_string()];
+            argv.extend(keys.iter().cloned());
+            Ok(argv)
+        }
+        Action::Zoom { region } => {
+            // Region is [x, y, x2, y2]; see berth_protocol::Region.
+            if region[2] <= region[0] || region[3] <= region[1] {
+                return Err("zoom region must have positive width and height".into());
+            }
+            Ok(vec![
+                ACTION_BIN.to_string(),
+                "zoom".into(),
+                region[0].to_string(),
+                region[1].to_string(),
+                region[2].to_string(),
+                region[3].to_string(),
+            ])
+        }
+        Action::CursorPosition {} => Ok(vec![ACTION_BIN.to_string(), "cursor_position".into()]),
+        // Deliberate, not missing. Arbitrary shell in the guest is a different
+        // security decision from driving its desktop, and the protocol has no
+        // carrier for command output anyway.
+        Action::Shell { .. } => Err("shell is not exposed by the guest driver".into()),
     }
 }
 
@@ -171,7 +206,7 @@ mod tests {
                 button: Button::Left,
             })
             .unwrap(),
-            [ACTION_BIN, "click", "1", "2", "double"]
+            [ACTION_BIN, "click", "1", "2", "double_left"]
         );
         assert_eq!(
             action_argv(&Action::Move { xy: [3, 4] }).unwrap(),
@@ -214,43 +249,88 @@ mod tests {
         );
     }
 
+    /// Anthropic's computer-use toolset issues drag, hold_key and
+    /// cursor_position; every one of them used to fail here and abort the rest
+    /// of the batch.
     #[test]
-    fn rejects_unsupported_and_mods() {
-        assert!(
+    fn maps_the_ops_that_used_to_be_refused() {
+        assert_eq!(
             action_argv(&Action::Drag {
-                path: vec![[0, 0], [1, 1]],
+                path: vec![[0, 0], [5, 6], [7, 8]],
             })
-            .unwrap_err()
-            .contains("drag")
+            .unwrap(),
+            [ACTION_BIN, "drag", "0", "0", "5", "6", "7", "8"]
         );
-        assert!(
+        assert_eq!(
             action_argv(&Action::HoldKey {
-                keys: vec!["SHIFT".into()],
-                ms: 10,
+                keys: vec!["SHIFT".into(), "a".into()],
+                ms: 250,
             })
-            .is_err()
+            .unwrap(),
+            [ACTION_BIN, "hold_key", "250", "SHIFT", "a"]
         );
-        assert!(
+        assert_eq!(
             action_argv(&Action::Zoom {
-                region: [0, 0, 1, 1],
+                region: [10, 20, 110, 220],
             })
-            .is_err()
+            .unwrap(),
+            [ACTION_BIN, "zoom", "10", "20", "110", "220"]
         );
-        assert!(action_argv(&Action::CursorPosition {}).is_err());
+        assert_eq!(
+            action_argv(&Action::CursorPosition {}).unwrap(),
+            [ACTION_BIN, "cursor_position"]
+        );
+        // Modifiers ride after the button rather than being refused.
+        assert_eq!(
+            action_argv(&Action::Click {
+                button: Button::Left,
+                xy: [0, 0],
+                mods: vec!["SHIFT".into(), "ctrl".into()],
+            })
+            .unwrap(),
+            [ACTION_BIN, "click", "0", "0", "left", "SHIFT", "ctrl"]
+        );
+        for (button, arg) in [
+            (Button::Right, "double_right"),
+            (Button::Middle, "double_middle"),
+        ] {
+            assert_eq!(
+                action_argv(&Action::DoubleClick { xy: [1, 2], button }).unwrap(),
+                [ACTION_BIN, "click", "1", "2", arg]
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_what_the_driver_really_cannot_do() {
+        // Deliberate policy, not a gap: arbitrary shell in the guest is a
+        // separate security decision from driving its desktop.
         assert!(
             action_argv(&Action::Shell {
                 cmd: "uname".into(),
             })
-            .is_err()
+            .unwrap_err()
+            .contains("shell is not exposed")
         );
         assert!(
-            action_argv(&Action::Click {
-                button: Button::Left,
-                xy: [0, 0],
-                mods: vec!["SHIFT".into()],
+            action_argv(&Action::Drag { path: vec![[0, 0]] })
+                .unwrap_err()
+                .contains("two points")
+        );
+        assert!(
+            action_argv(&Action::HoldKey {
+                keys: vec![],
+                ms: 10,
+            })
+            .is_err()
+        );
+        // A zero-or-negative region would crop to nothing.
+        assert!(
+            action_argv(&Action::Zoom {
+                region: [10, 10, 10, 20],
             })
             .unwrap_err()
-            .contains("mods")
+            .contains("positive")
         );
         assert!(
             action_argv(&Action::Key {
@@ -266,21 +346,6 @@ mod tests {
             })
             .unwrap_err()
             .contains("repeat")
-        );
-        assert!(
-            action_argv(&Action::DoubleClick {
-                xy: [1, 2],
-                button: Button::Right,
-            })
-            .unwrap_err()
-            .contains("double_click button")
-        );
-        assert!(
-            action_argv(&Action::DoubleClick {
-                xy: [1, 2],
-                button: Button::Middle,
-            })
-            .is_err()
         );
     }
 

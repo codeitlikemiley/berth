@@ -54,9 +54,14 @@ fn lease(workspace_id: &str) -> LeaseRequest {
     }
 }
 
+/// Exec as `berth`, the way the node itself does.
+///
+/// Not a detail: the guest drops ALL capabilities, so root has no
+/// CAP_DAC_OVERRIDE and cannot write to a berth-owned /workspace either. Root
+/// here fails with EACCES, which is the isolation working rather than a bug.
 fn docker_exec(container: &str, shell: &str) -> String {
     let out = Command::new("docker")
-        .args(["exec", container, "sh", "-c", shell])
+        .args(["exec", "-u", "berth", container, "sh", "-c", shell])
         .output()
         .expect("docker exec");
     assert!(
@@ -337,4 +342,110 @@ async fn empty_allowlist_denies_outbound() {
     );
 
     session.stop().await.expect("stop");
+}
+
+/// Anthropic's computer-use toolset issues drag, hold_key and cursor_position.
+/// All three used to fail argv mapping and abort the rest of the batch, so an
+/// agent driving a berth guest hit errors on verbs the protocol advertises.
+#[tokio::test]
+#[ignore = "requires Docker; BERTH_E2E=1 cargo test -p berth-node -- --ignored"]
+async fn driver_covers_every_action_the_protocol_advertises() {
+    if !e2e_enabled() {
+        eprintln!("skipping: set BERTH_E2E=1 to run docker e2e");
+        return;
+    }
+
+    let manager = SessionManager::connect().expect("docker connect");
+    let ws = unique_ws();
+    let req = lease(&ws);
+    let mut session = manager.start(&req).await.expect("start session");
+
+    let out = session
+        .exec(ActionBatch {
+            kind: ActionBatchKind::Actions,
+            id: "a_verbs".into(),
+            session_id: session.session_id().to_string(),
+            items: vec![
+                Action::Move { xy: [640, 400] },
+                // The pointer is read back below; Frame.cursor was in the
+                // protocol from the start and nothing ever populated it.
+                Action::CursorPosition {},
+                Action::Drag {
+                    path: vec![[100, 100], [300, 200], [500, 400]],
+                },
+                Action::HoldKey {
+                    keys: vec!["shift".into()],
+                    ms: 120,
+                },
+                Action::Click {
+                    button: Button::Left,
+                    xy: [400, 300],
+                    mods: vec!["ctrl".into()],
+                },
+                Action::DoubleClick {
+                    xy: [400, 300],
+                    button: Button::Right,
+                },
+                // [x, y, x2, y2], so this is a 100x50 crop.
+                Action::Zoom {
+                    region: [10, 20, 110, 70],
+                },
+            ],
+        })
+        .await
+        .expect("exec batch");
+
+    for (i, r) in out.ack.results.iter().enumerate() {
+        assert!(r.ok, "item {i} failed: {:?}", r.error);
+    }
+
+    // cursor_position and zoom both answer with a frame; the protocol has no
+    // other carrier for a reply.
+    assert_eq!(out.frames.len(), 2, "cursor_position and zoom each reply");
+
+    let cursor_frame = &out.frames[0];
+    assert_eq!(cursor_frame.width, FRAME_WIDTH);
+    assert_eq!(cursor_frame.height, FRAME_HEIGHT);
+    assert_eq!(
+        cursor_frame.cursor,
+        Some([640, 400]),
+        "cursor_position must report where Move just put the pointer"
+    );
+
+    let zoom_frame = &out.frames[1];
+    assert_eq!(zoom_frame.width, 100, "zoom crops to the region's width");
+    assert_eq!(zoom_frame.height, 50, "zoom crops to the region's height");
+
+    // Nothing may be left held down after drag and hold_key.
+    let loc = docker_exec(session.container_id(), "xdotool getmouselocation --shell");
+    assert!(loc.contains("X=400") && loc.contains("Y=300"), "{loc}");
+
+    // Shell stays refused on purpose: running arbitrary commands in the guest
+    // is a different security decision from driving its desktop.
+    let refused = session
+        .exec(ActionBatch {
+            kind: ActionBatchKind::Actions,
+            id: "a_shell".into(),
+            session_id: session.session_id().to_string(),
+            items: vec![Action::Shell {
+                cmd: "uname -a".into(),
+            }],
+        })
+        .await
+        .expect("shell batch");
+    assert!(!refused.ack.results[0].ok);
+    assert!(
+        refused.ack.results[0]
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("shell is not exposed")),
+        "{:?}",
+        refused.ack.results[0].error
+    );
+
+    let volume = session.volume_name().to_string();
+    session.stop().await.expect("stop");
+    let _ = Command::new("docker")
+        .args(["volume", "rm", "-f", &volume])
+        .status();
 }

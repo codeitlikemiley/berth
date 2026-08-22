@@ -11,7 +11,15 @@ usage() {
   cat <<'EOF' >&2
 Usage: action.sh <command> [args]
   screenshot              write a PNG of DISPLAY to stdout
-  click X Y [BUTTON]      BUTTON: left|right|middle|double (default left)
+  zoom X Y X2 Y2          write a PNG of that region to stdout
+  cursor_position         write a PNG to stdout; pointer goes to stderr
+  click X Y [BUTTON] [MOD...]
+                          BUTTON: left|right|middle|double (default left)
+                          MOD: ctrl|alt|shift|super, held for the click
+  drag X1 Y1 X2 Y2 [X Y...]
+                          press at the first point, move through the rest, release
+  hold_key MS KEY [KEY...]
+                          hold a chord down for MS milliseconds
   type TEXT               type TEXT (non-empty stdin if TEXT is omitted)
   key KEY [KEY...]        key chord (key ctrl s  |  key Return)
   scroll X Y DY           vertical ticks at X,Y (positive is down)
@@ -106,6 +114,102 @@ require_display() {
   fi
 }
 
+emit_cursor() {
+  # Frame.cursor has been in the protocol from the start and nothing ever set
+  # it. stdout is the PNG, so the pointer goes on stderr behind a marker the
+  # node can recognise and a human reading logs can ignore.
+  local loc x y
+  loc="$(xdotool getmouselocation --shell 2>/dev/null || true)"
+  x="$(printf '%s\n' "$loc" | sed -n 's/^X=\([0-9-]*\)$/\1/p')"
+  y="$(printf '%s\n' "$loc" | sed -n 's/^Y=\([0-9-]*\)$/\1/p')"
+  if [ -n "$x" ] && [ -n "$y" ]; then
+    echo "berth-cursor $x $y" >&2
+  fi
+}
+
+cmd_zoom() {
+  local x="${1:-}" y="${2:-}" x2="${3:-}" y2="${4:-}" w h
+  if ! is_int "$x" || ! is_int "$y" || ! is_int "$x2" || ! is_int "$y2"; then
+    echo "action.sh: zoom requires X Y X2 Y2" >&2
+    exit 1
+  fi
+  # Region is [x, y, x2, y2] -- top-left and bottom-right, not width/height.
+  w=$((x2 - x))
+  h=$((y2 - y))
+  if [ "$w" -le 0 ] || [ "$h" -le 0 ]; then
+    echo "action.sh: zoom region must have positive width and height" >&2
+    exit 1
+  fi
+  _berth_shot="$(mktemp /tmp/berth-shot.XXXXXX.png)"
+  trap 'rm -f -- "${_berth_shot:-}"' EXIT
+  trap 'rm -f -- "${_berth_shot:-}"; exit 141' PIPE
+  if ! import -display "$DISPLAY" -silent -window root \
+      -crop "${w}x${h}+${x}+${y}" +repage "png:${_berth_shot}"; then
+    echo "action.sh: zoom failed" >&2
+    exit 1
+  fi
+  emit_cursor
+  cat "$_berth_shot"
+}
+
+cmd_cursor_position() {
+  # Answered with a frame because the protocol has no other carrier for a
+  # reply; the pointer itself rides on stderr like every other frame's does.
+  cmd_screenshot
+}
+
+cmd_drag() {
+  if [ "$#" -lt 4 ] || [ $(( $# % 2 )) -ne 0 ]; then
+    echo "action.sh: drag requires at least two X Y pairs" >&2
+    exit 1
+  fi
+  local -a pts=("$@") i
+  for i in "${pts[@]}"; do
+    if ! is_int "$i"; then
+      echo "action.sh: drag coordinates must be integers" >&2
+      exit 1
+    fi
+  done
+  xdotool mousemove --sync "${pts[0]}" "${pts[1]}"
+  xdotool mousedown --clearmodifiers 1
+  # mouseup runs even if a move fails, so a failed drag cannot leave the guest
+  # with the button stuck down.
+  trap 'xdotool mouseup 1 >/dev/null 2>&1 || true' EXIT
+  local n=${#pts[@]} j
+  for (( j=2; j<n; j+=2 )); do
+    xdotool mousemove --sync "${pts[j]}" "${pts[j+1]}"
+  done
+  xdotool mouseup --clearmodifiers 1
+  trap - EXIT
+}
+
+cmd_hold_key() {
+  local ms="${1:-}"
+  shift || true
+  if ! [[ "${ms}" =~ ^[0-9]+$ ]] || [ "$#" -eq 0 ]; then
+    echo "action.sh: hold_key requires MS KEY [KEY...]" >&2
+    exit 1
+  fi
+  local mapped=() k
+  for k in "$@"; do
+    [ -z "$k" ] && continue
+    mapped+=("$(map_key "$k")")
+  done
+  if [ "${#mapped[@]}" -eq 0 ]; then
+    echo "action.sh: hold_key requires KEY" >&2
+    exit 1
+  fi
+  local chord
+  chord="$(IFS=+; echo "${mapped[*]}")"
+  xdotool keydown --clearmodifiers -- "$chord"
+  # Same reasoning as drag: release even on failure rather than leaving the
+  # guest with a key held down for the rest of the session.
+  trap 'xdotool keyup "'"$chord"'" >/dev/null 2>&1 || true' EXIT
+  python3 -c 'import time,sys; time.sleep(int(sys.argv[1])/1000.0)' "$ms"
+  xdotool keyup --clearmodifiers -- "$chord"
+  trap - EXIT
+}
+
 cmd_screenshot() {
   # Global so EXIT/PIPE traps can still see the path after this function returns.
   _berth_shot="$(mktemp /tmp/berth-shot.XXXXXX.png)"
@@ -115,11 +219,12 @@ cmd_screenshot() {
     echo "action.sh: screenshot failed" >&2
     exit 1
   fi
+  emit_cursor
   cat "$_berth_shot"
 }
 
 cmd_click() {
-  local x="${1:-}" y="${2:-}" button="${3:-left}" b
+  local x="${1:-}" y="${2:-}" button="${3:-left}" b repeat=1
   if ! is_int "$x" || ! is_int "$y"; then
     echo "action.sh: click requires X Y" >&2
     exit 1
@@ -128,16 +233,36 @@ cmd_click() {
     left|1) b=1 ;;
     middle|2) b=2 ;;
     right|3) b=3 ;;
-    double)
-      xdotool mousemove --sync "$x" "$y" click --clearmodifiers --repeat 2 --delay 50 1
-      return
-      ;;
+    double) b=1; repeat=2 ;;
+    double_left) b=1; repeat=2 ;;
+    double_middle) b=2; repeat=2 ;;
+    double_right) b=3; repeat=2 ;;
     *)
       echo "action.sh: unknown button '$button'" >&2
       exit 1
       ;;
   esac
-  xdotool mousemove --sync "$x" "$y" click --clearmodifiers "$b"
+  shift 3 2>/dev/null || shift $#
+  local mods=() k
+  for k in "$@"; do
+    [ -z "$k" ] && continue
+    mods+=("$(map_key "$k")")
+  done
+  local chord=""
+  if [ "${#mods[@]}" -gt 0 ]; then
+    chord="$(IFS=+; echo "${mods[*]}")"
+    xdotool keydown --clearmodifiers -- "$chord"
+    trap 'xdotool keyup "'"$chord"'" >/dev/null 2>&1 || true' EXIT
+  fi
+  xdotool mousemove --sync "$x" "$y"
+  # --clearmodifiers would undo the very modifiers we are holding.
+  if [ -n "$chord" ]; then
+    xdotool click --repeat "$repeat" --delay 50 "$b"
+    xdotool keyup --clearmodifiers -- "$chord"
+    trap - EXIT
+  else
+    xdotool click --clearmodifiers --repeat "$repeat" --delay 50 "$b"
+  fi
 }
 
 cmd_type() {
@@ -254,7 +379,7 @@ op="$1"
 shift
 
 case "$op" in
-  screenshot|click|type|key|scroll|move|wait) ;;
+  screenshot|zoom|cursor_position|click|drag|type|key|hold_key|scroll|move|wait) ;;
   *)
     echo "action.sh: unknown command '$op'" >&2
     usage
@@ -268,7 +393,11 @@ fi
 
 case "$op" in
   screenshot) cmd_screenshot ;;
+  zoom) cmd_zoom "$@" ;;
+  cursor_position) cmd_cursor_position ;;
   click) cmd_click "$@" ;;
+  drag) cmd_drag "$@" ;;
+  hold_key) cmd_hold_key "$@" ;;
   type) cmd_type "$@" ;;
   key) cmd_key "$@" ;;
   scroll) cmd_scroll "$@" ;;

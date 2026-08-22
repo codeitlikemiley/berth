@@ -1,7 +1,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use berth_protocol::{
-    Ack, AckKind, AckResult, Action, ActionBatch, Frame, FrameKind, LeaseRequest,
+    Ack, AckKind, AckResult, Action, ActionBatch, Frame, FrameKind, LeaseRequest, Point,
 };
 use bollard::Docker;
 use bollard::exec::StartExecResults;
@@ -336,7 +336,8 @@ impl Session {
                 out.stderr_lossy()
             )));
         }
-        let frame = frame_from_png(&self.session_id, out.stdout)?;
+        let cursor = parse_cursor(&out.stderr_lossy());
+        let frame = frame_from_png(&self.session_id, out.stdout, cursor)?;
         self.last_frame = Some(frame.clone());
         Ok(frame)
     }
@@ -486,27 +487,51 @@ async fn run_item(
     let argv = action_argv(item).map_err(ItemError::Failed)?;
     let repeats = key_repeats(item);
     let mut last_stdout = Vec::new();
+    let mut last_stderr = String::new();
     for _ in 0..repeats {
         let out = exec_cmd(docker, container_id, &argv)
             .await
             .map_err(|err| ItemError::Failed(err.to_string()))?;
         if out.exit_code != 0 {
             let msg = if out.stderr_lossy().is_empty() {
-                format!("action.sh exited {}", out.exit_code)
+                format!("driver exited {}", out.exit_code)
             } else {
-                format!("action.sh exited {}: {}", out.exit_code, out.stderr_lossy())
+                format!("driver exited {}: {}", out.exit_code, out.stderr_lossy())
             };
             return Err(ItemError::Failed(msg));
         }
+        last_stderr = out.stderr_lossy();
         last_stdout = out.stdout;
     }
-    if matches!(item, Action::Screenshot {}) {
-        let frame = frame_from_png(session_id, last_stdout)
+    // zoom and cursor_position answer with a frame too: the protocol has no
+    // other way to carry a reply back to the caller.
+    if matches!(
+        item,
+        Action::Screenshot {} | Action::Zoom { .. } | Action::CursorPosition {}
+    ) {
+        let frame = frame_from_png(session_id, last_stdout, parse_cursor(&last_stderr))
             .map_err(|err| ItemError::Failed(err.to_string()))?;
         Ok(Some(frame))
     } else {
         Ok(None)
     }
+}
+
+/// Pull `berth-cursor X Y` out of the driver's stderr.
+///
+/// stdout has to stay a clean PNG, so the pointer rides on stderr behind a
+/// marker. Anything else on stderr is left alone -- it is still the channel the
+/// driver reports real errors on.
+fn parse_cursor(stderr: &str) -> Option<Point> {
+    for line in stderr.lines() {
+        if let Some(rest) = line.trim().strip_prefix("berth-cursor ") {
+            let mut parts = rest.split_whitespace();
+            let x = parts.next()?.parse().ok()?;
+            let y = parts.next()?.parse().ok()?;
+            return Some([x, y]);
+        }
+    }
+    None
 }
 
 async fn exec_cmd(docker: &Docker, container_id: &str, cmd: &[String]) -> Result<ExecOut> {
@@ -567,7 +592,7 @@ async fn wait_exec_exit(docker: &Docker, exec_id: &str) -> Result<i64> {
     }
 }
 
-fn frame_from_png(session_id: &str, data: Vec<u8>) -> Result<Frame> {
+fn frame_from_png(session_id: &str, data: Vec<u8>, cursor: Option<Point>) -> Result<Frame> {
     if data.len() < PNG_MAGIC.len() || !data.starts_with(PNG_MAGIC) {
         return Err(Error::InvalidPng);
     }
@@ -580,7 +605,7 @@ fn frame_from_png(session_id: &str, data: Vec<u8>) -> Result<Frame> {
         height,
         mime: "image/png".into(),
         data,
-        cursor: None,
+        cursor,
     })
 }
 
@@ -662,7 +687,7 @@ mod tests {
         let mut data = vec![0_u8; 16];
         data[..8].copy_from_slice(PNG_MAGIC);
         assert!(matches!(
-            frame_from_png("s_1", data),
+            frame_from_png("s_1", data, None),
             Err(Error::InvalidPng)
         ));
     }

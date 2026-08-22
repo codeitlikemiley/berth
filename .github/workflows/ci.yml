@@ -86,3 +86,15 @@ jobs:
 
       - name: Egress filter holds
         run: ./images/linux-xfce/test-egress.sh berthos-linux-xfce:ci
+
+      # These exist in the repo but are #[ignore]d, so they have never actually
+      # run anywhere. One of them was silently broken. This job is the only one
+      # with a guest image to run them against.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Guest driver e2e
+        env:
+          BERTH_E2E: "1"
+          BERTH_IMAGE: berthos-linux-xfce:ci
+        run: cargo test -p berth-node --test e2e_docker -- --ignored
