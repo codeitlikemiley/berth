@@ -38,6 +38,41 @@ jobs:
       - name: cargo test
         run: cargo test --workspace
 
+  # Every console bug this repo has shipped passed the unit suite: a dialog that
+  # blocked the event loop, a label that claimed forfeiture over live income, a
+  # health panel that never re-read. Those are behaviours on a page, so assert
+  # them in a real browser against the production bundle.
+  console-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/console/package-lock.json
+
+      - name: Install deps
+        working-directory: apps/console
+        run: npm ci
+
+      - name: Install Chromium
+        working-directory: apps/console
+        run: npx playwright install --with-deps chromium
+
+      - name: Browser tests
+        working-directory: apps/console
+        run: npm run test:e2e
+
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: apps/console/playwright-report/
+          retention-days: 7
+
   # The egress guarantee lives in the guest image's entrypoint, not in Rust, so
   # the Rust job above cannot see it regress. Build the real image and assert
   # what it actually does to traffic.

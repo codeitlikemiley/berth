@@ -20,6 +20,8 @@ export default defineConfig({
     },
   },
   test: {
+    // Playwright owns e2e/; vitest would otherwise try to run those specs.
+    exclude: ["node_modules/**", "dist/**", "e2e/**"],
     environment: "node",
     include: ["src/**/*.test.ts"],
   },
