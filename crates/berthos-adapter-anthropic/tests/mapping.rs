@@ -6,7 +6,9 @@ use std::path::PathBuf;
 use berthos_adapter_anthropic::{
     ContentBlock, ToolUse, actions_from_tool_uses, computer_tool_uses, results_from_ack,
 };
-use berthos_protocol::{Ack, AckKind, AckResult, Action, ActionBatchKind, Button, Frame, FrameKind};
+use berthos_protocol::{
+    Ack, AckKind, AckResult, Action, ActionBatchKind, Button, Frame, FrameKind,
+};
 use serde_json::{Value, json};
 
 fn fixture(name: &str) -> Value {
