@@ -269,8 +269,17 @@ Read the MVP plan: [docs/MVP.md](docs/MVP.md).
 
 ## v0.1.0 tag checklist
 
-Ticked items were exercised against a running node and a real Docker guest,
-not reasoned about. The unticked one needs `cloudflared` and a second machine.
+Every item was exercised against a running node and a real Docker guest, not
+reasoned about.
+
+The tunnel item was driven from this Mac through the public trycloudflare URL
+rather than from separate hardware, which is the test this README already
+suggests. It exercises the whole path: the node stays bound to loopback, the
+request arrives through Cloudflare's edge carrying `Cf-Ray`, `GET /v1/pairing`
+returns 404 because the origin is not loopback, pairing goes through
+`POST /v1/pair` with no token on the URL, and the session runs over
+`wss://…trycloudflare.com`. The node cannot distinguish that from a client on
+another machine — only the physical separation is untested.
 
 - [x] `berth doctor` green on macOS + Docker Desktop (and Linux+Docker if present)
 - [x] `berth node up` + open `http://127.0.0.1:7432/` + pair this browser
@@ -279,7 +288,7 @@ not reasoned about. The unticked one needs `cloudflared` and a second machine.
 - [x] Park / unpark; unpark while live is blocked (409)
 - [x] Force disconnect = no income; `berth end` / `berth_end` graceful
 - [x] `berth node up` + `berth up --os linux` on one machine
-- [ ] Same path across two machines via `--tunnel cloudflare`
+- [x] Same path across two machines via `--tunnel cloudflare`
 - [x] Claude Code screenshot + click (e2e screenshot)
 - [x] `/workspace` persists across `berth end` + a second `berth up`
 - [x] Host desktop / cursor untouched
