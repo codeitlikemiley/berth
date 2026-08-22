@@ -15,7 +15,7 @@
 
 v0.1 shipped as a CLI+MCP private Linux outpost. Agents live in `berth mcp`. Before Slice A, humans could not: pairing codes went to node stderr, quotes went to stderr, `berth view` printed a loopback noVNC URL, `berth status` knew one lease from `~/.berth/session.toml`, and `berth doctor` was a text report.
 
-This document is the **node console** (operator HTTP): a Vite + React + TypeScript app in `apps/console/`, embedded in `berth-node` and served by the same axum process that already binds `127.0.0.1:7432`. It is **not** the agent protocol (`spec/computer-session.md`: POST/DELETE + WS). Pairing still uses `Authorization: Bearer`, but Slice A **issues additional bearers** (cap 8) so pairing the browser does not revoke CLI/MCP. Default `berth pair` does **not** revoke; `berth pair --revoke-others` / doctor “Revoke other clients” does. Same sqlite ledger. Same `Quote` meter. Humans create leases with a **What → Where (node) → Review** wizard. The operator **parks** (inventory on) and **unparks** (inventory off) this node; they cannot unpark while a lease is live (409). **Force disconnect** forfeits that row’s host income (`incomeUsd = 0`). Nothing is charged in Slice A. The operator of the parked box is both “user” and “admin” because there is one tenant.
+This document is the **node console** (operator HTTP): a Vite + React + TypeScript app in `apps/console/`, embedded in `berthos-node` and served by the same axum process that already binds `127.0.0.1:7432`. It is **not** the agent protocol (`spec/computer-session.md`: POST/DELETE + WS). Pairing still uses `Authorization: Bearer`, but Slice A **issues additional bearers** (cap 8) so pairing the browser does not revoke CLI/MCP. Default `berth pair` does **not** revoke; `berth pair --revoke-others` / doctor “Revoke other clients” does. Same sqlite ledger. Same `Quote` meter. Humans create leases with a **What → Where (node) → Review** wizard. The operator **parks** (inventory on) and **unparks** (inventory off) this node; they cannot unpark while a lease is live (409). **Force disconnect** forfeits that row’s host income (`incomeUsd = 0`). Nothing is charged in Slice A. The operator of the parked box is both “user” and “admin” because there is one tenant.
 
 It does **not** add a marketplace, wallets, payouts, Stripe, or a hosted SaaS. Those need a control plane that does not exist. The thesis already named the product shape: “one image, one tunnel, one dashboard, no SSH folklore” (`docs/THESIS.md`). Slice A is that dashboard. Slice B is post-MVP items 6–8 in `docs/MVP.md`.
 
@@ -31,16 +31,16 @@ Open computer-session layer: protocol + private node + later mesh. Not another a
 
 | Need | Pre-Slice A path |
 | --- | --- |
-| Pair | Copy `pairing code: ABCD-EFGH` from `berth node up` stderr (`crates/berth-node/src/http.rs` `serve()`). Laptop ran `berth pair --url … --code`. Token landed in `~/.berth/config.toml` (mode 0600). `Db::issue_bearer` **revoked every previous bearer** (`db.rs`); a second pair logged out the first client. |
+| Pair | Copy `pairing code: ABCD-EFGH` from `berth node up` stderr (`crates/berthos-node/src/http.rs` `serve()`). Laptop ran `berth pair --url … --code`. Token landed in `~/.berth/config.toml` (mode 0600). `Db::issue_bearer` **revoked every previous bearer** (`db.rs`); a second pair logged out the first client. |
 | See sessions | `berth status` → `GET /v1/leases/{id}` for the **one** id in `session.toml`. No list. |
 | See cost | `print_quote` / CLI `format_quote`: `$X USD for Ns min (not charged)` on stderr/stdout. sqlite stores `quote_json`, `billable_seconds`, `elapsed_seconds`. Nothing is charged. |
 | Watch the guest | `berth view` prints `http://127.0.0.1:{mapped}/vnc.html`. Tunnel does **not** publish noVNC (`README.md`). |
-| Health | `berth doctor` in `crates/berth-cli/src/doctor.rs`: docker, image, `BERTH_HOME`, paired **CLI** nodes, cloudflared, “host desktop is never driven”. Text, not JSON. |
+| Health | `berth doctor` in `crates/berthos-cli/src/doctor.rs`: docker, image, `BERTH_HOME`, paired **CLI** nodes, cloudflared, “host desktop is never driven”. Text, not JSON. |
 | End / create | `berth end` / `berth up` / MCP `berth_lease` / `berth_end`. |
 
 ### HTTP surface before Slice A
 
-`crates/berth-node/src/http.rs` `router()`:
+`crates/berthos-node/src/http.rs` `router()`:
 
 ```
 Unauthed:  GET  /healthz
@@ -51,13 +51,13 @@ Authed:    POST /v1/leases
            GET  /v1/sessions/{id}    (WebSocket ActionBatch)
 ```
 
-`GET /healthz` returns `{"ok": true}` only. Default bind `127.0.0.1:7432` (`crates/berth-cli/src/lib.rs` `NodeCmd::Up`). Auth is `Authorization: Bearer` after `POST /v1/pair` `{code}` → `{token}` (`brt_` + 64 hex). Pairing code is `XXXX-XXXX` from `random_pairing_code()` in `crates/berth-node/src/id.rs`, stored in `~/.berth/pair.code` (hash in sqlite `pair_tokens`). Token is never placed on a URL (`normalize_url` rejects `?` / `#`; advertised `ws_url` is tested to contain neither `?` nor `token`).
+`GET /healthz` returns `{"ok": true}` only. Default bind `127.0.0.1:7432` (`crates/berthos-cli/src/lib.rs` `NodeCmd::Up`). Auth is `Authorization: Bearer` after `POST /v1/pair` `{code}` → `{token}` (`brt_` + 64 hex). Pairing code is `XXXX-XXXX` from `random_pairing_code()` in `crates/berthos-node/src/id.rs`, stored in `~/.berth/pair.code` (hash in sqlite `pair_tokens`). Token is never placed on a URL (`normalize_url` rejects `?` / `#`; advertised `ws_url` is tested to contain neither `?` nor `token`).
 
 `PairRequest` was `{ code: String }` only (`http.rs`). `issue_bearer` always ran `UPDATE pair_tokens SET revoked_at` for `kind = 'bearer'`. Tests locked this (`pair_issues_bearer_and_rotates`). Slice A changed that default (K4). Today: `{ code, revoke_others?: bool }` with `revoke_others` default **false**; test `pair_issues_bearer_and_keeps_previous`.
 
 ### sqlite before Slice A
 
-`crates/berth-node/src/db.rs` `SCHEMA`: `pair_tokens`, `workspaces`, `leases`, `sessions`.
+`crates/berthos-node/src/db.rs` `SCHEMA`: `pair_tokens`, `workspaces`, `leases`, `sessions`.
 
 No `users`, `nodes`, `ledger_entries`, `hosts`, `invoices`, `payouts`.
 
@@ -67,7 +67,7 @@ Drain runs only on shutdown, **not** on startup. A crash can leave `status = 'ac
 
 ### Quote (unchanged)
 
-`Quote::from_request` in `crates/berth-protocol/src/quote.rs` (MATH.md seeds, **no protocol cut** — cut is mesh settlement):
+`Quote::from_request` in `crates/berthos-protocol/src/quote.rs` (MATH.md seeds, **no protocol cut** — cut is mesh settlement):
 
 ```
 usd_per_second = (P_CPU * vcpu + P_MEM * mem_gib + P_DISK * disk_gib)
@@ -75,7 +75,7 @@ usd_per_second = (P_CPU * vcpu + P_MEM * mem_gib + P_DISK * disk_gib)
 gas_per_second = usd_per_second / USD_PER_GAS    # 0.01
 ```
 
-Worked 2/4/40 isolated Linux (`crates/berth-protocol/tests/serde.rs` `quote_seed_prices_from_math_md`): **$0.0000134/s → $0.04824/hr**. Shared × 0.30 → **$0.014472/hr**. Container floor is `CONTAINER_MIN_SECONDS = 60` in `http.rs`, even for `density=isolated` (MATH.md’s 300s is the VM floor; this guest is a container). `db::billable_seconds(min, elapsed) = elapsed.max(min)`. On stop, that value is written; until then `billable_seconds` is `NULL`.
+Worked 2/4/40 isolated Linux (`crates/berthos-protocol/tests/serde.rs` `quote_seed_prices_from_math_md`): **$0.0000134/s → $0.04824/hr**. Shared × 0.30 → **$0.014472/hr**. Container floor is `CONTAINER_MIN_SECONDS = 60` in `http.rs`, even for `density=isolated` (MATH.md’s 300s is the VM floor; this guest is a container). `db::billable_seconds(min, elapsed) = elapsed.max(min)`. On stop, that value is written; until then `billable_seconds` is `NULL`.
 
 ### Why a UI now, and why not a control plane
 
@@ -87,7 +87,7 @@ Thesis slide 1 is the Mac mini in the closet. Operators will not SSH to scrape s
 
 ### Goals (Slice A)
 
-- Serve a human console from the **same** `berth-node` process, loopback bind unchanged, SPA at `/`.
+- Serve a human console from the **same** `berthos-node` process, loopback bind unchanged, SPA at `/`.
 - Pair in the browser without putting the code or bearer in the URL, Vite env, or screenshot URLs, and **without logging out CLI/MCP**.
 - List leases from sqlite: status, quote, occupancy USD labeled **quoted, not charged**, clock ticking **only while `live`**. Income badge: **$0 / no income** when the row was force-disconnected.
 - Create a lease with a **multi-step wizard** (What → Where/node → Review → `POST /v1/leases`). Linux-only in v0.1. Review shows `Quote` before confirm.
@@ -128,14 +128,14 @@ Hosted or self-hosted control plane: accounts (buyer / host / operator), occupan
 | --- | --- | --- |
 | K1 | **Two slices. Node is the control plane for A.** | Matches `docs/MVP.md` decision 2 and the current process. A SaaS console for one sqlite file is a lie. |
 | K2 | **Vite + React + TS in `apps/console/`. React Router. shadcn/ui + Tailwind CSS v4. Recharts behind `MeterChart` only (bar).** | No frontend exists. Concrete tokens in `tokens.css` (below). One chart library, one chart type. |
-| K3 | **Embed production `dist/` in `berth-node`; serve the SPA at `/`. `/healthz` and `/v1/*` stay API.** Node 22 is required at **compile** time for a real dashboard. | Helium-miner “open the box.” `/console` is not a fork. `cargo install --path crates/berth-cli` embeds whatever `build.rs` produced; CI/release always run Node. Placeholder is a **dev** hatch when `npm` is missing, not a release story. |
+| K3 | **Embed production `dist/` in `berthos-node`; serve the SPA at `/`. `/healthz` and `/v1/*` stay API.** Node 22 is required at **compile** time for a real dashboard. | Helium-miner “open the box.” `/console` is not a fork. `cargo install --path crates/berthos-cli` embeds whatever `build.rs` produced; CI/release always run Node. Placeholder is a **dev** hatch when `npm` is missing, not a release story. |
 | K4 | **Multiple bearers, cap 8. `POST /v1/pair` `{code, revoke_others?}` defaults `revoke_others: false`.** Console never sends `true` except an explicit “Revoke other clients” control. CLI: `berth pair --revoke-others` for the old rotate-all. Token in **`sessionStorage` only**; “remember this browser” writes `localStorage` **only when `window.location` is loopback**. Never query / hash / Vite env. | Today `issue_bearer` revokes all (`db.rs`); console pair would kill `berth mcp`. Cap prevents pile-up. `EventSource` cannot send `Authorization` — do not “fix” that with `?token=`. trycloudflare `localStorage` is a shared-computer leak. |
 | K5 | **Pairing code and loopback CSP only when the request is a loopback-operator request:** `Host` (strip port, accept `[::1]`) is loopback **and** none of `Cf-Ray` / `CF-Connecting-IP` / `CDN-Loop` are present. Ignore `X-Forwarded-*`. If `origin` is set and `Host` equals that origin’s hostname → 404. Document Cloudflare `httpHostHeader: 127.0.0.1` as **unsupported**. | Peer IP is 127.0.0.1 for tunneled traffic. Default quick tunnel forwards `Host: *.trycloudflare.com`. Named tunnels can rewrite Host to localhost; CF headers still mark the edge. |
 | K6 | **Ledger read model = `Quote` × seconds. Clock occupancy only while `live === true`.** Stopped → stored `billable_seconds` (fallback `min_seconds`). `status === "active" && !live` → freeze (`elapsed_seconds` else `min_seconds`), badge **stale / not running**. Label every USD figure **quoted, not charged**. | Crash leftovers stay `active` in sqlite (`drain` is shutdown-only). Ticking those rows is fake occupancy. No 12% cut. |
 | K7 | **Do not iframe `viewer_url` unless the browser hostname is loopback. CSP `frame-src` is Host-gated the same way as K5, as a per-request `Content-Security-Policy` header — never a `<meta>` tag in `index.html`.** | `viewer_url` is always `http://127.0.0.1:{port}/vnc.html`. A tunneled browser’s `127.0.0.1` is the **laptop**. A baked-in meta CSP cannot vary by Host and would re-allow the wrong-machine iframe. |
 | K8 | **Last frame is a cache, not a second driver.** Preview: **204** if live and no screenshot yet; **404** if unknown or not live. `Cache-Control: private, no-store`. Stub guest persists last PNG. | Stopped/drained guests leave `live`. Do not exec `action.sh screenshot`. Do not put Bearer on `img src`. |
 | K9 | **Poll leases + node status in Slice A (2s). No SSE in these PRs.** | `EventSource` + query token is forbidden (K4). `fetch` SSE can wait. |
-| K10 | **`config.toml` allowlist is CLI/MCP, not node.** | `berth-node` never reads `config.toml`. Doctor shows **node** effective list. Wizard create-lease **omits** `network` (same as CLI when the key is unset). |
+| K10 | **`config.toml` allowlist is CLI/MCP, not node.** | `berthos-node` never reads `config.toml`. Doctor shows **node** effective list. Wizard create-lease **omits** `network` (same as CLI when the key is unset). |
 | K11 | **Superseded by K15.** Do not ship a one-button “Lease Linux desktop.” | User decision 2026-08-21. |
 | K12 | **`mode: node \| control-plane` at the API client only.** Pages must not import `api/control-plane.ts` (eslint `no-restricted-imports`). Slice B adapter throws. No wallet widgets in node mode. | One design system. Wizard Where-step is the fleet seam later. |
 | K13 | **Native/SwiftUI is a future HTTP/WS client, not these PRs.** | Do not wrap the host desktop. |
@@ -154,7 +154,7 @@ Hosted or self-hosted control plane: accounts (buyer / host / operator), occupan
 flowchart TB
   subgraph sliceA ["Slice A — this node is the control plane"]
     HumanA[Human browser]
-    Node[berth-node axum 127.0.0.1:7432]
+    Node[berthos-node axum 127.0.0.1:7432]
     SQLite[(~/.berth/node.db)]
     Docker[Docker guest]
     noVNC[noVNC 127.0.0.1:mapped]
@@ -182,7 +182,7 @@ flowchart TB
 Laptop or parked box browser
         │  HTTP same origin (or Vite proxy in dev)
         ▼
-berth-node  127.0.0.1:7432
+berthos-node  127.0.0.1:7432
         ├─ GET  /                 SPA (rust-embed dist)
         ├─ GET  /healthz          {"ok": true}     unauthed
         ├─ POST /v1/pair          {code, revoke_others?} → {token}  unauthed
@@ -278,7 +278,7 @@ const api = createApi("node", { base: "", getToken, setToken });
 
 `createApi("control-plane", …)` throws `Error("control-plane adapter is not implemented")`. Do not use `VITE_BERTH_TOKEN`. `VITE_CONSOLE_MODE` is unnecessary if `main.tsx` hardcodes `"node"`.
 
-`createLease` / `quote` body (K10, K15). Always send `class=private`, `license=linux`, `term=on_demand`; **omit `network`**. Comment in `node.ts`: `// class/license/term match crates/berth-cli mvp_lease_request; resources/density from the wizard`.
+`createLease` / `quote` body (K10, K15). Always send `class=private`, `license=linux`, `term=on_demand`; **omit `network`**. Comment in `node.ts`: `// class/license/term match crates/berthos-cli mvp_lease_request; resources/density from the wizard`.
 
 ```json
 {
@@ -309,7 +309,7 @@ Token persistence (`lib/auth.ts`):
 sequenceDiagram
   participant CLI as berth CLI / MCP
   participant Op as Operator browser
-  participant Node as berth-node
+  participant Node as berthos-node
   Note over CLI,Node: existing laptop pair still valid
   Op->>Node: GET / (SPA, no secrets)
   alt loopback_operator
@@ -359,7 +359,7 @@ fn issue_bearer(&self, revoke_others: bool) -> Result<String> {
 `apps/console/src/lib/ledger.ts`:
 
 ```ts
-/** Matches Quote::usd_per_second in crates/berth-protocol/src/quote.rs */
+/** Matches Quote::usd_per_second in crates/berthos-protocol/src/quote.rs */
 export function usdPerSecond(q: Quote): number {
   return Number(q.gas_per_second) * Number(q.usd_per_gas);
 }
@@ -653,16 +653,16 @@ Resource/allowlist knobs that **already exist**:
 
 ### Serving the SPA from axum
 
-New `crates/berth-node/src/console.rs` + `build.rs`.
+New `crates/berthos-node/src/console.rs` + `build.rs`.
 
 **Compile-time Node (K3) — write this in PR2 README and Rollout:**
 
 1. **CI and any release job** (`.github/workflows/ci.yml`; add a release job when one exists): `actions/setup-node@v4` with **Node 22**, `npm ci && npm run build` in `apps/console`, **then** `cargo fmt` / `clippy -D warnings` / `test --workspace`. The tested binary has a real UI.
-2. **`build.rs`:** if `apps/console/dist/index.html` exists, embed it. Else if `npm` is on `PATH` and `apps/console/package.json` exists, run `npm ci && npm run build` and embed. Else copy `crates/berth-node/console-placeholder/index.html` (“console not built — install Node 22 and rebuild; see README”).
-3. **README (same PR as embed):** “The dashboard is compiled into `berth`. **Node 22 at compile time** (`npm` on PATH, or a pre-built `apps/console/dist`). `cargo install --path crates/berth-cli` without Node embeds the placeholder, not the UI.”
+2. **`build.rs`:** if `apps/console/dist/index.html` exists, embed it. Else if `npm` is on `PATH` and `apps/console/package.json` exists, run `npm ci && npm run build` and embed. Else copy `crates/berthos-node/console-placeholder/index.html` (“console not built — install Node 22 and rebuild; see README”).
+3. **README (same PR as embed):** “The dashboard is compiled into `berth`. **Node 22 at compile time** (`npm` on PATH, or a pre-built `apps/console/dist`). `cargo install --path crates/berthos-cli` without Node embeds the placeholder, not the UI.”
 4. Gitignore `apps/console/node_modules` and `apps/console/dist`. Do not commit generated `dist`.
 
-Placeholder is a **dev** escape hatch for `cargo test -p berth-protocol` machines without npm. It is not the tagged-release story.
+Placeholder is a **dev** escape hatch for `cargo test -p berthos-protocol` machines without npm. It is not the tagged-release story.
 
 Axum: API routes first; fallback serves embed (`index.html` for `/` and client routes; hashed assets by path). `Content-Type` via mime guess. `Cache-Control: no-cache` for `index.html`, immutable for hashed assets.
 
@@ -731,7 +731,7 @@ using the actual bound addr. Never append `?code=`.
 `apps/console/src/api/control-plane.ts` may declare:
 
 ```ts
-/** Slice B. Not served by berth-node. Do not import from pages/. */
+/** Slice B. Not served by berthos-node. Do not import from pages/. */
 export type AccountRole = "buyer" | "host" | "operator";
 export interface Invoice { /* occupancy × quote; MATH.md caps */ }
 export interface Payout { /* host share after protocol_cut 0.12 */ }
@@ -848,7 +848,7 @@ Errors (map in `into_response`):
 | Tokens | `tokens.css` values above; `html.dark`; `berth.theme` |
 | Charts | Recharts **bar**, only via `MeterChart`, `var(--chart-1)` |
 | Package manager | **npm** + committed `package-lock.json` |
-| Serve | rust-embed from `berth-node` at `/` |
+| Serve | rust-embed from `berthos-node` at `/` |
 | Dev | Vite proxy to `127.0.0.1:7432` |
 | Compile | Node 22 in CI/release; `build.rs` runs npm when present |
 | Slice B | same package, API adapter seam; pages cannot import it |
@@ -950,9 +950,9 @@ Threat model Slice A: **anyone who can speak to loopback on the parked box** is 
 
 ## Observability
 
-Today: `eprintln!` for pairing, bind, quotes, cloudflared exit. HTTP errors are `{"error": "…"}`. No tracing/metrics crate (`berth-node/Cargo.toml`). Do not add one.
+Today: `eprintln!` for pairing, bind, quotes, cloudflared exit. HTTP errors are `{"error": "…"}`. No tracing/metrics crate (`berthos-node/Cargo.toml`). Do not add one.
 
-Slice A — `access_log` in `crates/berth-node/src/http.rs` (~10 lines, `middleware::from_fn`):
+Slice A — `access_log` in `crates/berthos-node/src/http.rs` (~10 lines, `middleware::from_fn`):
 
 ```rust
 fn format_access_log(method: &str, path: &str, status: u16, ms: u64) -> String {
@@ -989,7 +989,7 @@ No feature-flag service.
 9. **Rollback:** revert the PR. `node_state` default parked=1 is harmless. `forfeited=0` on old rows is graceful. Extra bearers are harmless.
 10. **Staged:** private class only. Do not announce an earnings dashboard. Income is a **forfeit flag**, not a payout.
 
-`cargo test -p berth-node` without npm uses the placeholder embed; `GET /` 200 and HTML contains no `brt_` / pairing code. CI always has Node 22 and a real `dist`.
+`cargo test -p berthos-node` without npm uses the placeholder embed; `GET /` 200 and HTML contains no `brt_` / pairing code. CI always has Node 22 and a real `dist`.
 
 ---
 
@@ -1071,13 +1071,13 @@ flowchart LR
 
 **Files / components:**
 
-- `crates/berth-node/src/http.rs` — routes, `PairRequest.revoke_others`, `LeaseView::from_row` on POST/GET/DELETE/list, `loopback_operator`, `access_log`, `Error::TooManyBearers`, `AtomicBool` tunnel flags, tests
-- `crates/berth-node/src/db.rs` — `issue_bearer(revoke_others)`, `count_active_bearers`, `list_leases`, `LEASE_SELECT` + `LeaseRow` fields
-- `crates/berth-node/src/error.rs` — `TooManyBearers` → 409
-- `crates/berth-node/src/guest.rs` — `last_frame()`; stub stores PNG
-- `crates/berth-node/src/session.rs` — already has `last_frame`
-- `crates/berth-cli/src/lib.rs` — `berth pair --revoke-others`
-- `crates/berth-cli/src/client.rs` — `pair(code, revoke_others)`; `LeaseView` additive `#[serde(default)]`
+- `crates/berthos-node/src/http.rs` — routes, `PairRequest.revoke_others`, `LeaseView::from_row` on POST/GET/DELETE/list, `loopback_operator`, `access_log`, `Error::TooManyBearers`, `AtomicBool` tunnel flags, tests
+- `crates/berthos-node/src/db.rs` — `issue_bearer(revoke_others)`, `count_active_bearers`, `list_leases`, `LEASE_SELECT` + `LeaseRow` fields
+- `crates/berthos-node/src/error.rs` — `TooManyBearers` → 409
+- `crates/berthos-node/src/guest.rs` — `last_frame()`; stub stores PNG
+- `crates/berthos-node/src/session.rs` — already has `last_frame`
+- `crates/berthos-cli/src/lib.rs` — `berth pair --revoke-others`
+- `crates/berthos-cli/src/client.rs` — `pair(code, revoke_others)`; `LeaseView` additive `#[serde(default)]`
 
 **Dependencies:** none (HEAD `main` MVP)
 
@@ -1085,7 +1085,7 @@ flowchart LR
 
 **Accept:**
 
-- `cargo test -p berth-node` and `cargo test -p berth-cli` green.
+- `cargo test -p berthos-node` and `cargo test -p berthos-cli` green.
 - List empty/one/stopped; 401 without bearer on `GET /v1/leases` and `GET /v1/leases/{id}`.
 - POST 201 includes `started_at`, `live: true` (test fails if `from_row` runs before `live.insert`).
 - Default pair: t1 remains valid after t2; `--revoke-others` / `revoke_others: true` invalidates t1; 9th pair without revoke is 409.
@@ -1106,10 +1106,10 @@ flowchart LR
 - `apps/console/**` — Vite React TS, React Router, Tailwind v4, shadcn, **committed** `tokens.css` (values in this doc), theme toggle, `api/node.ts` (`pair`, `createApi("node")`), `lib/auth.ts` (sessionStorage; remember only on loopback), `/pair` page with **code input + POST /v1/pair** (no auto-code yet)
 - `apps/console/vite.config.ts` — proxy
 - `apps/console/eslint.config.js` — restricted import of `control-plane`
-- `crates/berth-node/src/console.rs`, fallback sets **`Content-Security-Policy` header** (no `<meta>` CSP in dist or placeholder)
-- `crates/berth-node/build.rs`, `console-placeholder/index.html`
-- `crates/berth-node/Cargo.toml` — `rust-embed`
-- `crates/berth-node/src/http.rs` `serve()` — print `console: http://{actual}/`
+- `crates/berthos-node/src/console.rs`, fallback sets **`Content-Security-Policy` header** (no `<meta>` CSP in dist or placeholder)
+- `crates/berthos-node/build.rs`, `console-placeholder/index.html`
+- `crates/berthos-node/Cargo.toml` — `rust-embed`
+- `crates/berthos-node/src/http.rs` `serve()` — print `console: http://{actual}/`
 - `.github/workflows/ci.yml` — Node 22, `npm ci && npm run build` in `apps/console` **before** cargo
 - `README.md` — Node 22 at **compile** time for the dashboard (short note; full human path in PR8)
 - `.gitignore` — `node_modules`, `dist`
@@ -1121,7 +1121,7 @@ flowchart LR
 **Accept:**
 
 - `npm run build` works.
-- `cargo test -p berth-node`: `GET /` 200; `GET /healthz` 200; `GET /v1/leases` **401** (route exists from PR1); HTML contains no pairing code / no `brt_` / no `Content-Security-Policy` meta.
+- `cargo test -p berthos-node`: `GET /` 200; `GET /healthz` 200; `GET /v1/leases` **401** (route exists from PR1); HTML contains no pairing code / no `brt_` / no `Content-Security-Policy` meta.
 - CSP **response header** (not body): loopback Host includes loopback `frame-src`; `Host: *.trycloudflare.com` has `frame-src 'none'`.
 - Access log includes `GET /` (path only).
 - Theme: computed `--bg` on `html` / `html.dark` matches `tokens.css`; no `#` in `src/pages/**` or `src/components/**` except `components/ui`.
@@ -1136,12 +1136,12 @@ flowchart LR
 
 **Files / components:**
 
-- `crates/berth-node/src/db.rs` — `node_state`, `ensure_node_state` default parked=1, `stop_lease(..., EndReason)`, `ALTER` `end_reason` / `forfeited`
-- `crates/berth-node/src/http.rs` — `POST /v1/node/park|unpark`, `POST /v1/quote`, `POST /v1/leases/{id}/force`, create 409 if unparked **before** Docker, `GET /v1/node` + `parked`
-- `crates/berth-node/src/error.rs` — `Unparked`, `Occupied { live_lease_id }`
-- `crates/berth-cli/src/lib.rs` — `berth end --force`; `berth up` surfaces unparked 409
-- `crates/berth-cli/src/client.rs` — `force_lease`; additive `forfeited` / `end_reason`
-- `crates/berth-mcp/src/tools.rs` — `berth_end` stays DELETE (no force)
+- `crates/berthos-node/src/db.rs` — `node_state`, `ensure_node_state` default parked=1, `stop_lease(..., EndReason)`, `ALTER` `end_reason` / `forfeited`
+- `crates/berthos-node/src/http.rs` — `POST /v1/node/park|unpark`, `POST /v1/quote`, `POST /v1/leases/{id}/force`, create 409 if unparked **before** Docker, `GET /v1/node` + `parked`
+- `crates/berthos-node/src/error.rs` — `Unparked`, `Occupied { live_lease_id }`
+- `crates/berthos-cli/src/lib.rs` — `berth end --force`; `berth up` surfaces unparked 409
+- `crates/berthos-cli/src/client.rs` — `force_lease`; additive `forfeited` / `end_reason`
+- `crates/berthos-mcp/src/tools.rs` — `berth_end` stays DELETE (no force)
 
 **Dependencies:** PR1
 
@@ -1289,13 +1289,13 @@ Stub types may exist in `api/control-plane.ts` from PR2; they must not render. *
 - `docs/TENANCY.md` — isolation; host desktop is never a session
 - `docs/REVIEW.md` — credits USD-pegged; wallet optional for cash-out
 - `spec/computer-session.md` — `POST /v1/leases`, `DELETE /v1/leases/{id}`, ActionBatch/Frame (agent socket)
-- `crates/berth-node/src/http.rs` — `router()`, `LeaseView`, `print_quote`, bind/tunnel, inline POST `LeaseView`
-- `crates/berth-node/src/db.rs` — schema, `billable_seconds`, `issue_bearer(revoke_others)` default false, `node_state`, lease `end_reason`/`forfeited`
-- `crates/berth-protocol/src/quote.rs` — `Quote::from_request`, `usd_per_second`
-- `crates/berth-cli/src/lib.rs` — `up | pair [--revoke-others] | view | end [--force] | status | mcp | doctor | node up`
-- `crates/berth-cli/src/doctor.rs` — probe split ok/warn/fail; no token in output
-- `crates/berth-cli/src/config.rs` — `config.toml` nodes + allowlist; URL must not include query
-- `crates/berth-mcp/src/tools.rs` — `berth_lease` / screenshot / click / type / key / scroll / `berth_end`
+- `crates/berthos-node/src/http.rs` — `router()`, `LeaseView`, `print_quote`, bind/tunnel, inline POST `LeaseView`
+- `crates/berthos-node/src/db.rs` — schema, `billable_seconds`, `issue_bearer(revoke_others)` default false, `node_state`, lease `end_reason`/`forfeited`
+- `crates/berthos-protocol/src/quote.rs` — `Quote::from_request`, `usd_per_second`
+- `crates/berthos-cli/src/lib.rs` — `up | pair [--revoke-others] | view | end [--force] | status | mcp | doctor | node up`
+- `crates/berthos-cli/src/doctor.rs` — probe split ok/warn/fail; no token in output
+- `crates/berthos-cli/src/config.rs` — `config.toml` nodes + allowlist; URL must not include query
+- `crates/berthos-mcp/src/tools.rs` — `berth_lease` / screenshot / click / type / key / scroll / `berth_end`
 - `README.md` — human console at `/`; CLI/MCP for agents; noVNC node-local
 - Cloudflare Tunnel origin parameters — `httpHostHeader` ([docs](https://developers.cloudflare.com/tunnel/advanced/origin-parameters/))
 - GitHub: https://github.com/codeitlikemiley/berth

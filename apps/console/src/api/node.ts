@@ -11,7 +11,7 @@ import type {
 export type { BerthApi, ConsoleMode, NodeStatus, WizardLease } from "./types";
 
 export function leaseRequestBody(req: WizardLease) {
-  // class/license/term match crates/berth-cli mvp_lease_request; resources/density from the wizard
+  // class/license/term match crates/berthos-cli mvp_lease_request; resources/density from the wizard
   return {
     os: req.os,
     class: "private",

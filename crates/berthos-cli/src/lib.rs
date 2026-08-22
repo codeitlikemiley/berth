@@ -1,0 +1,1016 @@
+mod client;
+mod config;
+mod doctor;
+mod error;
+
+use std::net::SocketAddr;
+use std::path::Path;
+use std::process::ExitCode;
+
+use berthos_protocol::{LeaseRequest, Os, Quote, network_from_allowlist_key};
+use clap::{Parser, Subcommand};
+
+use crate::client::{LeaseView, NodeClient};
+use crate::config::{
+    Config, DEFAULT_NODE, DEFAULT_URL, NodeConfig, Session, berth_home, clear_session,
+    load_session, normalize_url, require_session, resolve_ws_url, save_session, url_is_loopback,
+    validate_node_name,
+};
+pub use crate::error::{Error, Result};
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "berth",
+    version,
+    about = "Lease an isolated computer to an agent"
+)]
+pub struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Start a computer session
+    Up {
+        /// Guest OS (MVP: linux)
+        #[arg(long, default_value = "linux")]
+        os: String,
+        /// Paired node name from config.toml
+        #[arg(long, default_value = DEFAULT_NODE)]
+        node: String,
+        /// Reuse this workspace's /workspace disk. Omit for a fresh one.
+        #[arg(long)]
+        workspace: Option<String>,
+    },
+    /// Run a berth node
+    #[command(subcommand)]
+    Node(NodeCmd),
+    /// MCP stdio server
+    Mcp,
+    /// Pair with a node
+    Pair {
+        /// Node base URL
+        #[arg(long, default_value = DEFAULT_URL)]
+        url: String,
+        /// Pairing code printed by `berth node up`
+        #[arg(long)]
+        code: String,
+        /// Name stored under [nodes.<name>] in config.toml
+        #[arg(long, default_value = DEFAULT_NODE)]
+        node: String,
+        /// Revoke previously issued bearer tokens
+        #[arg(long)]
+        revoke_others: bool,
+    },
+    /// End a session
+    End {
+        /// Forfeit host income for this lease
+        #[arg(long)]
+        force: bool,
+    },
+    /// Print the session viewer URL
+    View,
+    /// Show session status
+    Status,
+    /// Diagnose local setup
+    Doctor,
+    /// Inspect and reclaim workspace disks
+    #[command(subcommand)]
+    Workspace(WorkspaceCmd),
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkspaceCmd {
+    /// List workspaces and whether each can be reused
+    Ls {
+        #[arg(long, default_value = DEFAULT_NODE)]
+        node: String,
+    },
+    /// Delete a workspace's disk. Refused while a lease is live.
+    Rm {
+        id: String,
+        #[arg(long, default_value = DEFAULT_NODE)]
+        node: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum NodeCmd {
+    /// Start the HTTP/WS control plane
+    Up {
+        /// Listen address (loopback default; never host-network)
+        #[arg(long, default_value = "127.0.0.1:7432")]
+        bind: SocketAddr,
+        /// Public edge. Node still binds loopback. `cloudflare` runs cloudflared.
+        #[arg(long, value_enum)]
+        tunnel: Option<TunnelArg>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
+enum TunnelArg {
+    Cloudflare,
+}
+
+pub fn exit(cli: Cli) -> ExitCode {
+    let home = match berth_home() {
+        Ok(home) => home,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::from(1);
+        }
+    };
+    match execute(cli, &home) {
+        Ok(out) => {
+            if !out.is_empty() {
+                println!("{out}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("{err}");
+            ExitCode::from(err.exit_code())
+        }
+    }
+}
+
+pub fn execute(cli: Cli, home: &Path) -> Result<String> {
+    match cli.command {
+        Command::Node(NodeCmd::Up { bind, tunnel }) => {
+            if tunnel.is_some() && !bind.ip().is_loopback() {
+                return Err(Error::Usage(
+                    "--tunnel requires a loopback --bind (cloudflared is the public edge)".into(),
+                ));
+            }
+            let tunnel = tunnel.map(|t| match t {
+                TunnelArg::Cloudflare => berthos_node::TunnelKind::Cloudflare,
+            });
+            berthos_node::serve_blocking(bind, tunnel)?;
+            Ok(String::new())
+        }
+        Command::Pair {
+            url,
+            code,
+            node,
+            revoke_others,
+        } => cmd_pair(home, &url, &code, &node, revoke_others),
+        Command::Up {
+            os,
+            node,
+            workspace,
+        } => cmd_up(home, &os, &node, workspace.as_deref()),
+        Command::Workspace(WorkspaceCmd::Ls { node }) => cmd_workspace_ls(home, &node),
+        Command::Workspace(WorkspaceCmd::Rm { id, node }) => cmd_workspace_rm(home, &id, &node),
+        Command::View => cmd_view(home),
+        Command::End { force } => cmd_end(home, force),
+        Command::Status => cmd_status(home),
+        Command::Mcp => {
+            berthos_mcp::serve_blocking(home)?;
+            Ok(String::new())
+        }
+        Command::Doctor => crate::doctor::run_doctor(home),
+    }
+}
+
+fn cmd_pair(home: &Path, url: &str, code: &str, node: &str, revoke_others: bool) -> Result<String> {
+    validate_node_name(node)?;
+    let url = normalize_url(url)?;
+    if code.trim().is_empty() {
+        return Err(Error::Usage("code is empty".into()));
+    }
+    let token = NodeClient::new(&url, None)?.pair(code.trim(), revoke_others)?;
+    let mut cfg = Config::load(home)?;
+    cfg.nodes.insert(
+        node.to_string(),
+        NodeConfig {
+            url: url.clone(),
+            token,
+        },
+    );
+    cfg.save(home)?;
+    Ok(format!("paired {node} at {url}"))
+}
+
+fn cmd_up(home: &Path, os: &str, node: &str, workspace: Option<&str>) -> Result<String> {
+    validate_node_name(node)?;
+    let os = parse_os(os)?;
+    let cfg = Config::load(home)?;
+    let req = mvp_lease_request(os, cfg.allowlist.as_deref(), workspace)?;
+    if let Some(cur) = load_session(home)? {
+        return Err(Error::Usage(format!(
+            "lease {} is current; run berth end first",
+            cur.lease_id
+        )));
+    }
+    let node_cfg = cfg.node(node)?;
+    let lease = NodeClient::new(&node_cfg.url, Some(&node_cfg.token))?.create_lease(&req)?;
+    let ws_url = resolve_ws_url(Some(&lease.ws_url), &node_cfg.url, &lease.session_id);
+    save_session(
+        home,
+        &Session {
+            node: node.to_string(),
+            lease_id: lease.lease_id.clone(),
+            session_id: lease.session_id.clone(),
+            viewer_url: lease.viewer_url.clone(),
+            ws_url: Some(ws_url),
+        },
+    )?;
+    Ok(format_up(&lease, &node_cfg.url))
+}
+
+fn cmd_view(home: &Path) -> Result<String> {
+    let session = require_session(home)?;
+    session
+        .viewer_url
+        .ok_or_else(|| Error::Usage(format!("lease {} has no viewer_url", session.lease_id)))
+}
+
+fn cmd_status(home: &Path) -> Result<String> {
+    let session = require_session(home)?;
+    let cfg = Config::load(home)?;
+    let node = cfg.node(&session.node)?;
+    let lease = NodeClient::new(&node.url, Some(&node.token))?.get_lease(&session.lease_id)?;
+    Ok(format_status(&session.node, &node.url, &lease))
+}
+
+fn cmd_end(home: &Path, force: bool) -> Result<String> {
+    let session = require_session(home)?;
+    let cfg = Config::load(home)?;
+    let node = cfg.node(&session.node)?;
+    let client = NodeClient::new(&node.url, Some(&node.token))?;
+    let result = if force {
+        client.force_lease(&session.lease_id)
+    } else {
+        client.delete_lease(&session.lease_id)
+    };
+    match result {
+        Ok(lease) => {
+            clear_session(home)?;
+            Ok(format_end(&lease))
+        }
+        Err(Error::Api { status: 404, .. }) => {
+            clear_session(home)?;
+            Ok(format!("lease {} gone", session.lease_id))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn parse_os(s: &str) -> Result<Os> {
+    match s.to_ascii_lowercase().as_str() {
+        "linux" => Ok(Os::Linux),
+        "windows" => Ok(Os::Windows),
+        "macos" => Ok(Os::Macos),
+        other => Err(Error::Usage(format!(
+            "unknown os `{other}`; expected linux, windows, or macos"
+        ))),
+    }
+}
+
+fn mvp_lease_request(
+    os: Os,
+    allowlist: Option<&str>,
+    workspace: Option<&str>,
+) -> Result<LeaseRequest> {
+    let mut value = serde_json::json!({
+        "os": os,
+        "class": "private",
+        "license": "linux",
+        "density": "isolated",
+        "term": "on_demand",
+        "resources": { "vcpu": 2, "mem_gib": 4, "disk_gib": 40 }
+    });
+    if let Some(net) = network_from_allowlist_key(allowlist) {
+        value["network"] = serde_json::to_value(net)?;
+    }
+    if let Some(id) = workspace {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(Error::Usage("--workspace is empty".into()));
+        }
+        value["workspace"] = serde_json::json!({ "id": id, "disk_gib": 40 });
+    }
+    let req: LeaseRequest = serde_json::from_value(value)?;
+    req.validate_mvp()?;
+    Ok(req)
+}
+
+fn cmd_workspace_ls(home: &Path, node: &str) -> Result<String> {
+    validate_node_name(node)?;
+    let cfg = Config::load(home)?;
+    let cfg_node = cfg.node(node)?;
+    let client = NodeClient::new(&cfg_node.url, Some(&cfg_node.token))?;
+    let list = client.list_workspaces()?;
+    if list.is_empty() {
+        return Ok("no workspaces".into());
+    }
+    let mut lines = vec![format!(
+        "{:<26} {:>7} {:>7}  {}",
+        "id", "leases", "live", "reuse with"
+    )];
+    for w in list {
+        lines.push(format!(
+            "{:<26} {:>7} {:>7}  {}",
+            w.id,
+            w.leases,
+            w.active_leases,
+            if w.reusable {
+                format!("berth up --workspace {}", w.id)
+            } else {
+                "in use".into()
+            }
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+fn cmd_workspace_rm(home: &Path, id: &str, node: &str) -> Result<String> {
+    validate_node_name(node)?;
+    let cfg = Config::load(home)?;
+    let cfg_node = cfg.node(node)?;
+    let client = NodeClient::new(&cfg_node.url, Some(&cfg_node.token))?;
+    client.delete_workspace(id)?;
+    Ok(format!("removed workspace {id}"))
+}
+
+fn format_up(lease: &LeaseView, node_url: &str) -> String {
+    let mut lines = vec![format!(
+        "lease {} session {}",
+        lease.lease_id, lease.session_id
+    )];
+    if url_is_loopback(node_url)
+        && let Some(viewer) = &lease.viewer_url
+    {
+        lines.push(format!("viewer {viewer}"));
+    }
+    lines.push(format_quote(&lease.lease_id, &lease.quote));
+    lines.join("\n")
+}
+
+fn format_status(node: &str, url: &str, lease: &LeaseView) -> String {
+    let mut lines = vec![
+        format!("lease: {}", lease.lease_id),
+        format!("status: {}", lease.status),
+        format!("session: {}", lease.session_id),
+        format!("node: {node} ({url})"),
+    ];
+    if url_is_loopback(url)
+        && let Some(viewer) = &lease.viewer_url
+    {
+        lines.push(format!("viewer: {viewer}"));
+    }
+    if let Some(secs) = lease.billable_seconds {
+        lines.push(format!("billable_seconds: {secs}"));
+    }
+    if let Some(secs) = lease.elapsed_seconds {
+        lines.push(format!("elapsed_seconds: {secs}"));
+    }
+    lines.join("\n")
+}
+
+fn format_end(lease: &LeaseView) -> String {
+    match lease.billable_seconds {
+        Some(secs) => format!("lease {} stopped billable_seconds={secs}", lease.lease_id),
+        None => format!("lease {} {}", lease.lease_id, lease.status),
+    }
+}
+
+fn format_quote(lease_id: &str, quote: &Quote) -> String {
+    let usd = quote
+        .usd_per_second()
+        .ok()
+        .map(|rate| rate * quote.min_seconds as f64)
+        .unwrap_or(0.0);
+    format!(
+        "lease {lease_id} quote ${usd:.6} USD for {}s min (not charged)",
+        quote.min_seconds
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use httptest::{Expectation, Server, matchers::*, responders::*};
+    use serde_json::json;
+    use std::path::Path;
+
+    fn run(home: &Path, args: &[&str]) -> Result<String> {
+        let mut full = vec!["berth"];
+        full.extend(args);
+        let cli = Cli::try_parse_from(&full).unwrap();
+        execute(cli, home)
+    }
+
+    fn sample_quote() -> serde_json::Value {
+        json!({
+            "vcpu": 2,
+            "mem_gib": 4,
+            "disk_gib": 40,
+            "os": "linux",
+            "os_mult": 1.0,
+            "density": "isolated",
+            "density_mult": 1.0,
+            "term": "on_demand",
+            "min_seconds": 60,
+            "pooled": false,
+            "gas_per_second": "0.00134",
+            "currency": "gas",
+            "usd_per_gas": "0.01"
+        })
+    }
+
+    fn sample_lease(status: &str, billable: Option<u64>) -> serde_json::Value {
+        let mut lease = json!({
+            "lease_id": "l_1",
+            "session_id": "s_1",
+            "ws_url": "ws://127.0.0.1:7432/v1/sessions/s_1",
+            "viewer_url": "http://127.0.0.1:6080/vnc.html",
+            "quote": sample_quote(),
+            "status": status
+        });
+        if let Some(secs) = billable {
+            lease["billable_seconds"] = json!(secs);
+            lease["elapsed_seconds"] = json!(secs);
+        }
+        lease
+    }
+
+    #[test]
+    fn parse_pair_and_up_flags() {
+        let pair = Cli::try_parse_from([
+            "berth",
+            "pair",
+            "--url",
+            "http://127.0.0.1:7432",
+            "--code",
+            "ABCD-EFGH",
+        ])
+        .unwrap();
+        assert!(matches!(
+            pair.command,
+            Command::Pair { ref url, ref code, ref node, revoke_others }
+                if url == DEFAULT_URL && code == "ABCD-EFGH" && node == DEFAULT_NODE && !revoke_others
+        ));
+        let revoke = Cli::try_parse_from([
+            "berth",
+            "pair",
+            "--url",
+            "http://127.0.0.1:7432",
+            "--code",
+            "ABCD-EFGH",
+            "--revoke-others",
+        ])
+        .unwrap();
+        assert!(matches!(
+            revoke.command,
+            Command::Pair {
+                revoke_others: true,
+                ..
+            }
+        ));
+        let up =
+            Cli::try_parse_from(["berth", "up", "--os", "linux", "--node", "home-nuc"]).unwrap();
+        assert!(matches!(
+            up.command,
+            Command::Up { ref os, ref node, .. } if os == "linux" && node == "home-nuc"
+        ));
+    }
+
+    fn unauthorized() -> impl httptest::responders::Responder {
+        status_code(401)
+            .append_header("content-type", "application/json")
+            .body(r#"{"error":"unauthorized"}"#)
+    }
+
+    fn seed_pair(home: &Path, url: &str, token: &str) {
+        let mut cfg = Config::default();
+        cfg.nodes.insert(
+            "default".into(),
+            NodeConfig {
+                url: url.into(),
+                token: token.into(),
+            },
+        );
+        cfg.save(home).unwrap();
+    }
+
+    fn seed_session(home: &Path) {
+        save_session(
+            home,
+            &Session {
+                node: "default".into(),
+                lease_id: "l_1".into(),
+                session_id: "s_1".into(),
+                viewer_url: Some("http://127.0.0.1:6080/vnc.html".into()),
+                ws_url: Some("ws://127.0.0.1:7432/v1/sessions/s_1".into()),
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn up_windows_rejected_before_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = run(dir.path(), &["up", "--os", "windows"]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Windows"), "{msg}");
+        assert!(msg.contains("v0.1"), "{msg}");
+        assert!(msg.contains("not implemented"), "{msg}");
+    }
+
+    #[test]
+    fn up_macos_rejected_without_http() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::run();
+        let url = format!("http://{}", server.addr());
+        seed_pair(dir.path(), &url, "brt_secret");
+        let err = run(dir.path(), &["up", "--os", "macos"]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("macOS"), "{msg}");
+        assert!(msg.contains("v0.1"), "{msg}");
+        assert!(msg.contains("not implemented"), "{msg}");
+    }
+
+    #[test]
+    fn up_lease_unauthorized() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(all_of![
+                request::method_path("POST", "/v1/leases"),
+                request::headers(contains(("authorization", "Bearer brt_stale"))),
+            ])
+            .respond_with(unauthorized()),
+        );
+        let url = format!("http://{}", server.addr());
+        seed_pair(dir.path(), &url, "brt_stale");
+        let err = run(dir.path(), &["up", "--os", "linux"]).unwrap_err();
+        assert!(err.to_string().contains("unauthorized"));
+        assert!(load_session(dir.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn status_lease_unauthorized() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(all_of![
+                request::method_path("GET", "/v1/leases/l_1"),
+                request::headers(contains(("authorization", "Bearer brt_stale"))),
+            ])
+            .respond_with(unauthorized()),
+        );
+        let url = format!("http://{}", server.addr());
+        seed_pair(dir.path(), &url, "brt_stale");
+        seed_session(dir.path());
+        let err = run(dir.path(), &["status"]).unwrap_err();
+        assert!(err.to_string().contains("unauthorized"));
+        assert!(load_session(dir.path()).unwrap().is_some());
+    }
+
+    #[test]
+    fn end_lease_unauthorized_keeps_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(all_of![
+                request::method_path("DELETE", "/v1/leases/l_1"),
+                request::headers(contains(("authorization", "Bearer brt_stale"))),
+            ])
+            .respond_with(unauthorized()),
+        );
+        let url = format!("http://{}", server.addr());
+        seed_pair(dir.path(), &url, "brt_stale");
+        seed_session(dir.path());
+        let err = run(dir.path(), &["end"]).unwrap_err();
+        assert!(err.to_string().contains("unauthorized"));
+        assert_eq!(require_session(dir.path()).unwrap().lease_id, "l_1");
+    }
+
+    #[test]
+    fn up_unparked_surfaces_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(all_of![
+                request::method_path("POST", "/v1/leases"),
+                request::headers(contains(("authorization", "Bearer brt_secret"))),
+            ])
+            .respond_with(
+                status_code(409)
+                    .append_header("content-type", "application/json")
+                    .body(r#"{"error":"node is unparked"}"#),
+            ),
+        );
+        let url = format!("http://{}", server.addr());
+        seed_pair(dir.path(), &url, "brt_secret");
+        let err = run(dir.path(), &["up", "--os", "linux"]).unwrap_err();
+        assert!(err.to_string().contains("node is unparked"));
+        assert!(load_session(dir.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn end_force_posts_force_and_clears_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(all_of![
+                request::method_path("POST", "/v1/leases/l_1/force"),
+                request::headers(contains(("authorization", "Bearer brt_secret"))),
+            ])
+            .respond_with(json_encoded({
+                let mut lease = sample_lease("stopped", Some(60));
+                lease["end_reason"] = json!("forced");
+                lease["forfeited"] = json!(true);
+                lease
+            })),
+        );
+        let url = format!("http://{}", server.addr());
+        seed_pair(dir.path(), &url, "brt_secret");
+        seed_session(dir.path());
+        let out = run(dir.path(), &["end", "--force"]).unwrap();
+        assert!(out.contains("l_1"));
+        assert!(out.contains("billable_seconds=60"));
+        assert!(load_session(dir.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn end_404_clears_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(all_of![
+                request::method_path("DELETE", "/v1/leases/l_1"),
+                request::headers(contains(("authorization", "Bearer brt_secret"))),
+            ])
+            .respond_with(
+                status_code(404)
+                    .append_header("content-type", "application/json")
+                    .body(r#"{"error":"not found"}"#),
+            ),
+        );
+        let url = format!("http://{}", server.addr());
+        seed_pair(dir.path(), &url, "brt_secret");
+        seed_session(dir.path());
+        let out = run(dir.path(), &["end"]).unwrap();
+        assert!(out.contains("l_1"));
+        assert!(out.contains("gone"));
+        assert!(load_session(dir.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn up_without_pair_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = run(dir.path(), &["up", "--os", "linux"]).unwrap_err();
+        assert!(err.to_string().contains("not paired"));
+    }
+
+    #[test]
+    fn view_without_session_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = run(dir.path(), &["view"]).unwrap_err();
+        assert!(err.to_string().contains("no active session"));
+    }
+
+    #[test]
+    fn parse_mcp() {
+        let cli = Cli::try_parse_from(["berth", "mcp"]).unwrap();
+        assert!(matches!(cli.command, Command::Mcp));
+    }
+
+    #[test]
+    fn parse_end_force() {
+        let end = Cli::try_parse_from(["berth", "end"]).unwrap();
+        assert!(matches!(end.command, Command::End { force: false }));
+        let force = Cli::try_parse_from(["berth", "end", "--force"]).unwrap();
+        assert!(matches!(force.command, Command::End { force: true }));
+    }
+
+    #[test]
+    fn parse_doctor() {
+        let cli = Cli::try_parse_from(["berth", "doctor"]).unwrap();
+        assert!(matches!(cli.command, Command::Doctor));
+    }
+
+    #[test]
+    fn up_omits_network_when_allowlist_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(all_of![
+                request::method_path("POST", "/v1/leases"),
+                request::body(json_decoded(|v: &serde_json::Value| {
+                    v.get("network").is_none()
+                })),
+            ])
+            .respond_with(json_encoded(sample_lease("active", None))),
+        );
+        let url = format!("http://{}", server.addr());
+        seed_pair(dir.path(), &url, "brt_secret");
+        run(dir.path(), &["up", "--os", "linux"]).unwrap();
+    }
+
+    #[test]
+    fn up_empty_allowlist_is_deny_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(all_of![
+                request::method_path("POST", "/v1/leases"),
+                request::body(json_decoded(|v: &serde_json::Value| {
+                    v["network"]["egress"] == "allowlist"
+                        && v["network"]["domains"]
+                            .as_array()
+                            .is_some_and(|d| d.is_empty())
+                })),
+            ])
+            .respond_with(json_encoded(sample_lease("active", None))),
+        );
+        let url = format!("http://{}", server.addr());
+        seed_pair(dir.path(), &url, "brt_secret");
+        let mut cfg = Config::load(dir.path()).unwrap();
+        cfg.allowlist = Some(String::new());
+        cfg.save(dir.path()).unwrap();
+        run(dir.path(), &["up", "--os", "linux"]).unwrap();
+    }
+
+    #[test]
+    fn parse_node_up_tunnel() {
+        let cli = Cli::try_parse_from([
+            "berth",
+            "node",
+            "up",
+            "--tunnel",
+            "cloudflare",
+            "--bind",
+            "127.0.0.1:7432",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Node(NodeCmd::Up {
+                tunnel: Some(TunnelArg::Cloudflare),
+                ..
+            })
+        ));
+        assert!(Cli::try_parse_from(["berth", "node", "up", "--tunnel", "mesh"]).is_err());
+        let plain = Cli::try_parse_from(["berth", "node", "up"]).unwrap();
+        assert!(matches!(
+            plain.command,
+            Command::Node(NodeCmd::Up { tunnel: None, .. })
+        ));
+    }
+
+    #[test]
+    fn node_up_tunnel_rejects_non_loopback_bind() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = run(
+            dir.path(),
+            &[
+                "node",
+                "up",
+                "--tunnel",
+                "cloudflare",
+                "--bind",
+                "0.0.0.0:7432",
+            ],
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("loopback"), "{msg}");
+        assert!(msg.contains("--tunnel"), "{msg}");
+    }
+
+    #[test]
+    fn pair_url_rejects_query_without_echoing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = run(
+            dir.path(),
+            &[
+                "pair",
+                "--url",
+                "https://host.example/?token=brt_secret",
+                "--code",
+                "ABCD-EFGH",
+            ],
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("query string"), "{msg}");
+        assert!(!msg.contains("brt_secret"), "{msg}");
+        assert!(!msg.contains("host.example"), "{msg}");
+    }
+
+    #[test]
+    fn format_up_omits_loopback_viewer_when_node_is_remote() {
+        let lease: LeaseView = serde_json::from_value(sample_lease("active", None)).unwrap();
+        assert!(format_up(&lease, "http://127.0.0.1:7432").contains("6080"));
+        let remote = format_up(&lease, "https://unit-test.trycloudflare.com");
+        assert!(!remote.contains("127.0.0.1"));
+        assert!(!remote.contains("viewer"));
+    }
+
+    #[test]
+    fn node_up_tunnel_missing_cloudflared() {
+        static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _lock = ENV.lock().unwrap_or_else(|p| p.into_inner());
+        struct ClearEnv;
+        impl Drop for ClearEnv {
+            fn drop(&mut self) {
+                // SAFETY: lock serializes BERTH_CLOUDFLARED mutation in this test.
+                unsafe { std::env::remove_var("BERTH_CLOUDFLARED") };
+            }
+        }
+        let _clear = ClearEnv;
+        // SAFETY: lock serializes BERTH_CLOUDFLARED mutation in this test.
+        unsafe { std::env::set_var("BERTH_CLOUDFLARED", "/no/such/berth-cloudflared") };
+        let dir = tempfile::tempdir().unwrap();
+        let err = run(
+            dir.path(),
+            &[
+                "node",
+                "up",
+                "--tunnel",
+                "cloudflare",
+                "--bind",
+                "127.0.0.1:0",
+            ],
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("brew install cloudflared"), "{msg}");
+        assert!(msg.contains("pkg.cloudflare.com/cloudflared"), "{msg}");
+    }
+
+    #[test]
+    fn pair_writes_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(all_of![
+                request::method_path("POST", "/v1/pair"),
+                request::body(json_decoded(|v: &serde_json::Value| {
+                    v["code"] == "ABCD-EFGH" && v["revoke_others"] == false
+                })),
+            ])
+            .respond_with(json_encoded(json!({ "token": "brt_secret" }))),
+        );
+        let url = format!("http://{}", server.addr());
+        let out = run(dir.path(), &["pair", "--url", &url, "--code", "ABCD-EFGH"]).unwrap();
+        assert!(out.contains("paired default"));
+        let cfg = Config::load(dir.path()).unwrap();
+        let node = cfg.node("default").unwrap();
+        assert_eq!(node.url, url);
+        assert_eq!(node.token, "brt_secret");
+    }
+
+    #[test]
+    fn pair_revoke_others_sends_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(all_of![
+                request::method_path("POST", "/v1/pair"),
+                request::body(json_decoded(|v: &serde_json::Value| {
+                    v["code"] == "ABCD-EFGH" && v["revoke_others"] == true
+                })),
+            ])
+            .respond_with(json_encoded(json!({ "token": "brt_secret" }))),
+        );
+        let url = format!("http://{}", server.addr());
+        run(
+            dir.path(),
+            &[
+                "pair",
+                "--url",
+                &url,
+                "--code",
+                "ABCD-EFGH",
+                "--revoke-others",
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn pair_unauthorized() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::method_path("POST", "/v1/pair")).respond_with(
+                status_code(401)
+                    .append_header("content-type", "application/json")
+                    .body(r#"{"error":"unauthorized"}"#),
+            ),
+        );
+        let url = format!("http://{}", server.addr());
+        let err = run(dir.path(), &["pair", "--url", &url, "--code", "NOPE"]).unwrap_err();
+        assert!(err.to_string().contains("unauthorized"));
+    }
+
+    #[test]
+    fn pair_up_view_status_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(all_of![
+                request::method_path("POST", "/v1/pair"),
+                request::body(json_decoded(|v: &serde_json::Value| {
+                    v["code"] == "ABCD-EFGH" && v["revoke_others"] == false
+                })),
+            ])
+            .respond_with(json_encoded(json!({ "token": "brt_secret" }))),
+        );
+        server.expect(
+            Expectation::matching(all_of![
+                request::method_path("POST", "/v1/leases"),
+                request::headers(contains(("authorization", "Bearer brt_secret"))),
+                request::body(json_decoded(|v: &serde_json::Value| {
+                    v["os"] == "linux"
+                        && v["class"] == "private"
+                        && v["license"] == "linux"
+                        && v["density"] == "isolated"
+                        && v["resources"]["vcpu"] == 2
+                        && v["resources"]["mem_gib"] == 4
+                        && v["resources"]["disk_gib"] == 40
+                })),
+            ])
+            .respond_with(json_encoded(sample_lease("active", None))),
+        );
+        server.expect(
+            Expectation::matching(all_of![
+                request::method_path("GET", "/v1/leases/l_1"),
+                request::headers(contains(("authorization", "Bearer brt_secret"))),
+            ])
+            .respond_with(json_encoded(sample_lease("active", None))),
+        );
+        server.expect(
+            Expectation::matching(all_of![
+                request::method_path("DELETE", "/v1/leases/l_1"),
+                request::headers(contains(("authorization", "Bearer brt_secret"))),
+            ])
+            .respond_with(json_encoded(sample_lease("stopped", Some(60)))),
+        );
+
+        let url = format!("http://{}", server.addr());
+        run(
+            dir.path(),
+            &[
+                "pair",
+                "--url",
+                &url,
+                "--code",
+                "ABCD-EFGH",
+                "--node",
+                "home-nuc",
+            ],
+        )
+        .unwrap();
+
+        let up = run(dir.path(), &["up", "--os", "linux", "--node", "home-nuc"]).unwrap();
+        assert!(up.contains("lease l_1 session s_1"));
+        assert!(up.contains("http://127.0.0.1:6080/vnc.html"));
+        assert!(up.contains("not charged"));
+
+        let view = run(dir.path(), &["view"]).unwrap();
+        assert_eq!(view, "http://127.0.0.1:6080/vnc.html");
+
+        let status = run(dir.path(), &["status"]).unwrap();
+        assert!(status.contains("status: active"));
+        assert!(status.contains("home-nuc"));
+
+        let ended = run(dir.path(), &["end"]).unwrap();
+        assert!(ended.contains("stopped"));
+        assert!(ended.contains("billable_seconds=60"));
+        assert!(load_session(dir.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn second_up_requires_end() {
+        let dir = tempfile::tempdir().unwrap();
+        save_session(
+            dir.path(),
+            &Session {
+                node: "default".into(),
+                lease_id: "l_old".into(),
+                session_id: "s_old".into(),
+                viewer_url: None,
+                ws_url: None,
+            },
+        )
+        .unwrap();
+        let mut cfg = Config::default();
+        cfg.nodes.insert(
+            "default".into(),
+            NodeConfig {
+                url: DEFAULT_URL.into(),
+                token: "brt_x".into(),
+            },
+        );
+        cfg.save(dir.path()).unwrap();
+        let err = run(dir.path(), &["up", "--os", "linux"]).unwrap_err();
+        assert!(err.to_string().contains("l_old"));
+        assert!(err.to_string().contains("berth end"));
+    }
+}

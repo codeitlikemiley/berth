@@ -129,34 +129,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
-name = "berth-adapter-anthropic"
+name = "berthos"
 version = "0.1.0"
 dependencies = [
- "base64",
- "berth-protocol",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "berth-adapter-openai"
-version = "0.1.0"
-dependencies = [
- "base64",
- "berth-node",
- "berth-protocol",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "berth-cli"
-version = "0.1.0"
-dependencies = [
- "berth-mcp",
- "berth-node",
- "berth-protocol",
+ "berthos-mcp",
+ "berthos-node",
+ "berthos-protocol",
  "clap",
  "httptest",
  "reqwest",
@@ -167,11 +145,33 @@ dependencies = [
 ]
 
 [[package]]
-name = "berth-mcp"
+name = "berthos-adapter-anthropic"
 version = "0.1.0"
 dependencies = [
  "base64",
- "berth-protocol",
+ "berthos-protocol",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "berthos-adapter-openai"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "berthos-node",
+ "berthos-protocol",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "berthos-mcp"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "berthos-protocol",
  "futures-util",
  "httptest",
  "reqwest",
@@ -184,11 +184,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "berth-node"
+name = "berthos-node"
 version = "0.1.0"
 dependencies = [
  "axum",
- "berth-protocol",
+ "berthos-protocol",
  "bollard",
  "futures-util",
  "getrandom 0.4.3",
@@ -207,7 +207,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "berth-protocol"
+name = "berthos-protocol"
 version = "0.1.0"
 dependencies = [
  "base64",

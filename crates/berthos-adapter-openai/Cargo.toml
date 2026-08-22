@@ -1,0 +1,19 @@
+[package]
+name = "berthos-adapter-openai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OpenAI Responses computer-use adapter"
+
+[dependencies]
+base64 = "0.22"
+berthos-protocol = { version = "0.1.0", path = "../berthos-protocol" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+berthos-node = { version = "0.1.0", path = "../berthos-node" }
+berthos-protocol = { version = "0.1.0", path = "../berthos-protocol" }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
