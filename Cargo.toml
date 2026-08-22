@@ -5,6 +5,7 @@ members = [
     "crates/berth-node",
     "crates/berth-mcp",
     "crates/berth-adapter-anthropic",
+    "crates/berth-adapter-openai",
     "crates/berth-cli",
 ]
 

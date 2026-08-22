@@ -62,16 +62,16 @@ map_key() {
     DELETE|Delete|delete|DEL|Del)
       echo Delete
       ;;
-    ARROW_UP|ArrowUp|ARROWUP|Up)
+    ARROW_UP|ArrowUp|ARROWUP|UP|Up|up)
       echo Up
       ;;
-    ARROW_DOWN|ArrowDown|ARROWDOWN|Down)
+    ARROW_DOWN|ArrowDown|ARROWDOWN|DOWN|Down|down)
       echo Down
       ;;
-    ARROW_LEFT|ArrowLeft|ARROWLEFT|Left)
+    ARROW_LEFT|ArrowLeft|ARROWLEFT|LEFT|Left|left)
       echo Left
       ;;
-    ARROW_RIGHT|ArrowRight|ARROWRIGHT|Right)
+    ARROW_RIGHT|ArrowRight|ARROWRIGHT|RIGHT|Right|right)
       echo Right
       ;;
     PAGE_UP|PageUp|PAGEUP|Page_Up)
@@ -85,6 +85,10 @@ map_key() {
       ;;
     END|End)
       echo End
+      ;;
+    [fF][0-9]|[fF]1[0-2])
+      # X wants F1..F12; a lowercase f1 resolves to nothing at all.
+      printf 'F%s\n' "${k#[fF]}"
       ;;
     *)
       echo "$k"

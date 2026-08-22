@@ -376,7 +376,10 @@ Two engineers: split PR2 (image) // PR1+3 (protocol+executor), then join at PR4.
 Ordered, still:
 
 1. Cua Driver in image (macOS/Windows private become possible)  
-2. OpenAI adapter  
+2. OpenAI adapter — **done**: `crates/berth-adapter-openai` maps Responses
+   `computer_call` items (batched `actions`, safety checks, data-URL
+   screenshots) onto the protocol. `zoom`, `cursor_position` and `hold_key`
+   have no OpenAI equivalent and stay protocol-only.  
 3. `/mnt/s3` rclone  
 4. Lume private macOS  
 5. W365 provider (`isolated` + `pooled`, list $0.40/hr)  
