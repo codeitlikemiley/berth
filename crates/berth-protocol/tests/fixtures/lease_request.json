@@ -5,19 +5,45 @@
   "density": "shared",
   "pooled": false,
   "term": "on_demand",
-  "resources": { "vcpu": 2, "mem_gib": 4, "disk_gib": 40 },
-  "workspace": { "id": "ws_...", "disk_gib": 20 },
-  "object": { "endpoint": "https://s3.amazonaws.com", "bucket": "example", "prefix": "berth/ws_.../" },
+  "resources": {
+    "vcpu": 2,
+    "mem_gib": 4,
+    "disk_gib": 40
+  },
+  "workspace": {
+    "id": "ws_...",
+    "disk_gib": 20
+  },
+  "object": {
+    "remote": "buyer-s3",
+    "bucket": "example",
+    "prefix": "berth/ws_.../"
+  },
   "cpu_overcommit": 1.0,
   "min_seconds": 300,
   "max_seconds": 86400,
   "exclusive_hardware": false,
-  "capabilities": ["ax-tree", "shell", "gpu", "xcode", "iphone-simulator"],
+  "capabilities": [
+    "ax-tree",
+    "shell",
+    "gpu",
+    "xcode",
+    "iphone-simulator"
+  ],
   "image": "berth/linux-xfce:2026-08",
   "region": "eu",
   "isolation": "vm",
-  "network": { "egress": "allowlist", "domains": ["github.com", "pypi.org"] },
+  "network": {
+    "egress": "allowlist",
+    "domains": [
+      "github.com",
+      "pypi.org"
+    ]
+  },
   "recording": true,
-  "human_confirm": ["paste", "key:Return"],
+  "human_confirm": [
+    "paste",
+    "key:Return"
+  ],
   "preemptible": true
 }

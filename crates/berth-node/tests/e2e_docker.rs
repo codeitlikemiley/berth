@@ -449,3 +449,154 @@ async fn driver_covers_every_action_the_protocol_advertises() {
         .args(["volume", "rm", "-f", &volume])
         .status();
 }
+
+/// Pinned so a new upstream release cannot turn CI red without a commit here.
+const MINIO_IMAGE: &str = "minio/minio:RELEASE.2025-09-07T16-13-09Z";
+
+/// A bucket is staged into /mnt/s3 before the guest starts and synced back
+/// after it stops, with rclone running node-side so the guest never holds the
+/// credentials. Backed by a real MinIO, so the whole round trip is exercised
+/// rather than mocked.
+#[tokio::test]
+#[ignore = "requires Docker; BERTH_E2E=1 cargo test -p berth-node -- --ignored"]
+async fn object_store_round_trips_through_mnt_s3() {
+    if !e2e_enabled() {
+        eprintln!("skipping: set BERTH_E2E=1 to run docker e2e");
+        return;
+    }
+
+    let tag = format!("berth-minio-{}", std::process::id());
+    let port = 39_000 + (std::process::id() % 1000) as u16;
+    let up = Command::new("docker")
+        .args([
+            "run",
+            "-d",
+            "--name",
+            &tag,
+            "-p",
+            &format!("127.0.0.1:{port}:9000"),
+            "-e",
+            "MINIO_ROOT_USER=berthtest",
+            "-e",
+            "MINIO_ROOT_PASSWORD=berthtestsecret",
+            MINIO_IMAGE,
+            "server",
+            "/data",
+        ])
+        .status()
+        .expect("start minio");
+    assert!(up.success(), "minio must start");
+
+    struct Cleanup(String);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = Command::new("docker").args(["rm", "-f", &self.0]).status();
+        }
+    }
+    let _minio = Cleanup(tag.clone());
+
+    // A temporary BERTH_HOME so the node's rclone config is this test's, and
+    // the credentials never touch the developer's real one.
+    let home = tempfile::tempdir().expect("home");
+    std::fs::write(
+        home.path().join("rclone.conf"),
+        format!(
+            "[buyer-s3]\ntype = s3\nprovider = Minio\nenv_auth = false\n\
+             access_key_id = berthtest\nsecret_access_key = berthtestsecret\n\
+             endpoint = http://host.docker.internal:{port}\nregion = us-east-1\n"
+        ),
+    )
+    .expect("write rclone.conf");
+    // SAFETY: no other test in this binary reads or writes BERTH_HOME, so there
+    // is no concurrent access to race with.
+    unsafe { std::env::set_var("BERTH_HOME", home.path()) };
+
+    // Wait for MinIO, then seed a file through the same rclone the node uses.
+    let mut ready = false;
+    for _ in 0..60 {
+        if rclone_host(&["lsd", "buyer-s3:"], home.path()).is_some() {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert!(ready, "minio never became reachable through rclone");
+    rclone_host(&["mkdir", "buyer-s3:berth-e2e"], home.path()).expect("make bucket");
+    let seed = home.path().join("seed.txt");
+    std::fs::write(&seed, "from-the-bucket\n").unwrap();
+    rclone_host(
+        &["copyto", "/c/seed.txt", "buyer-s3:berth-e2e/ws/seed.txt"],
+        home.path(),
+    )
+    .expect("seed bucket");
+
+    let manager = SessionManager::connect().expect("docker connect");
+    let ws = unique_ws();
+    let mut req = lease(&ws);
+    req.object = Some(berth_protocol::ObjectStore {
+        remote: "buyer-s3".into(),
+        bucket: "berth-e2e".into(),
+        prefix: "ws".into(),
+        endpoint: String::new(),
+    });
+
+    let mut session = manager.start(&req).await.expect("start with a bucket");
+
+    // Staged in before the guest existed.
+    assert_eq!(
+        docker_exec(session.container_id(), "cat /mnt/s3/seed.txt"),
+        "from-the-bucket"
+    );
+    // The guest must not be able to read the credentials that fetched it.
+    let leaked = docker_exec(
+        session.container_id(),
+        "cat /berth/rclone.conf 2>/dev/null || echo NOTPRESENT",
+    );
+    assert_eq!(leaked, "NOTPRESENT", "guest must never see rclone.conf");
+
+    docker_exec(
+        session.container_id(),
+        "echo from-the-guest > /mnt/s3/written.txt",
+    );
+    session.stop().await.expect("stop syncs back");
+
+    // Synced out after the guest stopped.
+    let listed = rclone_host(&["lsf", "buyer-s3:berth-e2e/ws"], home.path()).expect("list");
+    assert!(listed.contains("written.txt"), "{listed}");
+    assert!(listed.contains("seed.txt"), "{listed}");
+
+    let _ = Command::new("docker")
+        .args(["volume", "rm", "-f", &berth_node::volume_name(&ws)])
+        .status();
+    let _ = Command::new("docker")
+        .args(["volume", "rm", "-f", &berth_node::s3_volume_name(&ws)])
+        .status();
+}
+
+/// Run rclone from a throwaway container using the same config the node uses.
+fn rclone_host(args: &[&str], home: &std::path::Path) -> Option<String> {
+    let mut cmd = Command::new("docker");
+    cmd.args([
+        "run",
+        "--rm",
+        "--add-host",
+        "host.docker.internal:host-gateway",
+        "-v",
+        &format!("{}:/c", home.display()),
+        "--entrypoint",
+        "rclone",
+        &berth_node::image_from_env(),
+        "--config",
+        "/c/rclone.conf",
+    ]);
+    cmd.args(args);
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        eprintln!(
+            "rclone {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}

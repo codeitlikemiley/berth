@@ -126,9 +126,60 @@ pub struct Workspace {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectStore {
-    pub endpoint: String,
+    /// Name of a remote configured on the node, not a credential.
+    ///
+    /// The node stores every LeaseRequest verbatim as `request_json`, and
+    /// `GET /v1/leases` hands it back, so a key placed here would sit in
+    /// plaintext sqlite and in every reply. The lease names a remote; the
+    /// secret stays in the node's rclone config.
+    pub remote: String,
     pub bucket: String,
+    #[serde(default)]
     pub prefix: String,
+    /// Informational only. The node's remote definition is what actually
+    /// decides where the bytes go.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub endpoint: String,
+}
+
+impl ObjectStore {
+    /// `remote:bucket/prefix`, the path rclone is given.
+    #[must_use]
+    pub fn rclone_path(&self) -> String {
+        let prefix = self.prefix.trim_matches('/');
+        if prefix.is_empty() {
+            format!("{}:{}", self.remote, self.bucket)
+        } else {
+            format!("{}:{}/{}", self.remote, self.bucket, prefix)
+        }
+    }
+
+    /// Reject anything that could break out of the remote path when it reaches
+    /// a shell-free argv, or name a remote the node did not define.
+    pub fn validate(&self) -> Result<(), MvpError> {
+        fn clean(s: &str, what: &'static str) -> Result<(), MvpError> {
+            if s.is_empty() {
+                return Err(MvpError::InvalidObject(format!("object {what} is empty")));
+            }
+            if s.contains(['/', ':', '\n', '\r']) && what != "prefix" {
+                return Err(MvpError::InvalidObject(format!(
+                    "object {what} must not contain / or :"
+                )));
+            }
+            if s.split('/').any(|seg| seg == "..") {
+                return Err(MvpError::InvalidObject(format!(
+                    "object {what} must not contain .."
+                )));
+            }
+            Ok(())
+        }
+        clean(&self.remote, "remote")?;
+        clean(&self.bucket, "bucket")?;
+        if !self.prefix.is_empty() {
+            clean(&self.prefix, "prefix")?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -268,6 +319,9 @@ pub fn default_min_seconds(os: Os, density: Density) -> u64 {
 
 /// MVP control-plane gate: private Linux, isolated|shared, on_demand.
 pub fn validate_mvp(req: &LeaseRequest) -> Result<(), MvpError> {
+    if let Some(object) = &req.object {
+        object.validate()?;
+    }
     match req.os {
         Os::Linux => {}
         Os::Windows => return Err(MvpError::UnsupportedOs(Os::Windows)),
@@ -293,18 +347,20 @@ pub fn validate_mvp(req: &LeaseRequest) -> Result<(), MvpError> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MvpError {
     UnsupportedOs(Os),
     UnsupportedClass(Class),
     UnsupportedDensity(Density),
     UnsupportedTerm(Term),
     InvalidResources,
+    InvalidObject(String),
 }
 
 impl std::fmt::Display for MvpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidObject(msg) => write!(f, "{msg}"),
             Self::UnsupportedOs(Os::Windows) => {
                 write!(
                     f,
@@ -364,4 +420,49 @@ pub struct Lease {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub driver: Option<String>,
     pub quote: Quote,
+}
+
+#[cfg(test)]
+mod object_tests {
+    use super::*;
+
+    fn store(remote: &str, bucket: &str, prefix: &str) -> ObjectStore {
+        ObjectStore {
+            remote: remote.into(),
+            bucket: bucket.into(),
+            prefix: prefix.into(),
+            endpoint: String::new(),
+        }
+    }
+
+    #[test]
+    fn rclone_path_joins_without_stray_slashes() {
+        assert_eq!(store("r", "b", "").rclone_path(), "r:b");
+        assert_eq!(store("r", "b", "p/q").rclone_path(), "r:b/p/q");
+        assert_eq!(store("r", "b", "/p/").rclone_path(), "r:b/p");
+    }
+
+    #[test]
+    fn rejects_names_that_could_escape_the_remote_path() {
+        assert!(store("", "b", "").validate().is_err());
+        assert!(store("r", "", "").validate().is_err());
+        // A colon or slash in the remote would re-point rclone somewhere else.
+        assert!(store("r:other", "b", "").validate().is_err());
+        assert!(store("r", "b/c", "").validate().is_err());
+        // .. must not walk out of the prefix.
+        assert!(store("r", "b", "../secrets").validate().is_err());
+        assert!(store("r", "b", "ws/1").validate().is_ok());
+    }
+
+    #[test]
+    fn an_invalid_object_fails_the_mvp_gate() {
+        let mut req: LeaseRequest =
+            serde_json::from_str(include_str!("../tests/fixtures/lease_request.json"))
+                .expect("fixture");
+        req.object = Some(store("r:evil", "b", ""));
+        assert!(matches!(
+            validate_mvp(&req),
+            Err(MvpError::InvalidObject(_))
+        ));
+    }
 }

@@ -40,7 +40,7 @@ session_id   = id of a live desktop (usually 1:1 with lease)
   "term": "on_demand" | "monthly" | "annual",
   "resources": { "vcpu": 2, "mem_gib": 4, "disk_gib": 40 },
   "workspace": { "id": "ws_...", "disk_gib": 20 },
-  "object": { "endpoint": "https://s3.amazonaws.com", "bucket": "…", "prefix": "berth/ws_…/" },
+  "object": { "remote": "buyer-s3", "bucket": "…", "prefix": "berth/ws_…/" },
   "cpu_overcommit": 1.0,
   "min_seconds": 300,
   "max_seconds": 86400,
@@ -55,6 +55,8 @@ session_id   = id of a live desktop (usually 1:1 with lease)
   "preemptible": true
 }
 ```
+
+`object.remote` names a remote configured on the node; it is not a credential. The node stores the whole request as `request_json` and returns it from `GET /v1/leases`, so a key placed here would sit in plaintext. The node stages `remote:bucket/prefix` into `/mnt/s3` before the guest starts and syncs it back after the guest stops, so the guest never sees the credentials either.
 
 `density` slices silicon. `pooled` is scheduling (warm check-out).
 
