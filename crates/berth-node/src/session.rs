@@ -249,10 +249,6 @@ impl SessionManager {
                     ..Default::default()
                 }]),
                 auto_remove: Some(false),
-                // So an endpoint on the node itself is reachable by name. The
-                // helper already has full egress and holds the credentials; it
-                // is node-controlled, not agent-controlled.
-                extra_hosts: Some(vec!["host.docker.internal:host-gateway".into()]),
                 ..Default::default()
             }),
             ..Default::default()

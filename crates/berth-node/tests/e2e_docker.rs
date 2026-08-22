@@ -466,15 +466,12 @@ async fn object_store_round_trips_through_mnt_s3() {
     }
 
     let tag = format!("berth-minio-{}", std::process::id());
-    let port = 39_000 + (std::process::id() % 1000) as u16;
     let up = Command::new("docker")
         .args([
             "run",
             "-d",
             "--name",
             &tag,
-            "-p",
-            &format!("127.0.0.1:{port}:9000"),
             "-e",
             "MINIO_ROOT_USER=berthtest",
             "-e",
@@ -495,6 +492,28 @@ async fn object_store_round_trips_through_mnt_s3() {
     }
     let _minio = Cleanup(tag.clone());
 
+    // Reached at its address on the default bridge, which is where the node
+    // runs its rclone helper. Going back out through a published port would
+    // mean host.docker.internal, and that resolves to the docker0 gateway on
+    // Linux while MinIO would be listening on loopback -- green on a Mac,
+    // hung on a CI runner.
+    let out = Command::new("docker")
+        .args([
+            "inspect",
+            "-f",
+            // Ranging over Networks rather than reading .NetworkSettings.IPAddress:
+            // newer Docker drops that top-level key entirely.
+            "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+            &tag,
+        ])
+        .output()
+        .expect("inspect minio");
+    let addr = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(
+        !addr.is_empty(),
+        "minio has no address on the default bridge"
+    );
+
     // A temporary BERTH_HOME so the node's rclone config is this test's, and
     // the credentials never touch the developer's real one.
     let home = tempfile::tempdir().expect("home");
@@ -503,7 +522,7 @@ async fn object_store_round_trips_through_mnt_s3() {
         format!(
             "[buyer-s3]\ntype = s3\nprovider = Minio\nenv_auth = false\n\
              access_key_id = berthtest\nsecret_access_key = berthtestsecret\n\
-             endpoint = http://host.docker.internal:{port}\nregion = us-east-1\n"
+             endpoint = http://{addr}:9000\nregion = us-east-1\n"
         ),
     )
     .expect("write rclone.conf");
@@ -511,14 +530,33 @@ async fn object_store_round_trips_through_mnt_s3() {
     // is no concurrent access to race with.
     unsafe { std::env::set_var("BERTH_HOME", home.path()) };
 
-    // Wait for MinIO, then seed a file through the same rclone the node uses.
-    let mut ready = false;
+    // Wait on MinIO's own log signal rather than probing with rclone, so the
+    // failure path is seconds: an rclone probe against an endpoint that is not
+    // listening costs ~14s even with the timeouts below, and thirty of those
+    // would be an eight-minute red build.
+    let mut listening = false;
     for _ in 0..60 {
+        let logs = Command::new("docker")
+            .args(["logs", &tag])
+            .output()
+            .expect("minio logs");
+        let text = String::from_utf8_lossy(&logs.stdout).to_string()
+            + &String::from_utf8_lossy(&logs.stderr);
+        if text.contains("API:") {
+            listening = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert!(listening, "minio never reported an API endpoint");
+
+    let mut ready = false;
+    for _ in 0..3 {
         if rclone_host(&["lsd", "buyer-s3:"], home.path()).is_some() {
             ready = true;
             break;
         }
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::thread::sleep(std::time::Duration::from_secs(2));
     }
     assert!(ready, "minio never became reachable through rclone");
     rclone_host(&["mkdir", "buyer-s3:berth-e2e"], home.path()).expect("make bucket");
@@ -579,8 +617,6 @@ fn rclone_host(args: &[&str], home: &std::path::Path) -> Option<String> {
     cmd.args([
         "run",
         "--rm",
-        "--add-host",
-        "host.docker.internal:host-gateway",
         "-v",
         &format!("{}:/c", home.display()),
         "--entrypoint",
@@ -588,6 +624,16 @@ fn rclone_host(args: &[&str], home: &std::path::Path) -> Option<String> {
         &berth_node::image_from_env(),
         "--config",
         "/c/rclone.conf",
+        // So a probe against an endpoint that is not up yet returns quickly
+        // instead of retrying inside rclone for minutes.
+        "--contimeout",
+        "3s",
+        "--timeout",
+        "10s",
+        "--retries",
+        "1",
+        "--low-level-retries",
+        "1",
     ]);
     cmd.args(args);
     let out = cmd.output().ok()?;
