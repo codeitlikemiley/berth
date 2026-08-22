@@ -1,11 +1,12 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use berth_protocol::{
-    Ack, AckKind, AckResult, Action, ActionBatch, Frame, FrameKind, LeaseRequest, Point,
+    Ack, AckKind, AckResult, Action, ActionBatch, Frame, FrameKind, LeaseRequest, ObjectStore,
+    Point,
 };
 use bollard::Docker;
 use bollard::exec::StartExecResults;
-use bollard::models::ExecConfig;
+use bollard::models::{ContainerCreateBody, ExecConfig, HostConfig, Mount, MountType};
 use bollard::query_parameters::{CreateContainerOptionsBuilder, RemoveContainerOptionsBuilder};
 use futures_util::StreamExt;
 use tokio::time::sleep;
@@ -13,9 +14,26 @@ use tokio::time::sleep;
 use crate::action::{ACTION_BIN, PNG_MAGIC, action_argv, key_repeats, png_dimensions, skipped};
 use crate::allowlist::csv_for_lease;
 #[cfg(debug_assertions)]
-use crate::docker::assert_host_isolated;
+use crate::docker::{GuestVolumes, OBJECT_MOUNT, assert_host_isolated};
+
+/// Where the node's rclone config is mounted inside the helper, read-only.
+const RCLONE_CONFIG_MOUNT: &str = "/berth/rclone.conf";
+const RCLONE_WAIT: Duration = Duration::from_secs(300);
+
+/// The node's rclone config. Credentials live here and nowhere else.
+fn rclone_config_path() -> Result<std::path::PathBuf> {
+    let dir =
+        match std::env::var_os("BERTH_HOME") {
+            Some(home) => std::path::PathBuf::from(home),
+            None => std::path::PathBuf::from(std::env::var_os("HOME").ok_or_else(|| {
+                Error::Internal("HOME is not set; cannot find rclone.conf".into())
+            })?)
+            .join(".berth"),
+        };
+    Ok(dir.join("rclone.conf"))
+}
 use crate::docker::{
-    VIEWER_PORT, container_body, container_name, image_from_env, network_name,
+    VIEWER_PORT, container_body, container_name, image_from_env, network_name, s3_volume_name,
     session_network_create, volume_create, volume_name,
 };
 use crate::error::{Error, Result};
@@ -58,6 +76,8 @@ impl SessionManager {
         let session_id = new_id("s");
         let workspace_id = workspace_id_from_req(req);
         let volume = volume_name(&workspace_id);
+        // A bucket gets its own volume, staged before the guest starts.
+        let object_volume = req.object.as_ref().map(|_| s3_volume_name(&workspace_id));
         let network = network_name(&session_id);
         let name = container_name(&session_id);
         // Build HostConfig before allocating a network so InvalidResources
@@ -67,7 +87,10 @@ impl SessionManager {
             &session_id,
             &workspace_id,
             &req.resources,
-            &volume,
+            GuestVolumes {
+                workspace: &volume,
+                object: object_volume.as_deref(),
+            },
             &network,
             &csv_for_lease(req),
         )?;
@@ -77,6 +100,10 @@ impl SessionManager {
         }
 
         self.ensure_volume(&volume).await?;
+        if let (Some(object), Some(vol)) = (req.object.as_ref(), object_volume.as_deref()) {
+            // Before the guest exists, so it never sees a half-populated mount.
+            self.stage_in(object, vol).await?;
+        }
         self.create_session_network(&network, &session_id).await?;
         // Drop (cancel or error) removes the in-flight network/container.
         let mut guard = StartGuard::new(self.docker.clone(), network.clone());
@@ -96,6 +123,9 @@ impl SessionManager {
         let viewer_port = self.viewer_port(&container_id).await;
         guard.disarm();
         Ok(Session {
+            object: req.object.clone(),
+            object_volume,
+            image: self.image.clone(),
             docker: self.docker.clone(),
             container_id,
             container_name: name,
@@ -134,6 +164,131 @@ impl SessionManager {
 
     pub async fn volume_exists(&self, name: &str) -> bool {
         self.docker.inspect_volume(name).await.is_ok()
+    }
+
+    /// Stage a bucket into the guest's `/mnt/s3` volume before it starts.
+    ///
+    /// rclone runs in a short-lived helper container, not in the guest: it is
+    /// the only thing that sees the node's rclone config, so an agent with a
+    /// shell in the guest still cannot read the bucket credentials. The helper
+    /// is on the default bridge rather than the guest's isolated network, so
+    /// staging is unaffected by the guest's egress allowlist -- the node is
+    /// fetching the bytes, not the agent.
+    pub async fn stage_in(&self, object: &ObjectStore, volume: &str) -> Result<()> {
+        self.ensure_volume(volume).await?;
+        self.run_rclone(
+            &["copy", &object.rclone_path(), OBJECT_MOUNT],
+            volume,
+            "stage in",
+            true,
+        )
+        .await
+    }
+
+    /// Sync `/mnt/s3` back to the bucket after the guest has stopped.
+    pub async fn stage_out(&self, object: &ObjectStore, volume: &str) -> Result<()> {
+        if !self.volume_exists(volume).await {
+            return Ok(());
+        }
+        self.run_rclone(
+            &["sync", OBJECT_MOUNT, &object.rclone_path()],
+            volume,
+            "stage out",
+            false,
+        )
+        .await
+    }
+
+    async fn run_rclone(
+        &self,
+        args: &[&str],
+        volume: &str,
+        what: &str,
+        hand_to_guest: bool,
+    ) -> Result<()> {
+        let config = rclone_config_path()?;
+        if !config.is_file() {
+            return Err(Error::Guest(format!(
+                "{} needs an rclone config at {}",
+                what,
+                config.display()
+            )));
+        }
+        // rclone runs as root, so anything it stages in lands root-owned and the
+        // guest -- which runs as `berth` -- could not write into it. Args go
+        // through "$@" rather than being interpolated, so a bucket or prefix can
+        // never be read as shell syntax.
+        let script = if hand_to_guest {
+            format!(
+                "rclone --config {RCLONE_CONFIG_MOUNT} \"$@\" && chown -R berth:berth {OBJECT_MOUNT}"
+            )
+        } else {
+            format!("rclone --config {RCLONE_CONFIG_MOUNT} \"$@\"")
+        };
+        let mut cmd = vec!["sh".to_string(), "-c".to_string(), script, "sh".to_string()];
+        cmd.extend(args.iter().map(|a| (*a).to_string()));
+
+        let name = format!("berth-rclone-{}", new_id("h").trim_start_matches("h_"));
+        let body = ContainerCreateBody {
+            image: Some(self.image.clone()),
+            entrypoint: Some(vec![String::new()]),
+            cmd: Some(cmd),
+            user: Some("root".into()),
+            host_config: Some(HostConfig {
+                // Read-only so a bug here cannot rewrite the node's credentials.
+                binds: Some(vec![format!(
+                    "{}:{}:ro",
+                    config.display(),
+                    RCLONE_CONFIG_MOUNT
+                )]),
+                mounts: Some(vec![Mount {
+                    target: Some(OBJECT_MOUNT.into()),
+                    source: Some(volume.to_string()),
+                    typ: Some(MountType::VOLUME),
+                    read_only: Some(false),
+                    ..Default::default()
+                }]),
+                auto_remove: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let opts = CreateContainerOptionsBuilder::default().name(&name).build();
+        let created = self.docker.create_container(Some(opts), body).await?;
+        let id = created.id;
+        let result = self.await_rclone(&id, what).await;
+        let _ = force_remove_container(&self.docker, &id).await;
+        result
+    }
+
+    async fn await_rclone(&self, id: &str, what: &str) -> Result<()> {
+        self.docker
+            .start_container(id, None::<bollard::query_parameters::StartContainerOptions>)
+            .await?;
+        let deadline = tokio::time::Instant::now() + RCLONE_WAIT;
+        loop {
+            let info = self
+                .docker
+                .inspect_container(
+                    id,
+                    None::<bollard::query_parameters::InspectContainerOptions>,
+                )
+                .await?;
+            let state = info.state.as_ref();
+            let running = state.and_then(|s| s.running).unwrap_or(false);
+            if !running {
+                let code = state.and_then(|s| s.exit_code).unwrap_or(0);
+                if code == 0 {
+                    return Ok(());
+                }
+                return Err(Error::Guest(format!("rclone {what} exited {code}")));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Error::Guest(format!("rclone {what} timed out")));
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
     }
 
     async fn ensure_volume(&self, name: &str) -> Result<()> {
@@ -222,6 +377,11 @@ pub struct Session {
     viewer_port: Option<u16>,
     last_frame: Option<Frame>,
     stopped: bool,
+    /// Kept so stop() knows where to sync `/mnt/s3` back to, and which image
+    /// the rclone helper that does it should run.
+    object: Option<ObjectStore>,
+    object_volume: Option<String>,
+    image: String,
 }
 
 impl Session {
@@ -353,6 +513,16 @@ impl Session {
         force_remove_container(&self.docker, &self.container_id).await?;
         self.stopped = true;
         remove_session_network(&self.docker, &self.network).await;
+        // After the container is gone, so nothing can still be writing while
+        // the sync runs. A failure here must not leave the caller thinking the
+        // session is still up, so it is reported after teardown, not before.
+        if let (Some(object), Some(volume)) = (self.object.clone(), self.object_volume.clone()) {
+            let manager = SessionManager {
+                docker: self.docker.clone(),
+                image: self.image.clone(),
+            };
+            manager.stage_out(&object, &volume).await?;
+        }
         Ok(())
     }
 }

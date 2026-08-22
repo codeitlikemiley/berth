@@ -13,6 +13,9 @@ use crate::id::hex_lower;
 
 pub const DEFAULT_IMAGE: &str = "berthos-linux-xfce:dev";
 pub const WORKSPACE_MOUNT: &str = "/workspace";
+/// Staged by the node before the guest starts and synced back after it stops,
+/// so the guest sees ordinary local files and never the bucket credentials.
+pub const OBJECT_MOUNT: &str = "/mnt/s3";
 pub const VIEWER_PORT: &str = "6080/tcp";
 const GIB: i64 = 1 << 30;
 const NANO: i64 = 1_000_000_000;
@@ -41,6 +44,14 @@ pub const EGRESS_VERSION: &str = "2";
 
 pub fn image_from_env() -> String {
     resolve_image(env::var("BERTH_IMAGE").ok().as_deref())
+}
+
+/// Named volume `berth-s3-<workspace_id>` at `/mnt/s3`.
+///
+/// Separate from the workspace volume so a bucket can be attached and detached
+/// without touching files the agent owns.
+pub fn s3_volume_name(workspace_id: &str) -> String {
+    namespaced("berth-s3-", workspace_id)
 }
 
 /// Named volume `berth-ws-<workspace_id>` at `/workspace`.
@@ -104,7 +115,12 @@ fn sha8(bytes: &[u8]) -> String {
     hex_lower(&digest[..4])
 }
 
-pub fn host_config(resources: &Resources, volume: &str, network: &str) -> Result<HostConfig> {
+pub fn host_config(
+    resources: &Resources,
+    volume: &str,
+    network: &str,
+    object_volume: Option<&str>,
+) -> Result<HostConfig> {
     if resources.vcpu == 0 || resources.mem_gib == 0 {
         return Err(Error::InvalidResources);
     }
@@ -140,13 +156,7 @@ pub fn host_config(resources: &Resources, volume: &str, network: &str) -> Result
         auto_remove: Some(false),
         // Named volume only. Never bind /tmp/.X11-unix or a host display.
         binds: None,
-        mounts: Some(vec![Mount {
-            target: Some(WORKSPACE_MOUNT.into()),
-            source: Some(volume.to_string()),
-            typ: Some(MountType::VOLUME),
-            read_only: Some(false),
-            ..Default::default()
-        }]),
+        mounts: Some(guest_mounts(volume, object_volume)),
         port_bindings: Some(port_bindings),
         shm_size: Some(64 * 1024 * 1024),
         pid_mode: None,
@@ -158,16 +168,43 @@ pub fn host_config(resources: &Resources, volume: &str, network: &str) -> Result
     })
 }
 
+fn guest_mounts(volume: &str, object_volume: Option<&str>) -> Vec<Mount> {
+    let mut mounts = vec![Mount {
+        target: Some(WORKSPACE_MOUNT.into()),
+        source: Some(volume.to_string()),
+        typ: Some(MountType::VOLUME),
+        read_only: Some(false),
+        ..Default::default()
+    }];
+    if let Some(object) = object_volume {
+        mounts.push(Mount {
+            target: Some(OBJECT_MOUNT.into()),
+            source: Some(object.to_string()),
+            typ: Some(MountType::VOLUME),
+            read_only: Some(false),
+            ..Default::default()
+        });
+    }
+    mounts
+}
+
+/// The guest's two volumes: its workspace, and an optional staged bucket.
+#[derive(Debug, Clone, Copy)]
+pub struct GuestVolumes<'a> {
+    pub workspace: &'a str,
+    pub object: Option<&'a str>,
+}
+
 pub fn container_body(
     image: &str,
     session_id: &str,
     workspace_id: &str,
     resources: &Resources,
-    volume: &str,
+    volumes: GuestVolumes<'_>,
     network: &str,
     allowlist: &str,
 ) -> Result<ContainerCreateBody> {
-    let host_config = host_config(resources, volume, network)?;
+    let host_config = host_config(resources, volumes.workspace, network, volumes.object)?;
     let mut labels = HashMap::new();
     labels.insert("berth.session_id".into(), session_id.to_string());
     labels.insert("berth.workspace_id".into(), workspace_id.to_string());
@@ -269,8 +306,48 @@ mod tests {
             },
             "berth-ws-abc",
             "berth-net-s_1",
+            None,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn object_mount_appears_only_when_a_bucket_is_attached() {
+        let res = Resources {
+            vcpu: 1,
+            mem_gib: 1,
+            disk_gib: 1,
+        };
+        let targets = |hc: &HostConfig| -> Vec<String> {
+            hc.mounts
+                .as_ref()
+                .expect("mounts")
+                .iter()
+                .filter_map(|m| m.target.clone())
+                .collect()
+        };
+
+        let plain = host_config(&res, "berth-ws-a", "berth-net-s_1", None).unwrap();
+        assert_eq!(targets(&plain), vec![WORKSPACE_MOUNT.to_string()]);
+
+        let with_bucket =
+            host_config(&res, "berth-ws-a", "berth-net-s_1", Some("berth-s3-a")).unwrap();
+        assert_eq!(
+            targets(&with_bucket),
+            vec![WORKSPACE_MOUNT.to_string(), OBJECT_MOUNT.to_string()]
+        );
+        // Attaching a bucket must not quietly relax the isolation posture.
+        assert_host_isolated(&with_bucket);
+        assert_eq!(
+            with_bucket.cap_drop.as_deref(),
+            Some(&["ALL".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn workspace_and_bucket_volumes_never_collide() {
+        assert_ne!(volume_name("ws_1"), s3_volume_name("ws_1"));
+        assert!(s3_volume_name("ws_1").starts_with("berth-s3-"));
     }
 
     #[test]
@@ -320,6 +397,7 @@ mod tests {
                 },
                 vol,
                 net,
+                None,
             )
             .is_err()
         );
@@ -332,6 +410,7 @@ mod tests {
                 },
                 vol,
                 net,
+                None,
             )
             .is_err()
         );
@@ -344,6 +423,7 @@ mod tests {
                 },
                 vol,
                 "host",
+                None,
             )
             .is_err()
         );
@@ -360,7 +440,10 @@ mod tests {
                 mem_gib: 1,
                 disk_gib: 1,
             },
-            "berth-ws-ws_1",
+            GuestVolumes {
+                workspace: "berth-ws-ws_1",
+                object: None,
+            },
             "berth-net-s_1",
             berth_protocol::DEFAULT_ALLOWLIST,
         )
@@ -389,7 +472,10 @@ mod tests {
                 mem_gib: 1,
                 disk_gib: 1,
             },
-            "berth-ws-ws_1",
+            GuestVolumes {
+                workspace: "berth-ws-ws_1",
+                object: None,
+            },
             "berth-net-s_1",
             "",
         )

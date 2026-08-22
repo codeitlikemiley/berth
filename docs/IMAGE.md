@@ -61,23 +61,39 @@ humans already split EBS from EC2.
 | --- | --- | --- | --- |
 | `/` (root) | session | in the compute quote (`disk_gib`) | the image |
 | `/workspace` | workspace_id, survives leases | **GiB-month** | git, caches, agent files |
-| `/mnt/s3` | rclone/s3fs to a bucket | **we don't bill S3**; the bucket owner does | "connect my S3" |
+| `/mnt/s3` | synced from a bucket, per lease | **we don't bill S3**; the bucket owner does | "connect my S3" |
 
 `/mnt/s3` config at lease:
 
 ```json
 {
   "object": {
-    "endpoint": "https://s3.amazonaws.com",
+    "remote": "buyer-s3",
     "bucket": "my-agent-data",
-    "prefix": "berth/ws_123/",
-    "region": "us-east-1"
+    "prefix": "berth/ws_123"
   }
 }
 ```
 
-Credentials from the buyer's vault, never the host's. rclone mount,
-`--vfs-cache-mode writes`, allowlist the endpoint in egress.
+**Sync, not mount.** rclone copies the prefix into `/mnt/s3` before the guest
+starts and syncs it back after the guest is gone. A FUSE mount would need
+`SYS_ADMIN` in the guest, which would undo the capability posture above for a
+convenience; a sync keeps `cap_drop: ALL` intact. The cost is that the bucket
+sees the result at lease end, not continuously — writes are not live, and a
+node that dies mid-lease loses the delta.
+
+**Credentials stay on the node.** `remote` names an rclone remote configured in
+`$BERTH_HOME/rclone.conf`; it is not a credential. This matters because the node
+stores every `LeaseRequest` verbatim as `request_json` and `GET /v1/leases`
+hands it back — a secret in the lease would be a secret in the API's output.
+rclone itself runs in a short-lived helper container with that config bind-mounted
+read-only, so the guest never has the credentials, only the bytes. Staged files
+are chowned to the guest user, since the helper runs as root and the guest
+does not.
+
+`prefix`, `bucket` and `remote` are validated before anything runs: a `/` or `:`
+in the remote or bucket, or a `..` in the prefix, would re-point rclone
+somewhere the lease never asked for.
 
 We can also run a **Berth object store** (Garage / MinIO) for buyers
 who do not have a bucket. That is a separate SKU: `$/GiB-month` at

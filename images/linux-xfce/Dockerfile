@@ -26,6 +26,7 @@ RUN apt-get update \
         novnc \
         openbox \
         procps \
+        rclone \
         python3 \
         tini \
         tint2 \
@@ -43,12 +44,12 @@ RUN apt-get update \
     && useradd -m -u 1000 -g 1000 -s /bin/bash berth \
     && groupadd -r berthdns \
     && useradd -r -g berthdns -s /usr/sbin/nologin -d /nonexistent berthdns \
-    && mkdir -p /workspace \
+    && mkdir -p /workspace /mnt/s3 \
         /home/berth/.config/openbox \
         /home/berth/.config/chromium \
         /etc/xdg/openbox \
     && touch "/home/berth/.config/chromium/First Run" \
-    && chown -R berth:berth /home/berth /workspace
+    && chown -R berth:berth /home/berth /workspace /mnt/s3
 
 # Sourced by /usr/bin/chromium so desktop files and PATH both get Docker flags.
 # --no-sandbox is a Chromium argv, not a container privilege.

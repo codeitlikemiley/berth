@@ -22,7 +22,8 @@ mod tunnel;
 pub use action::{ACTION_BIN, FRAME_HEIGHT, FRAME_WIDTH};
 pub use berth_protocol::{DEFAULT_ALLOWLIST, parse_allowlist};
 pub use docker::{
-    DEFAULT_IMAGE, EGRESS_LABEL, EGRESS_VERSION, WORKSPACE_MOUNT, image_from_env, volume_name,
+    DEFAULT_IMAGE, EGRESS_LABEL, EGRESS_VERSION, OBJECT_MOUNT, WORKSPACE_MOUNT, image_from_env,
+    s3_volume_name, volume_name,
 };
 pub use error::{Error, Result};
 pub use http::{serve, serve_blocking};

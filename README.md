@@ -66,6 +66,32 @@ automatically, because otherwise every `berth up` leaks one forever. Set
 sweep only touches workspaces this node recorded, never one with a live lease,
 and Docker refuses to remove a volume that is still attached.
 
+### Attaching a bucket
+
+A lease can name an S3 bucket to appear at `/mnt/s3`. Configure the remote on
+the node once, with rclone's own config:
+
+```sh
+rclone config --config ~/.berth/rclone.conf   # create a remote, e.g. "buyer-s3"
+```
+
+Then name it in the lease — the name, never a key:
+
+```json
+{ "object": { "remote": "buyer-s3", "bucket": "my-agent-data", "prefix": "ws_123" } }
+```
+
+Berth copies that prefix into `/mnt/s3` before the guest boots and syncs it back
+after the guest is gone. Two consequences worth knowing before you rely on it:
+
+- **Writes are not live.** The bucket sees the result at lease end. If the node
+  dies mid-lease, the delta is lost. This is the price of not giving the guest
+  `SYS_ADMIN`, which a FUSE mount would require.
+- **The guest never holds your credentials.** rclone runs in a separate
+  short-lived container with `~/.berth/rclone.conf` mounted read-only. Keys stay
+  out of the lease on purpose: the node persists every lease request verbatim and
+  serves it back from `GET /v1/leases`.
+
 ### Node 22 at compile time
 
 The dashboard is compiled into berth. **Node 22 is required at compile time**
