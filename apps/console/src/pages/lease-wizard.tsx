@@ -19,7 +19,8 @@ import {
   UNPARKED_LEASE_COPY,
   quoteMatchesDraft,
   wizardMayPost,
-  wizardWhatReady,
+  capacityHint,
+  wizardWhatError,
   wizardWhereNextEnabled,
 } from "@/lib/wizard";
 
@@ -29,9 +30,6 @@ const WINDOWS_V01_COPY =
   "Windows is not supported in v0.1; only os=linux is available (Windows guests are not implemented)";
 const MACOS_V01_COPY =
   "macOS is not supported in v0.1; only os=linux is available (macOS guests are not implemented)";
-const INVALID_RESOURCES_COPY =
-  "vcpu and mem_gib must be greater than zero (0 is not unlimited)";
-
 function parseCount(raw: string): number {
   const n = Number.parseInt(raw, 10);
   if (!Number.isFinite(n) || n < 0) return 0;
@@ -73,7 +71,9 @@ export function LeaseWizardPage() {
   const [quotePending, setQuotePending] = useState(false);
   const [confirmPending, setConfirmPending] = useState(false);
 
-  const whatReady = wizardWhatReady(vcpu, memGib);
+  const whatError = wizardWhatError(vcpu, memGib, node?.capacity ?? null);
+  const whatReady = whatError === null;
+  const capacityNote = capacityHint(node?.capacity ?? null);
   const parked = node?.parked === true;
   const draft = {
     vcpu,
@@ -172,11 +172,13 @@ export function LeaseWizardPage() {
 
   async function onNext() {
     if (step === 0) {
-      if (!whatReady) {
-        setError(INVALID_RESOURCES_COPY);
+      if (whatError) {
+        setError(whatError);
         return;
       }
-      if (error === INVALID_RESOURCES_COPY) setError(null);
+      // Advancing clears whatever step one was complaining about; Where
+      // re-fetches and will set its own error if there still is one.
+      setError(null);
       setStep(1);
       return;
     }
@@ -323,8 +325,11 @@ export function LeaseWizardPage() {
                 />
               </label>
             </div>
-            {!whatReady ? (
-              <p className="text-sm text-destructive">{INVALID_RESOURCES_COPY}</p>
+            {capacityNote ? (
+              <p className="text-xs text-muted-foreground">{capacityNote}</p>
+            ) : null}
+            {whatError ? (
+              <p className="text-sm text-destructive">{whatError}</p>
             ) : null}
           </CardContent>
         </Card>
