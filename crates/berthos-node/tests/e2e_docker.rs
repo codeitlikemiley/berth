@@ -72,6 +72,27 @@ fn docker_exec(container: &str, shell: &str) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+/// Poll a file the guest writes asynchronously.
+///
+/// `xdotool` returns once the keystrokes are delivered, not once the guest's
+/// shell has finished acting on them, so the batch's own Wait is a guess. It
+/// held locally and flaked on a loaded CI runner: `cat` succeeded and returned
+/// empty, which is the shell having created the file through the redirect
+/// before `echo` wrote to it. Reading until there is content turns that race
+/// into a bounded wait.
+fn wait_for_content(container: &str, path: &str) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        // `|| true` so a not-yet-created file is an empty read rather than a
+        // failed exec, which docker_exec would panic on.
+        let body = docker_exec(container, &format!("cat {path} 2>/dev/null || true"));
+        if !body.is_empty() || std::time::Instant::now() >= deadline {
+            return body;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
 fn inspect_host_config(container: &str) -> serde_json::Value {
     let out = Command::new("docker")
         .args(["inspect", container])
@@ -196,8 +217,14 @@ async fn session_screenshot_and_workspace_persists() {
         .expect("type into xterm");
     assert!(typed.ack.results.iter().all(|r| r.ok), "{:?}", typed.ack);
 
-    let typed_body = docker_exec(session.container_id(), "cat /workspace/typed.txt");
-    assert_eq!(typed_body, "typed-ok");
+    let typed_body = wait_for_content(session.container_id(), "/workspace/typed.txt");
+    assert_eq!(
+        typed_body, "typed-ok",
+        "guest never wrote the typed command's output. Staying empty for the whole \
+         window means the keystrokes did not arrive intact -- a dropped character \
+         redirects to a different path, or truncates the echo -- rather than the \
+         write being slow, which the poll already covers"
+    );
 
     let marker = "berth-persist-ok";
     docker_exec(
