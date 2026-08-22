@@ -44,8 +44,9 @@ impl Mcp {
                 .ok_or_else(|| Error::Usage("os is required".into()))?,
         )?;
         let seconds = optional_seconds(args);
+        let workspace = args.get("workspace").and_then(|v| v.as_str());
         let cfg = Config::load(&self.home)?;
-        let mut req = mvp_lease_request(os, cfg.allowlist.as_deref())?;
+        let mut req = mvp_lease_request(os, cfg.allowlist.as_deref(), workspace)?;
         if let Some(seconds) = seconds
             && seconds >= 60
         {
@@ -211,7 +212,11 @@ impl Mcp {
     }
 }
 
-fn mvp_lease_request(os: Os, allowlist: Option<&str>) -> Result<LeaseRequest> {
+fn mvp_lease_request(
+    os: Os,
+    allowlist: Option<&str>,
+    workspace: Option<&str>,
+) -> Result<LeaseRequest> {
     let mut value = serde_json::json!({
         "os": os,
         "class": "private",
@@ -222,6 +227,13 @@ fn mvp_lease_request(os: Os, allowlist: Option<&str>) -> Result<LeaseRequest> {
     });
     if let Some(net) = network_from_allowlist_key(allowlist) {
         value["network"] = serde_json::to_value(net)?;
+    }
+    if let Some(id) = workspace {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(Error::Usage("workspace is empty".into()));
+        }
+        value["workspace"] = serde_json::json!({ "id": id, "disk_gib": 40 });
     }
     let req: LeaseRequest = serde_json::from_value(value)?;
     req.validate_mvp()?;

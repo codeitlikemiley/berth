@@ -12,7 +12,7 @@ use axum::http::header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, HOST};
 use axum::http::{HeaderMap, HeaderName, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Router, middleware};
 use berth_protocol::{ActionBatch, LeaseRequest, Quote, parse_allowlist};
 use serde::{Deserialize, Serialize};
@@ -22,12 +22,14 @@ use crate::db::{Db, EndReason, LeaseRow, NewLease};
 use crate::docker::image_from_env;
 use crate::error::{Error, Result};
 use crate::guest::{Guest, GuestMode};
-use crate::id::{new_id, u64_from_i64};
+use crate::id::{new_id, u64_from_i64, unix_now};
 use crate::session::SessionManager;
 use crate::tunnel::{self, TunnelKind};
 
 /// Container sessions boot in seconds; MATH.md isolated-VM 300s floor does not apply.
 const CONTAINER_MIN_SECONDS: u64 = 60;
+/// How long a workspace may sit unused before its disk is reclaimed.
+const DEFAULT_WORKSPACE_TTL_DAYS: u64 = 7;
 const LIST_LEASES_MAX: usize = 500;
 
 #[derive(Clone)]
@@ -244,6 +246,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/leases", get(list_leases).post(create_lease))
         .route("/v1/leases/{id}", get(get_lease).delete(delete_lease))
         .route("/v1/leases/{id}/force", post(force_lease))
+        .route("/v1/workspaces", get(list_workspaces))
+        .route("/v1/workspaces/{id}", delete(delete_workspace))
         .route("/v1/node", get(get_node))
         .route("/v1/node/park", post(park_node))
         .route("/v1/node/unpark", post(unpark_node))
@@ -305,12 +309,76 @@ pub async fn serve(bind: SocketAddr, tunnel: Option<TunnelKind>) -> Result<()> {
         }
         None => None,
     };
+    let reclaim_state = state.clone();
+    tokio::spawn(async move { reclaim_loop(reclaim_state).await });
     let shutdown_state = state.clone();
     let drain_state = state.clone();
     axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown_on_signal_or_tunnel(shutdown_state, tunnel_child))
         .await?;
     drain_state.drain().await;
+    Ok(())
+}
+
+/// Days a workspace may sit idle before its disk is reclaimed. 0 disables the
+/// sweep entirely; unset means the default.
+fn workspace_ttl_days() -> u64 {
+    std::env::var("BERTH_WORKSPACE_TTL_DAYS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_WORKSPACE_TTL_DAYS)
+}
+
+async fn reclaim_loop(state: AppState) {
+    loop {
+        if let Err(err) = reclaim_workspaces(&state).await {
+            eprintln!("workspace reclaim failed: {err}");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(6 * 60 * 60)).await;
+    }
+}
+
+/// Delete the disks of workspaces nothing has used for a while.
+///
+/// This throws away user data, so every condition below is a guard, not a
+/// filter: only workspaces this node recorded (which is what bounds it to
+/// berth-ws-* volumes it created), only those with no running lease, and only
+/// those idle past the TTL. Docker's own refusal to remove an attached volume
+/// is the last line -- if any of the above is wrong, it still will not pull the
+/// disk out from under a running guest.
+async fn reclaim_workspaces(state: &AppState) -> Result<()> {
+    let ttl_days = workspace_ttl_days();
+    if ttl_days == 0 {
+        return Ok(());
+    }
+    let cutoff = unix_now() - (ttl_days as i64) * 24 * 60 * 60;
+    if !matches!(state.inner.mode, GuestMode::Docker) {
+        return Ok(());
+    }
+    // Connect rather than peeking at the slot: it is filled lazily, so a node
+    // that has not leased anything yet would otherwise skip every sweep.
+    let manager = state.docker_manager().await?;
+    for ws in state.inner.db.workspaces()? {
+        if ws.active_leases > 0 || ws.last_activity > cutoff {
+            continue;
+        }
+        match manager.remove_volume(&ws.volume).await {
+            Ok(()) => {
+                state.inner.db.delete_workspace(&ws.id)?;
+                eprintln!("reclaimed workspace {} (idle {ttl_days}d)", ws.id);
+            }
+            Err(err) => {
+                // In use, or already gone. Either way leave the row alone: a
+                // record with no volume is harmless, a deleted record with a
+                // live volume is an orphan nothing will ever clean up.
+                if !manager.volume_exists(&ws.volume).await {
+                    state.inner.db.delete_workspace(&ws.id)?;
+                } else {
+                    eprintln!("workspace {} not reclaimed: {err}", ws.id);
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1070,6 +1138,62 @@ async fn check_capacity(mode: GuestMode, req: &LeaseRequest) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct WorkspaceView {
+    id: String,
+    volume: String,
+    created_at: i64,
+    leases: i64,
+    last_activity: i64,
+    active_leases: i64,
+    /// Reuse this as `workspace.id` on a lease request to get the same disk.
+    reusable: bool,
+}
+
+async fn list_workspaces(State(state): State<AppState>) -> Result<Json<serde_json::Value>> {
+    let rows = state.inner.db.workspaces()?;
+    let views: Vec<WorkspaceView> = rows
+        .into_iter()
+        .map(|w| WorkspaceView {
+            reusable: w.active_leases == 0,
+            id: w.id,
+            volume: w.volume,
+            created_at: w.created_at,
+            leases: w.leases,
+            last_activity: w.last_activity,
+            active_leases: w.active_leases,
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "workspaces": views })))
+}
+
+async fn delete_workspace(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+) -> Result<StatusCode> {
+    let Some(ws) = state.inner.db.workspace(&id)? else {
+        return Err(Error::NotFound);
+    };
+    if ws.active_leases > 0 {
+        return Err(Error::BadRequest(format!(
+            "workspace {id} is in use by a live lease; end it first"
+        )));
+    }
+    if matches!(state.inner.mode, GuestMode::Docker) {
+        let manager = state.docker_manager().await?;
+        if let Err(err) = manager.remove_volume(&ws.volume).await
+            && manager.volume_exists(&ws.volume).await
+        {
+            return Err(Error::BadRequest(format!(
+                "could not remove {}: {err}",
+                ws.volume
+            )));
+        }
+    }
+    state.inner.db.delete_workspace(&id)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn probe_docker_and_image(mode: GuestMode) -> (DockerProbe, GuestImageProbe) {

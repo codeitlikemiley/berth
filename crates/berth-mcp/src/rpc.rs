@@ -80,7 +80,8 @@ fn tools() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "os": { "type": "string", "description": "Guest OS. MVP accepts linux only." },
-                    "seconds": { "type": "number", "description": "Optional min_seconds if >= 60." }
+                    "seconds": { "type": "number", "description": "Optional min_seconds if >= 60." },
+                    "workspace": { "type": "string", "description": "Reuse this workspace id so /workspace keeps its contents. Omit for a fresh disk." }
                 },
                 "required": ["os"]
             }),

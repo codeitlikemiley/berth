@@ -101,6 +101,18 @@ pub(crate) struct Db {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct WorkspaceRow {
+    pub id: String,
+    pub volume: String,
+    pub created_at: i64,
+    pub leases: i64,
+    /// Newest stop, or start for a lease still running; falls back to creation
+    /// for a workspace that never hosted one.
+    pub last_activity: i64,
+    pub active_leases: i64,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct LeaseRow {
     pub id: String,
     pub session_id: String,
@@ -387,6 +399,48 @@ impl Db {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    pub(crate) fn workspaces(&self) -> Result<Vec<WorkspaceRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT w.id, w.volume, w.created_at,
+                    COUNT(l.id),
+                    COALESCE(MAX(COALESCE(l.stopped_at, l.started_at)), w.created_at),
+                    SUM(CASE WHEN l.status = 'active' THEN 1 ELSE 0 END)
+             FROM workspaces w
+             LEFT JOIN leases l ON l.workspace_id = w.id
+             GROUP BY w.id
+             ORDER BY 5 DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(WorkspaceRow {
+                id: row.get(0)?,
+                volume: row.get(1)?,
+                created_at: row.get(2)?,
+                leases: row.get(3)?,
+                last_activity: row.get(4)?,
+                active_leases: row.get::<_, Option<i64>>(5)?.unwrap_or(0),
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn workspace(&self, id: &str) -> Result<Option<WorkspaceRow>> {
+        Ok(self.workspaces()?.into_iter().find(|w| w.id == id))
+    }
+
+    /// Forget a workspace. The caller removes the volume; losing the row while
+    /// the volume survives is the safe direction, since the next reclaim sweep
+    /// will not touch a volume it has no record of.
+    pub(crate) fn delete_workspace(&self, id: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute("DELETE FROM workspaces WHERE id = ?1", params![id])?;
+        Ok(())
     }
 
     pub(crate) fn active_leases(&self) -> Result<Vec<LeaseRow>> {

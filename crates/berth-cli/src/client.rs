@@ -19,6 +19,19 @@ pub struct NodeClient {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct WorkspaceView {
+    pub id: String,
+    pub leases: i64,
+    pub active_leases: i64,
+    pub reusable: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkspaceList {
+    pub workspaces: Vec<WorkspaceView>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct LeaseView {
     pub lease_id: String,
     pub session_id: String,
@@ -90,6 +103,27 @@ impl NodeClient {
         let url = format!("{}/v1/leases/{lease_id}", self.base);
         let res = self.authed(self.http.get(url)).send()?;
         decode(res)
+    }
+
+    pub fn list_workspaces(&self) -> Result<Vec<WorkspaceView>> {
+        let url = format!("{}/v1/workspaces", self.base);
+        let res = self.authed(self.http.get(url)).send()?;
+        let body: WorkspaceList = decode(res)?;
+        Ok(body.workspaces)
+    }
+
+    pub fn delete_workspace(&self, id: &str) -> Result<()> {
+        let url = format!("{}/v1/workspaces/{id}", self.base);
+        let res = self.authed(self.http.delete(url)).send()?;
+        let status = res.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let bytes = res.bytes()?;
+        Err(Error::Api {
+            status: status.as_u16(),
+            message: api_message(status, &bytes),
+        })
     }
 
     pub fn delete_lease(&self, lease_id: &str) -> Result<LeaseView> {

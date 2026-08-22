@@ -39,6 +39,9 @@ enum Command {
         /// Paired node name from config.toml
         #[arg(long, default_value = DEFAULT_NODE)]
         node: String,
+        /// Reuse this workspace's /workspace disk. Omit for a fresh one.
+        #[arg(long)]
+        workspace: Option<String>,
     },
     /// Run a berth node
     #[command(subcommand)]
@@ -72,6 +75,24 @@ enum Command {
     Status,
     /// Diagnose local setup
     Doctor,
+    /// Inspect and reclaim workspace disks
+    #[command(subcommand)]
+    Workspace(WorkspaceCmd),
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkspaceCmd {
+    /// List workspaces and whether each can be reused
+    Ls {
+        #[arg(long, default_value = DEFAULT_NODE)]
+        node: String,
+    },
+    /// Delete a workspace's disk. Refused while a lease is live.
+    Rm {
+        id: String,
+        #[arg(long, default_value = DEFAULT_NODE)]
+        node: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -134,7 +155,13 @@ pub fn execute(cli: Cli, home: &Path) -> Result<String> {
             node,
             revoke_others,
         } => cmd_pair(home, &url, &code, &node, revoke_others),
-        Command::Up { os, node } => cmd_up(home, &os, &node),
+        Command::Up {
+            os,
+            node,
+            workspace,
+        } => cmd_up(home, &os, &node, workspace.as_deref()),
+        Command::Workspace(WorkspaceCmd::Ls { node }) => cmd_workspace_ls(home, &node),
+        Command::Workspace(WorkspaceCmd::Rm { id, node }) => cmd_workspace_rm(home, &id, &node),
         Command::View => cmd_view(home),
         Command::End { force } => cmd_end(home, force),
         Command::Status => cmd_status(home),
@@ -165,11 +192,11 @@ fn cmd_pair(home: &Path, url: &str, code: &str, node: &str, revoke_others: bool)
     Ok(format!("paired {node} at {url}"))
 }
 
-fn cmd_up(home: &Path, os: &str, node: &str) -> Result<String> {
+fn cmd_up(home: &Path, os: &str, node: &str, workspace: Option<&str>) -> Result<String> {
     validate_node_name(node)?;
     let os = parse_os(os)?;
     let cfg = Config::load(home)?;
-    let req = mvp_lease_request(os, cfg.allowlist.as_deref())?;
+    let req = mvp_lease_request(os, cfg.allowlist.as_deref(), workspace)?;
     if let Some(cur) = load_session(home)? {
         return Err(Error::Usage(format!(
             "lease {} is current; run berth end first",
@@ -241,7 +268,11 @@ fn parse_os(s: &str) -> Result<Os> {
     }
 }
 
-fn mvp_lease_request(os: Os, allowlist: Option<&str>) -> Result<LeaseRequest> {
+fn mvp_lease_request(
+    os: Os,
+    allowlist: Option<&str>,
+    workspace: Option<&str>,
+) -> Result<LeaseRequest> {
     let mut value = serde_json::json!({
         "os": os,
         "class": "private",
@@ -253,9 +284,54 @@ fn mvp_lease_request(os: Os, allowlist: Option<&str>) -> Result<LeaseRequest> {
     if let Some(net) = network_from_allowlist_key(allowlist) {
         value["network"] = serde_json::to_value(net)?;
     }
+    if let Some(id) = workspace {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(Error::Usage("--workspace is empty".into()));
+        }
+        value["workspace"] = serde_json::json!({ "id": id, "disk_gib": 40 });
+    }
     let req: LeaseRequest = serde_json::from_value(value)?;
     req.validate_mvp()?;
     Ok(req)
+}
+
+fn cmd_workspace_ls(home: &Path, node: &str) -> Result<String> {
+    validate_node_name(node)?;
+    let cfg = Config::load(home)?;
+    let cfg_node = cfg.node(node)?;
+    let client = NodeClient::new(&cfg_node.url, Some(&cfg_node.token))?;
+    let list = client.list_workspaces()?;
+    if list.is_empty() {
+        return Ok("no workspaces".into());
+    }
+    let mut lines = vec![format!(
+        "{:<26} {:>7} {:>7}  {}",
+        "id", "leases", "live", "reuse with"
+    )];
+    for w in list {
+        lines.push(format!(
+            "{:<26} {:>7} {:>7}  {}",
+            w.id,
+            w.leases,
+            w.active_leases,
+            if w.reusable {
+                format!("berth up --workspace {}", w.id)
+            } else {
+                "in use".into()
+            }
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+fn cmd_workspace_rm(home: &Path, id: &str, node: &str) -> Result<String> {
+    validate_node_name(node)?;
+    let cfg = Config::load(home)?;
+    let cfg_node = cfg.node(node)?;
+    let client = NodeClient::new(&cfg_node.url, Some(&cfg_node.token))?;
+    client.delete_workspace(id)?;
+    Ok(format!("removed workspace {id}"))
 }
 
 fn format_up(lease: &LeaseView, node_url: &str) -> String {
@@ -397,7 +473,7 @@ mod tests {
             Cli::try_parse_from(["berth", "up", "--os", "linux", "--node", "home-nuc"]).unwrap();
         assert!(matches!(
             up.command,
-            Command::Up { ref os, ref node } if os == "linux" && node == "home-nuc"
+            Command::Up { ref os, ref node, .. } if os == "linux" && node == "home-nuc"
         ));
     }
 
