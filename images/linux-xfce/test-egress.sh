@@ -25,6 +25,13 @@ trap cleanup EXIT
 pass() { echo "  ok   $1"; }
 fail() { echo "  FAIL $1"; FAILURES=$((FAILURES + 1)); }
 
+# Never pipe into grep -q here. It exits on the first match, the producer takes
+# SIGPIPE, and `set -o pipefail` turns that into a failed pipeline -- a matched
+# assertion reported as a failure, intermittently, depending on how fast the
+# producer flushes. Capture first, match in the shell.
+logs_of() { docker logs "$1" 2>&1 || true; }
+has() { case "$2" in *"$1"*) return 0 ;; *) return 1 ;; esac; }
+
 # Root inside the guest; PATH is trimmed for the berth user so name it in full.
 rules() { docker exec -u root "$1" /usr/sbin/iptables -S OUTPUT 2>/dev/null; }
 # The unprivileged user an agent actually runs as.
@@ -40,11 +47,15 @@ start_guest() { # $1 name, $2 BERTH_ALLOWLIST value
   # policy first and logs last, so keying on the policy races the rest of the
   # ruleset into existence and reads a half-built chain.
   for _ in $(seq 1 30); do
-    if ! docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null | grep -q true; then
+    running="$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null || true)"
+    if [ "$running" != "true" ]; then
       echo "  container $name exited; logs:"; docker logs "$name" 2>&1 | sed 's/^/    /' | tail -20
       return 1
     fi
-    docker logs "$name" 2>&1 | grep -qE 'egress (deny-all|allowlist:)' && return 0
+    log_text="$(logs_of "$name")"
+    if has "egress deny-all" "$log_text" || has "egress allowlist:" "$log_text"; then
+      return 0
+    fi
     sleep 1
   done
   echo "  egress rules never appeared in $name; logs:"; docker logs "$name" 2>&1 | sed 's/^/    /' | tail -20
@@ -61,19 +72,22 @@ echo
 echo "deny-all (BERTH_ALLOWLIST=\"\") -- nothing may leave, DNS included"
 if start_guest "berth-egress-deny-$$" ""; then
   g="berth-egress-deny-$$"
-  rules "$g" | grep -q -- '-P OUTPUT DROP'          && pass "default policy DROP"            || fail "default policy is not DROP"
-  rules "$g" | grep -q -- '-d 127.0.0.11/32 -j DROP' && pass "embedded resolver dropped"      || fail "embedded resolver not dropped"
-  docker logs "$g" 2>&1 | grep -q "egress deny-all" && pass "logged deny-all"                || fail "did not log deny-all"
+  deny_rules="$(rules "$g")"
+  has '-P OUTPUT DROP' "$deny_rules"          && pass "default policy DROP"       || fail "default policy is not DROP"
+  has '-d 127.0.0.11/32 -j DROP' "$deny_rules" && pass "embedded resolver dropped" || fail "embedded resolver not dropped"
+  has "egress deny-all" "$(logs_of "$g")"     && pass "logged deny-all"           || fail "did not log deny-all"
   as_agent "$g" 'getent hosts github.com'           && fail "DNS resolved under deny-all"    || pass "DNS blocked"
   as_agent "$g" 'curl -sS --max-time 8 https://github.com' && fail "TCP reached github.com"  || pass "TCP blocked"
-  docker exec -u root "$g" sh -c 'ps ax | grep -q "[d]nsmasq"' >/dev/null 2>&1 \
-    && fail "name filter running in deny-all" || pass "no name filter needed"
+  dnsmasq_count="$(docker exec -u root "$g" sh -c 'ps ax | grep -c "[d]nsmasq"' 2>/dev/null || true)"
+  dnsmasq_count="$(printf '%s' "$dnsmasq_count" | tr -dc '0-9')"
+  [ "${dnsmasq_count:-0}" -eq 0 ] \
+    && pass "no name filter needed" || fail "name filter running in deny-all"
   # Ordering is the whole bug: the resolver DROP has to precede the loopback
   # ACCEPT, or the ACCEPT lets every DNAT-ed lookup straight back out.
   # pipefail would abort the run when grep finds nothing -- that is a FAIL to
   # report, not a reason to stop testing.
-  drop_at=$(rules "$g" | grep -n -- '-d 127.0.0.11/32 -j DROP' | head -1 | cut -d: -f1 || true)
-  lo_at=$(rules "$g" | grep -n -- '-o lo -j ACCEPT' | head -1 | cut -d: -f1 || true)
+  drop_at=$(printf '%s\n' "$deny_rules" | grep -n -- '-d 127.0.0.11/32 -j DROP' | cut -d: -f1 | sed -n 1p)
+  lo_at=$(printf '%s\n' "$deny_rules" | grep -n -- '-o lo -j ACCEPT' | cut -d: -f1 | sed -n 1p)
   if [ -n "$drop_at" ] && [ -n "$lo_at" ] && [ "$drop_at" -lt "$lo_at" ]; then
     pass "resolver DROP precedes loopback ACCEPT"
   else
@@ -87,7 +101,7 @@ echo
 echo "allowlist (BERTH_ALLOWLIST=github.com) -- only that host may leave"
 if start_guest "berth-egress-allow-$$" "github.com"; then
   g="berth-egress-allow-$$"
-  docker logs "$g" 2>&1 | grep -q "egress allowlist: github.com" && pass "logged allowlist" || fail "did not log allowlist"
+  has "egress allowlist: github.com" "$(logs_of "$g")" && pass "logged allowlist" || fail "did not log allowlist"
   as_agent "$g" 'getent hosts github.com'                        && pass "DNS resolves"      || fail "DNS blocked, but allowlisted hosts need it"
   as_agent "$g" 'curl -sS --max-time 15 -o /dev/null https://github.com' && pass "allowed host reachable" || fail "allowlisted host unreachable"
   as_agent "$g" 'curl -sS --max-time 8 -o /dev/null https://example.com' && fail "non-listed host reachable" || pass "non-listed host blocked"
