@@ -104,7 +104,7 @@ No central cloud. The **node is the control plane** for private leases.
 ```
 Laptop (macOS)                 Tunnel                    Parked box (macOS or Linux + Docker)
 ┌─────────────────────┐        (cloudflared)        ┌──────────────────────────┐
-│ berth CLI           │  HTTPS/WSS ───────────────► │ berth-node (daemon)      │
+│ berth CLI           │  HTTPS/WSS ───────────────► │ berthos-node (daemon)      │
 │ berth mcp (stdio)   │                             │  GET  /  console         │
 │ Claude Code / Codex │                             │  POST /v1/leases         │
 │ operator browser    │                             │  WS  /v1/sessions/:id    │
@@ -148,11 +148,11 @@ Repo layout to create:
 berth/
   Cargo.toml                  (workspace)
   crates/
-    berth-protocol/           types, action enum, serde, coord scaling
-    berth-node/               axum daemon, docker, sqlite
-    berth-cli/                berth, berth node, berth mcp, berth view
-    berth-mcp/                stdio MCP server (used by cli)
-    berth-adapter-anthropic/  toolset_20260801 ⇄ protocol
+    berthos-protocol/           types, action enum, serde, coord scaling
+    berthos-node/               axum daemon, docker, sqlite
+    berthos-cli/                berth, berth node, berth mcp, berth view
+    berthos-mcp/                stdio MCP server (used by cli)
+    berthos-adapter-anthropic/  toolset_20260801 ⇄ protocol
   images/linux-xfce/          Dockerfile + entrypoint
   docs/                       (already exists)
   spec/computer-session.md    (already exists)
@@ -169,13 +169,13 @@ Each PR is independently reviewable. Do not start N+1 until N's acceptance box i
 
 ### PR0 — repo skeleton (½ day)
 
-**Files:** `Cargo.toml`, `crates/berth-cli` hello, `crates/berth-protocol` empty types, `.github/workflows/ci.yml` (`cargo fmt`, `clippy -D warnings`, `test`), `rust-toolchain.toml`.
+**Files:** `Cargo.toml`, `crates/berthos-cli` hello, `crates/berthos-protocol` empty types, `.github/workflows/ci.yml` (`cargo fmt`, `clippy -D warnings`, `test`), `rust-toolchain.toml`.
 
 **Accept:** `cargo test` and `berth --help` print `up | node | mcp | pair | end | view`.
 
 ### PR1 — protocol crate (1 day)
 
-**Files:** `crates/berth-protocol`
+**Files:** `crates/berthos-protocol`
 
 Implement, with tests:
 
@@ -184,7 +184,7 @@ Implement, with tests:
 - Coordinate helper: if frame was scaled, map click xy back to guest pixels
 - Reject `os != linux` and `class=mesh` in a `validate_mvp()` that the node calls
 
-**Accept:** table-driven serde tests from the JSON in `spec/computer-session.md`. Golden fixtures in `crates/berth-protocol/tests/fixtures/`.
+**Accept:** table-driven serde tests from the JSON in `spec/computer-session.md`. Golden fixtures in `crates/berthos-protocol/tests/fixtures/`.
 
 ### PR2 — berthOS Linux image (1–2 days)
 
@@ -215,7 +215,7 @@ Keep image under ~1.5 GB uncompressed if possible.
 
 ### PR3 — executor (docker + actions) (2 days)
 
-**Files:** `crates/berth-node/src/docker.rs`, `executor.rs`
+**Files:** `crates/berthos-node/src/docker.rs`, `executor.rs`
 
 - `Session::start(lease)` → `docker create/start` with:
   - `--memory`, `--cpus` from `resources`
@@ -231,7 +231,7 @@ Keep image under ~1.5 GB uncompressed if possible.
 
 ### PR4 — node HTTP/WS + sqlite (2 days)
 
-**Files:** `crates/berth-node`
+**Files:** `crates/berthos-node`
 
 - `berth node up --bind 127.0.0.1:7432 --pair-file ~/.berth/node.token`
 - sqlite `~/.berth/node.db`: `leases`, `sessions`, `workspaces`, `pair_tokens`
@@ -248,7 +248,7 @@ Keep image under ~1.5 GB uncompressed if possible.
 
 ### PR5 — CLI (1 day)
 
-**Files:** `crates/berth-cli`
+**Files:** `crates/berthos-cli`
 
 ```
 berth node up [--tunnel cloudflare]
@@ -266,7 +266,7 @@ Config: `~/.berth/config.toml` (`nodes.home-nuc.url`, `token`).
 
 ### PR6 — MCP + Anthropic adapter (2 days)
 
-**Files:** `crates/berth-mcp`, `crates/berth-adapter-anthropic`
+**Files:** `crates/berthos-mcp`, `crates/berthos-adapter-anthropic`
 
 MCP tools (minimum):
 
@@ -323,7 +323,7 @@ Linux+Docker if present).
 | Level | What |
 | --- | --- |
 | Unit | protocol serde, coord scale, lease validate, anthropic mapping |
-| Docker e2e | `BERTH_E2E=1 cargo test -p berth-node -- --ignored` start/click/persist/stop |
+| Docker e2e | `BERTH_E2E=1 cargo test -p berthos-node -- --ignored` start/click/persist/stop |
 | Manual gate | PR6 Claude Code path; PR7 two-machine path |
 
 No mock MCP. If Claude Code is unavailable in CI, script a raw MCP stdio handshake (initialize → tools/list → tools/call screenshot).
@@ -376,7 +376,7 @@ Two engineers: split PR2 (image) // PR1+3 (protocol+executor), then join at PR4.
 Ordered, still:
 
 1. Cua Driver in image (macOS/Windows private become possible)  
-2. OpenAI adapter — **done**: `crates/berth-adapter-openai` maps Responses
+2. OpenAI adapter — **done**: `crates/berthos-adapter-openai` maps Responses
    `computer_call` items (batched `actions`, safety checks, data-URL
    screenshots) onto the protocol. `zoom`, `cursor_position` and `hold_key`
    have no OpenAI equivalent and stay protocol-only.  

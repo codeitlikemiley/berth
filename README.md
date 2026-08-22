@@ -18,7 +18,7 @@ laptop (CLI / Claude Code / MCP)     browser (operator console)
         │  HTTPS (cloudflared) or loopback
         ▼
 parked box (macOS + Docker Desktop/OrbStack, or Linux + Docker)
-        │  berth-node on 127.0.0.1:7432  — GET / is the console
+        │  berthos-node on 127.0.0.1:7432  — GET / is the console
         ▼
 Linux guest (Xvfb + openbox + Chromium)   ← not Finder, not your cursor
 ```
@@ -31,9 +31,13 @@ workstation.
 ```sh
 # once — Node 22 on PATH (or a pre-built apps/console/dist) for the real dashboard
 docker build -t berthos-linux-xfce:dev images/linux-xfce
-cargo install --path crates/berth-cli
+cargo install --path crates/berthos-cli
 berth doctor
 ```
+
+The crates publish as **`berthos`**; the command they install is **`berth`**.
+Note that an unrelated crate already holds the name `berth` on crates.io, so
+`cargo install berth` gets you someone else's project — use `berthos`.
 
 `berth doctor` must be green (Docker daemon, guest image, `~/.berth` writable).
 It does **not** probe the embedded SPA. cloudflared is a warning unless you
@@ -96,9 +100,9 @@ after the guest is gone. Two consequences worth knowing before you rely on it:
 
 The dashboard is compiled into berth. **Node 22 is required at compile time**
 for the real UI (`npm` on PATH, or a pre-built `apps/console/dist`).
-`cargo install --path crates/berth-cli` without Node embeds the placeholder
+`cargo install --path crates/berthos-cli` without Node embeds the placeholder
 page, not the dashboard. If `http://127.0.0.1:7432/` shows that placeholder,
-install Node 22 and re-run `cargo install --path crates/berth-cli`.
+install Node 22 and re-run `cargo install --path crates/berthos-cli`.
 
 ### Human path (console)
 

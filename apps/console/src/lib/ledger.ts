@@ -1,6 +1,6 @@
 import type { LeaseView, Quote } from "@/api/types";
 
-/** Matches Quote::usd_per_second in crates/berth-protocol/src/quote.rs */
+/** Matches Quote::usd_per_second in crates/berthos-protocol/src/quote.rs */
 export function usdPerSecond(q: Quote): number {
   return Number(q.gas_per_second) * Number(q.usd_per_gas);
 }

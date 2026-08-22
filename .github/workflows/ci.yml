@@ -97,7 +97,7 @@ jobs:
         env:
           BERTH_E2E: "1"
           BERTH_IMAGE: berthos-linux-xfce:ci
-        run: cargo test -p berth-node --test e2e_docker -- --ignored
+        run: cargo test -p berthos-node --test e2e_docker -- --ignored
 
       # An adapter that maps cleanly but emits actions the guest refuses is the
       # failure this catches; it is how drag and hold_key stayed broken.
@@ -105,4 +105,4 @@ jobs:
         env:
           BERTH_E2E: "1"
           BERTH_IMAGE: berthos-linux-xfce:ci
-        run: cargo test -p berth-adapter-openai --test e2e_guest -- --ignored
+        run: cargo test -p berthos-adapter-openai --test e2e_guest -- --ignored
