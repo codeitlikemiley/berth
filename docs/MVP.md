@@ -80,7 +80,10 @@ reason to stay on Apple silicon, not a reason to switch to Linux now.
 
 Post-MVP (do not start until the Done-when above is true):
 
-1. Cua Driver in the image  
+1. Cua Driver in the image — evaluated 2026-08-22 and **not adopted**; it
+   falls back to the same input route xdotool already uses on this guest. See
+   [CUA.md](CUA.md). The five actions this was meant to unlock are implemented
+   in xdotool instead.  
 2. OpenAI `computer` adapter  
 3. rclone `/mnt/s3`  
 4. Lume private macOS  
