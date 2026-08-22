@@ -474,9 +474,6 @@ mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::Mutex;
-
-    static ENV: Mutex<()> = Mutex::new(());
 
     const SAMPLE_LOG: &str = r#"
 2024-06-01T12:00:00Z INF Requesting new quick Tunnel on trycloudflare.com...
@@ -493,9 +490,10 @@ mod tests {
 
     impl EnvGuard {
         fn acquire(keys: &[&str]) -> Self {
-            let lock = ENV.lock().unwrap_or_else(|p| p.into_inner());
+            let lock = crate::test_env::lock();
             for key in keys {
-                // SAFETY: ENV serializes process-env mutation in this module.
+                // SAFETY: test_env::lock serializes every env access in this binary,
+                // so no other test can spawn a process mid-mutation.
                 unsafe { std::env::remove_var(key) };
             }
             Self {
@@ -505,7 +503,8 @@ mod tests {
         }
 
         fn set(&self, key: &str, val: &str) {
-            // SAFETY: ENV serializes process-env mutation in this module.
+            // SAFETY: test_env::lock serializes every env access in this binary,
+            // so no other test can spawn a process mid-mutation.
             unsafe { std::env::set_var(key, val) };
         }
     }
@@ -513,7 +512,8 @@ mod tests {
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             for key in &self.keys {
-                // SAFETY: ENV serializes process-env mutation in this module.
+                // SAFETY: test_env::lock serializes every env access in this binary,
+                // so no other test can spawn a process mid-mutation.
                 unsafe { std::env::remove_var(key) };
             }
         }

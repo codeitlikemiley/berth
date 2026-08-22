@@ -15,6 +15,8 @@ mod guest;
 mod http;
 mod id;
 mod session;
+#[cfg(test)]
+mod test_env;
 mod tunnel;
 
 pub use action::{ACTION_BIN, FRAME_HEIGHT, FRAME_WIDTH};

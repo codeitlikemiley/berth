@@ -23,9 +23,6 @@ mod tests {
         Class, DEFAULT_ALLOWLIST, Density, Egress, Isolation, LeaseRequest, License, Network, Os,
         Resources, Term,
     };
-    use std::sync::Mutex;
-
-    static ENV: Mutex<()> = Mutex::new(());
 
     fn sample_req(network: Option<Network>) -> LeaseRequest {
         LeaseRequest {
@@ -59,13 +56,15 @@ mod tests {
 
     #[test]
     fn lease_domains_override_env() {
-        let _lock = ENV.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: lock serializes BERTH_ALLOWLIST mutation in these tests.
+        let _lock = crate::test_env::lock();
+        // SAFETY: test_env::lock serializes every env access in this binary,
+        // including the process spawns in tunnel's tests.
         unsafe { env::set_var("BERTH_ALLOWLIST", "should.not.use.example") };
         struct Restore;
         impl Drop for Restore {
             fn drop(&mut self) {
-                // SAFETY: lock serializes BERTH_ALLOWLIST mutation in these tests.
+                // SAFETY: test_env::lock serializes every env access in this binary,
+                // including the process spawns in tunnel's tests.
                 unsafe { env::remove_var("BERTH_ALLOWLIST") };
             }
         }
@@ -86,8 +85,9 @@ mod tests {
 
     #[test]
     fn unset_env_uses_default_when_lease_has_no_network() {
-        let _lock = ENV.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: lock serializes BERTH_ALLOWLIST mutation in these tests.
+        let _lock = crate::test_env::lock();
+        // SAFETY: test_env::lock serializes every env access in this binary,
+        // including the process spawns in tunnel's tests.
         unsafe { env::remove_var("BERTH_ALLOWLIST") };
         let csv = csv_for_lease(&sample_req(None));
         assert_eq!(csv, DEFAULT_ALLOWLIST);
@@ -95,13 +95,15 @@ mod tests {
 
     #[test]
     fn empty_env_is_deny_all_when_lease_has_no_network() {
-        let _lock = ENV.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: lock serializes BERTH_ALLOWLIST mutation in these tests.
+        let _lock = crate::test_env::lock();
+        // SAFETY: test_env::lock serializes every env access in this binary,
+        // including the process spawns in tunnel's tests.
         unsafe { env::set_var("BERTH_ALLOWLIST", "") };
         struct Restore;
         impl Drop for Restore {
             fn drop(&mut self) {
-                // SAFETY: lock serializes BERTH_ALLOWLIST mutation in these tests.
+                // SAFETY: test_env::lock serializes every env access in this binary,
+                // including the process spawns in tunnel's tests.
                 unsafe { env::remove_var("BERTH_ALLOWLIST") };
             }
         }
